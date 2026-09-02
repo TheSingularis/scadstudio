@@ -1,0 +1,16 @@
+{
+  "name": "scadstudio",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "spike:parse": "node spikes/parse-spike.mjs",
+    "spike:render": "node spikes/render-spike.mjs",
+    "spike:gaps": "node spikes/isolate-gaps.mjs"
+  },
+  "dependencies": {
+    "@holistic-stack/tree-sitter-openscad": "^0.1.0",
+    "openscad-wasm": "^0.0.4",
+    "web-tree-sitter": "^0.25.3"
+  }
+}
