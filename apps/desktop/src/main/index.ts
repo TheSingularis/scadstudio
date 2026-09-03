@@ -44,6 +44,12 @@ function createWindow(): void {
   if (process.env['SCADSTUDIO_SCREENSHOT']) {
     win.webContents.once('did-finish-load', () => {
       setTimeout(async () => {
+        if (process.env['SCADSTUDIO_TEST_EDIT']) {
+          await win.webContents.executeJavaScript(
+            `window.__testEditor.setValue(${JSON.stringify(process.env['SCADSTUDIO_TEST_EDIT'])})`,
+          );
+          await new Promise((r) => setTimeout(r, 2500));
+        }
         const image = await win.webContents.capturePage();
         await writeFile(process.env['SCADSTUDIO_SCREENSHOT']!, image.toPNG());
         app.quit();
