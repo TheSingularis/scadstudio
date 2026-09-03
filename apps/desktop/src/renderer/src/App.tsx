@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Editor } from './components/Editor';
 import { Viewport } from './components/Viewport';
+import { parseScad } from './scadParser';
+import { createCoalescingRunner } from './coalescingRunner';
 
-const DEFAULT_SOURCE = `// scadstudio M1 static viewer — open a .scad file to replace this
+const DEFAULT_SOURCE = `// scadstudio M2 live viewer — edit this, or open a .scad file
 module bracket(w=20, h=10, thickness=3) {
     difference() {
         cube([w, h, thickness]);
@@ -18,36 +20,67 @@ union() {
 }
 `;
 
+// Debounce window before a text edit triggers re-parse + re-render. See
+// PLAN.md's render latency benchmark: full-document renders can take ~1.2s,
+// so this is paired with a coalescing runner (only the latest text ever
+// renders, no per-keystroke pile-up) rather than relying on debounce alone.
+const RENDER_DEBOUNCE_MS = 400;
+
 export function App(): JSX.Element {
   const [source, setSource] = useState(DEFAULT_SOURCE);
   const [filePath, setFilePath] = useState<string | null>(null);
   const [stlBytes, setStlBytes] = useState<Uint8Array | null>(null);
   const [status, setStatus] = useState('Rendering...');
+  const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const render = useCallback(async (src: string) => {
-    setStatus('Rendering...');
-    try {
-      const bytes = await window.scadstudio.renderScad(src);
-      setStlBytes(bytes);
-      setStatus('Rendered');
-    } catch (err) {
-      setStatus(`Render failed: ${(err as Error).message}`);
-      console.error('[scadstudio] render failed', err);
-    }
-  }, []);
+  const runRender = useMemo(
+    () =>
+      createCoalescingRunner(async (src: string) => {
+        setStatus('Rendering...');
+        try {
+          const bytes = await window.scadstudio.renderScad(src);
+          setStlBytes(bytes);
+          setStatus('Rendered');
+        } catch (err) {
+          setStatus(`Render failed: ${(err as Error).message}`);
+          console.error('[scadstudio] render failed', err);
+        }
+      }),
+    [],
+  );
+
+  const parseAndRender = useCallback(
+    async (src: string) => {
+      const { errorCount } = await parseScad(src);
+      setParseErrorCount(errorCount);
+      runRender(src);
+    },
+    [runRender],
+  );
 
   useEffect(() => {
-    render(source);
+    parseAndRender(source);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleSourceChange = useCallback(
+    (next: string) => {
+      setSource(next);
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      debounceTimer.current = setTimeout(() => parseAndRender(next), RENDER_DEBOUNCE_MS);
+    },
+    [parseAndRender],
+  );
 
   const handleOpen = useCallback(async () => {
     const result = await window.scadstudio.openFile();
     if (!result) return;
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setFilePath(result.filePath);
     setSource(result.contents);
-    render(result.contents);
-  }, [render]);
+    parseAndRender(result.contents);
+  }, [parseAndRender]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'sans-serif' }}>
@@ -65,11 +98,14 @@ export function App(): JSX.Element {
       >
         <button onClick={handleOpen}>Open .scad file...</button>
         <span>{filePath ?? '(unsaved default example)'}</span>
-        <span style={{ marginLeft: 'auto', opacity: 0.7 }}>{status}</span>
+        <span style={{ marginLeft: 'auto', opacity: 0.7 }}>
+          {parseErrorCount ? `${parseErrorCount} parse error(s) — ` : ''}
+          {status}
+        </span>
       </div>
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <Editor value={source} />
+          <Editor value={source} onChange={handleSourceChange} />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
           <Viewport stlBytes={stlBytes} />

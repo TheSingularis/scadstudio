@@ -9,7 +9,9 @@
   "scripts": {
     "spike:parse": "node spikes/parse-spike.mjs",
     "spike:render": "node spikes/render-spike.mjs",
-    "spike:gaps": "node spikes/isolate-gaps.mjs"
+    "spike:gaps": "node spikes/isolate-gaps.mjs",
+    "spike:bench": "node spikes/bench-render.mjs",
+    "spike:bench-isolate": "node spikes/bench-isolate.mjs"
   },
   "dependencies": {
     "@holistic-stack/tree-sitter-openscad": "^0.1.0",

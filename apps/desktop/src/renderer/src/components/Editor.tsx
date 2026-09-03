@@ -6,11 +6,14 @@ let languageRegistered = false;
 
 interface EditorProps {
   value: string;
+  onChange: (value: string) => void;
 }
 
-export function Editor({ value }: EditorProps): JSX.Element {
+export function Editor({ value, onChange }: EditorProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
 
   useEffect(() => {
     if (!languageRegistered) {
@@ -19,18 +22,26 @@ export function Editor({ value }: EditorProps): JSX.Element {
     }
     if (!containerRef.current) return;
 
-    editorRef.current = monaco.editor.create(containerRef.current, {
+    const editor = monaco.editor.create(containerRef.current, {
       value,
       language: 'scad',
       theme: 'vs-dark',
-      readOnly: true, // M1 scope: read-only viewer. Editable sync arrives in M2.
       minimap: { enabled: false },
       automaticLayout: true,
       fontSize: 13,
     });
+    editorRef.current = editor;
+    // Manual verification hook: lets SCADSTUDIO_TEST_EDIT (main/index.ts) script
+    // an edit via executeJavaScript for screenshot-based milestone verification.
+    (window as unknown as { __testEditor?: typeof editor }).__testEditor = editor;
+
+    const subscription = editor.onDidChangeModelContent(() => {
+      onChangeRef.current(editor.getValue());
+    });
 
     return () => {
-      editorRef.current?.dispose();
+      subscription.dispose();
+      editor.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
