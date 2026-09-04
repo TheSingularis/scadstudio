@@ -50,6 +50,16 @@ function createWindow(): void {
           );
           await new Promise((r) => setTimeout(r, 2500));
         }
+        if (process.env['SCADSTUDIO_EXEC_JS']) {
+          await win.webContents.executeJavaScript(process.env['SCADSTUDIO_EXEC_JS']);
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        if (process.env['SCADSTUDIO_CLICK_AT']) {
+          const [x, y] = process.env['SCADSTUDIO_CLICK_AT']!.split(',').map(Number);
+          win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+          win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+          await new Promise((r) => setTimeout(r, 500));
+        }
         const image = await win.webContents.capturePage();
         await writeFile(process.env['SCADSTUDIO_SCREENSHOT']!, image.toPNG());
         app.quit();

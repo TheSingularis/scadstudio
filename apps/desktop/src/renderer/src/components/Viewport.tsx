@@ -2,36 +2,58 @@ import { useMemo } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
-import * as THREE from 'three';
+import type { ThreeEvent } from '@react-three/fiber';
 
-interface ViewportProps {
-  stlBytes: Uint8Array | null;
+export interface NodeMesh {
+  index: number;
+  bytes: Uint8Array;
 }
 
-function Model({ stlBytes }: { stlBytes: Uint8Array }): JSX.Element {
+interface ViewportProps {
+  meshes: NodeMesh[];
+  selectedIndex: number | null;
+  onSelect: (index: number | null) => void;
+}
+
+function NodeModel({
+  mesh,
+  selected,
+  onSelect,
+}: {
+  mesh: NodeMesh;
+  selected: boolean;
+  onSelect: (index: number) => void;
+}) {
   const geometry = useMemo(() => {
-    const loader = new STLLoader();
-    const geom = loader.parse(stlBytes.buffer as ArrayBuffer);
+    const geom = new STLLoader().parse(mesh.bytes.buffer as ArrayBuffer);
     geom.computeVertexNormals();
     return geom;
-  }, [stlBytes]);
+  }, [mesh.bytes]);
 
   return (
-    <mesh geometry={geometry}>
-      <meshStandardMaterial color="#4a90d9" />
+    <mesh
+      geometry={geometry}
+      onClick={(e: ThreeEvent<MouseEvent>) => {
+        e.stopPropagation();
+        onSelect(mesh.index);
+      }}
+    >
+      <meshStandardMaterial color={selected ? '#e8a33d' : '#4a90d9'} />
     </mesh>
   );
 }
 
-export function Viewport({ stlBytes }: ViewportProps): JSX.Element {
+export function Viewport({ meshes, selectedIndex, onSelect }: ViewportProps) {
   return (
-    <Canvas camera={{ position: [50, 50, 50], fov: 45 }}>
+    <Canvas camera={{ position: [50, 50, 50], fov: 45 }} onPointerMissed={() => onSelect(null)}>
       <ambientLight intensity={0.6} />
       <directionalLight position={[10, 20, 10]} intensity={0.8} />
-      {stlBytes && (
+      {meshes.length > 0 && (
         <Bounds fit clip observe margin={1.2}>
           <Center>
-            <Model stlBytes={stlBytes} />
+            {meshes.map((mesh) => (
+              <NodeModel key={mesh.index} mesh={mesh} selected={mesh.index === selectedIndex} onSelect={onSelect} />
+            ))}
           </Center>
         </Bounds>
       )}

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Editor } from './components/Editor';
-import { Viewport } from './components/Viewport';
+import { Viewport, type NodeMesh } from './components/Viewport';
 import { parseScad } from './scadParser';
+import { buildSceneGraph, nodeSource, type SceneNode } from './sceneGraph';
 import { createCoalescingRunner } from './coalescingRunner';
 
-const DEFAULT_SOURCE = `// scadstudio M2 live viewer — edit this, or open a .scad file
+const DEFAULT_SOURCE = `// scadstudio M3 — click a shape or click in the code to select it
 module bracket(w=20, h=10, thickness=3) {
     difference() {
         cube([w, h, thickness]);
@@ -13,11 +14,13 @@ module bracket(w=20, h=10, thickness=3) {
     }
 }
 
-union() {
-    bracket(30, 15, 4);
-    translate([0, 0, 10])
-        cylinder(h=20, r=5, $fn=32);
-}
+bracket(30, 15, 4);
+
+translate([0, 0, 10])
+    cylinder(h=20, r=5, $fn=32);
+
+translate([40, 0, 0])
+    sphere(r=8);
 `;
 
 // Debounce window before a text edit triggers re-parse + re-render. See
@@ -26,10 +29,12 @@ union() {
 // renders, no per-keystroke pile-up) rather than relying on debounce alone.
 const RENDER_DEBOUNCE_MS = 400;
 
-export function App(): JSX.Element {
+export function App() {
   const [source, setSource] = useState(DEFAULT_SOURCE);
   const [filePath, setFilePath] = useState<string | null>(null);
-  const [stlBytes, setStlBytes] = useState<Uint8Array | null>(null);
+  const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
+  const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [status, setStatus] = useState('Rendering...');
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -39,9 +44,26 @@ export function App(): JSX.Element {
       createCoalescingRunner(async (src: string) => {
         setStatus('Rendering...');
         try {
-          const bytes = await window.scadstudio.renderScad(src);
-          setStlBytes(bytes);
-          setStatus('Rendered');
+          const { tree, errorCount } = await parseScad(src);
+          setParseErrorCount(errorCount);
+          const graph = buildSceneGraph(tree, src);
+          setSceneNodes(graph.nodes);
+
+          // Isolated per-node renders (M3 scope: one call per top-level
+          // statement, sequential — see PLAN.md M3 build notes on why this
+          // stays simple rather than the full render-worker job queue).
+          const meshes: NodeMesh[] = [];
+          for (const node of graph.nodes) {
+            try {
+              const bytes = await window.scadstudio.renderScad(nodeSource(graph, node, src));
+              meshes.push({ index: node.index, bytes });
+            } catch (err) {
+              console.error(`[scadstudio] node ${node.index} render failed`, err);
+            }
+          }
+          setNodeMeshes(meshes);
+          setSelectedIndex((prev) => (prev !== null && prev < graph.nodes.length ? prev : null));
+          setStatus(meshes.length === graph.nodes.length ? 'Rendered' : `Rendered ${meshes.length}/${graph.nodes.length} nodes`);
         } catch (err) {
           setStatus(`Render failed: ${(err as Error).message}`);
           console.error('[scadstudio] render failed', err);
@@ -50,17 +72,8 @@ export function App(): JSX.Element {
     [],
   );
 
-  const parseAndRender = useCallback(
-    async (src: string) => {
-      const { errorCount } = await parseScad(src);
-      setParseErrorCount(errorCount);
-      runRender(src);
-    },
-    [runRender],
-  );
-
   useEffect(() => {
-    parseAndRender(source);
+    runRender(source);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -68,9 +81,9 @@ export function App(): JSX.Element {
     (next: string) => {
       setSource(next);
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
-      debounceTimer.current = setTimeout(() => parseAndRender(next), RENDER_DEBOUNCE_MS);
+      debounceTimer.current = setTimeout(() => runRender(next), RENDER_DEBOUNCE_MS);
     },
-    [parseAndRender],
+    [runRender],
   );
 
   const handleOpen = useCallback(async () => {
@@ -79,8 +92,8 @@ export function App(): JSX.Element {
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setFilePath(result.filePath);
     setSource(result.contents);
-    parseAndRender(result.contents);
-  }, [parseAndRender]);
+    runRender(result.contents);
+  }, [runRender]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'sans-serif' }}>
@@ -105,10 +118,16 @@ export function App(): JSX.Element {
       </div>
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <Editor value={source} onChange={handleSourceChange} />
+          <Editor
+            value={source}
+            onChange={handleSourceChange}
+            nodes={sceneNodes}
+            selectedIndex={selectedIndex}
+            onSelectNode={setSelectedIndex}
+          />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
-          <Viewport stlBytes={stlBytes} />
+          <Viewport meshes={nodeMeshes} selectedIndex={selectedIndex} onSelect={setSelectedIndex} />
         </div>
       </div>
     </div>
