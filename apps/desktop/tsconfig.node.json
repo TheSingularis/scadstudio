@@ -7,7 +7,8 @@
     "types": ["electron-vite/node", "node"],
     "strict": true,
     "skipLibCheck": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "outDir": "../../.tsbuild/desktop-node"
   },
   "include": ["electron.vite.config.ts", "src/main/**/*", "src/preload/**/*"]
 }
