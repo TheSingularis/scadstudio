@@ -176,6 +176,12 @@ M1 (static viewer) is done: `apps/desktop/` is a real Electron app (electron-vit
 
 **Workspace layout**: converted the repo root to an npm workspace (`"workspaces": ["apps/*"]`) rather than pnpm (per the plan's "pnpm/npm workspaces" either-or) since npm was already the available package manager in this environment and adding pnpm would need a global install; `spikes/` remains a plain script directory outside the workspace (its own flat `node_modules` via the root `package.json`, unrelated to the app).
 
+## Known engine bug: linear_extrude(twist=...) + low $fn crashes WASM (2026-09-07)
+
+Found while building a manual test/demo file (`spikes/fixtures/test-drive.scad`): `linear_extrude(height=h, twist=..., slices=...)` applied to a `circle()` with a **low polygon count** (`$fn=6`, `$fn=7`, `$fn=10` reproduced; `$fn=8`, `12`, `16`, `20`, `32` all fine — not a clean "below N" threshold) crashes `openscad-wasm` with a hard `RuntimeError: null function or function signature mismatch`. This is a genuine WASM-level fault (an Emscripten indirect-call-table error), not a normal OpenSCAD compile error — it propagates as an unhandled main-process exception, not a graceful "render failed" the way invalid syntax does. Reproduced in complete isolation (fresh process per test case, ruling out cross-call contamination) via a throwaway `spikes/isolate-crash.mjs` (not committed — one-off repro, not a reusable fixture like `bench-*.mjs`).
+
+**Why this matters going forward**: this is exactly the kind of input the M5 toolbar (extrude tool) or a user typing a low-poly twisted extrude could trigger, and right now it would surface as an ugly generic IPC error rather than anything resembling OpenSCAD's own error reporting. Worth a defensive check (e.g. clamp/warn on very low `$fn` specifically when `twist` is also set) before M5/M7 ship an extrude tool, rather than passing arbitrary user `$fn` values straight through. For now, just avoid the combination in example/demo content.
+
 ## Render latency benchmark (2026-09-03, ahead of M2)
 
 Before building M2's live-sync loop, benchmarked `openscad-wasm` render cost (`spikes/bench-render.mjs`, `spikes/bench-isolate.mjs`) since M2's whole point is a responsive editing feel and this was previously unmeasured.
