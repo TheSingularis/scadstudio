@@ -1,13 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
-import { Viewport, type NodeMesh } from './components/Viewport';
+import { Viewport, type GizmoMode, type NodeMesh } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, nodeSource, type SceneNode } from './sceneGraph';
-import { patchTranslate } from './targetedPatch';
+import { patchTranslate, patchRotate, patchScale } from './targetedPatch';
+import { appendPrimitive, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
 
-const DEFAULT_SOURCE = `// scadstudio M4 — drag a shape with the translate gizmo, or click to select
+const PRIMITIVE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
+  { kind: 'cube', label: 'Cube' },
+  { kind: 'sphere', label: 'Sphere' },
+  { kind: 'cylinder', label: 'Cylinder' },
+  { kind: 'square', label: 'Square' },
+  { kind: 'circle', label: 'Circle' },
+];
+
+const GIZMO_MODE_BUTTONS: { mode: GizmoMode; label: string }[] = [
+  { mode: 'translate', label: 'Move' },
+  { mode: 'rotate', label: 'Rotate' },
+  { mode: 'scale', label: 'Scale' },
+];
+
+const DEFAULT_SOURCE = `// scadstudio M5 — drag the gizmo (Move/Rotate/Scale), insert primitives, or click to select
 module bracket(w=20, h=10, thickness=3) {
     difference() {
         cube([w, h, thickness]);
@@ -37,9 +52,14 @@ export function App() {
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [gizmoMode, setGizmoMode] = useState<GizmoMode>('translate');
   const [status, setStatus] = useState('Rendering...');
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set right before an insertion-triggered render so that render's own
+  // selection-preserving logic (below) knows to select the newly-appended
+  // node instead of trying to preserve whatever was selected before.
+  const pendingSelectLast = useRef(false);
   // Latest parsed tree + inputs to it, kept outside React state: the gizmo
   // commit handler (targetedPatch) needs the CST that matches the *currently
   // displayed* source to locate a node's translate() call, but doesn't want
@@ -78,7 +98,12 @@ export function App() {
             }
           }
           setNodeMeshes(meshes);
-          setSelectedIndex((prev) => (prev !== null && prev < graph.nodes.length ? prev : null));
+          if (pendingSelectLast.current) {
+            pendingSelectLast.current = false;
+            setSelectedIndex(graph.nodes.length > 0 ? graph.nodes.length - 1 : null);
+          } else {
+            setSelectedIndex((prev) => (prev !== null && prev < graph.nodes.length ? prev : null));
+          }
           setStatus(meshes.length === graph.nodes.length ? 'Rendered' : `Rendered ${meshes.length}/${graph.nodes.length} nodes`);
         } catch (err) {
           setStatus(`Render failed: ${(err as Error).message}`);
@@ -111,19 +136,33 @@ export function App() {
     runRender(result.contents);
   }, [runRender]);
 
-  // M4: gizmo drag-end -> targeted patch -> same re-parse/re-render pipeline
-  // as a text edit (one derivation path, not two — see PLAN.md "Visual edit
-  // path"). Dragging itself never reaches here; only the drag-end delta does,
-  // which is what makes skip-WASM-during-drag free.
+  // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
+  // pipeline as a text edit (one derivation path, not two — see PLAN.md
+  // "Visual edit path"). Dragging itself never reaches here; only the
+  // drag-end value does, which is what makes skip-WASM-during-drag free.
   const handleTransformCommit = useCallback(
-    (index: number, delta: [number, number, number]) => {
+    (index: number, mode: GizmoMode, value: [number, number, number]) => {
       const tree = treeRef.current;
       const node = sceneNodesRef.current.find((n) => n.index === index);
       if (!tree || !node) return;
-      const patched = patchTranslate(sourceRef.current, tree, node, delta);
+      const patch = mode === 'rotate' ? patchRotate : mode === 'scale' ? patchScale : patchTranslate;
+      const patched = patch(sourceRef.current, tree, node, value);
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(patched);
       runRender(patched);
+    },
+    [runRender],
+  );
+
+  // M5: toolbar primitive insertion, reusing the same targeted-patch +
+  // re-render pipeline as every other edit path.
+  const handleInsertPrimitive = useCallback(
+    (kind: PrimitiveKind) => {
+      const next = appendPrimitive(sourceRef.current, kind);
+      pendingSelectLast.current = true;
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(next);
+      runRender(next);
     },
     [runRender],
   );
@@ -149,6 +188,39 @@ export function App() {
           {status}
         </span>
       </div>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 16,
+          padding: '6px 12px',
+          background: '#252526',
+          color: '#ccc',
+          fontSize: 12,
+          borderBottom: '1px solid #333',
+        }}
+      >
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          Insert:
+          {PRIMITIVE_BUTTONS.map(({ kind, label }) => (
+            <button key={kind} onClick={() => handleInsertPrimitive(kind)}>
+              {label}
+            </button>
+          ))}
+        </span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          Gizmo:
+          {GIZMO_MODE_BUTTONS.map(({ mode, label }) => (
+            <button
+              key={mode}
+              onClick={() => setGizmoMode(mode)}
+              style={{ fontWeight: gizmoMode === mode ? 'bold' : 'normal' }}
+            >
+              {label}
+            </button>
+          ))}
+        </span>
+      </div>
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <Editor
@@ -164,6 +236,7 @@ export function App() {
             meshes={nodeMeshes}
             selectedIndex={selectedIndex}
             onSelect={setSelectedIndex}
+            gizmoMode={gizmoMode}
             onTransformCommit={handleTransformCommit}
           />
         </div>

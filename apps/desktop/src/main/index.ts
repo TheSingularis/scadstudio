@@ -55,26 +55,42 @@ function createWindow(): void {
           await new Promise((r) => setTimeout(r, 500));
         }
         if (process.env['SCADSTUDIO_CLICK_AT']) {
-          const [x, y] = process.env['SCADSTUDIO_CLICK_AT']!.split(',').map(Number);
-          win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
-          win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        // M4 gizmo-drag verification: "x1,y1,x2,y2" — a real mouseDown/move.../mouseUp
-        // sequence through the same Chromium input pipeline as SCADSTUDIO_CLICK_AT,
-        // rather than calling the drag handlers directly from JS.
-        if (process.env['SCADSTUDIO_DRAG_AT']) {
-          const [x1, y1, x2, y2] = process.env['SCADSTUDIO_DRAG_AT']!.split(',').map(Number);
-          const steps = 10;
-          win.webContents.sendInputEvent({ type: 'mouseDown', x: x1, y: y1, button: 'left', clickCount: 1 });
-          for (let i = 1; i <= steps; i++) {
-            const x = x1 + ((x2 - x1) * i) / steps;
-            const y = y1 + ((y2 - y1) * i) / steps;
-            win.webContents.sendInputEvent({ type: 'mouseMove', x, y, button: 'left' });
-            await new Promise((r) => setTimeout(r, 30));
+          // ";"-separated list of "x,y" pairs, clicked in sequence — lets a
+          // single verification run chain UI actions (e.g. pick a gizmo mode,
+          // then select a shape) before a SCADSTUDIO_DRAG_AT.
+          for (const pair of process.env['SCADSTUDIO_CLICK_AT']!.split(';')) {
+            const [x, y] = pair.split(',').map(Number);
+            win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+            win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+            await new Promise((r) => setTimeout(r, 500));
           }
-          win.webContents.sendInputEvent({ type: 'mouseUp', x: x2, y: y2, button: 'left', clickCount: 1 });
-          await new Promise((r) => setTimeout(r, 1500));
+        }
+        // M4/M5 gizmo-drag verification: ";"-separated list of "x1,y1,x2,y2"
+        // drags, each a real mouseDown/move.../mouseUp sequence through the
+        // same Chromium input pipeline as SCADSTUDIO_CLICK_AT (rather than
+        // calling the drag handlers directly from JS) — multiple drags in one
+        // run lets a test exercise "commit, then drag the same gizmo again"
+        // (e.g. confirming a second rotate patches the existing wrap instead
+        // of inserting a duplicate).
+        if (process.env['SCADSTUDIO_DRAG_AT']) {
+          for (const spec of process.env['SCADSTUDIO_DRAG_AT']!.split(';')) {
+            const [x1, y1, x2, y2] = spec.split(',').map(Number);
+            const steps = 10;
+            win.webContents.sendInputEvent({ type: 'mouseDown', x: x1, y: y1, button: 'left', clickCount: 1 });
+            for (let i = 1; i <= steps; i++) {
+              const x = x1 + ((x2 - x1) * i) / steps;
+              const y = y1 + ((y2 - y1) * i) / steps;
+              win.webContents.sendInputEvent({ type: 'mouseMove', x, y, button: 'left' });
+              await new Promise((r) => setTimeout(r, 30));
+            }
+            win.webContents.sendInputEvent({ type: 'mouseUp', x: x2, y: y2, button: 'left', clickCount: 1 });
+            // Long enough for a multi-node file's sequential per-node WASM
+            // re-renders to finish before a chained drag starts — too short
+            // here isn't a product bug, but it does make the gizmo briefly
+            // absent, so a follow-up drag can miss it and fall through to
+            // camera-orbit instead (which is what a short wait looks like).
+            await new Promise((r) => setTimeout(r, 3500));
+          }
         }
         const image = await win.webContents.capturePage();
         await writeFile(process.env['SCADSTUDIO_SCREENSHOT']!, image.toPNG());

@@ -50,7 +50,16 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: 
     });
 
     // Text -> selection: find which top-level scene node contains the cursor.
+    // Every programmatic `model.setValue()` below (i.e. every gizmo/toolbar
+    // commit, since those flow back through this component's `value` prop)
+    // resets Monaco's cursor to the start of the document as a side effect —
+    // reported with reason `ContentFlush`, distinct from a real user-driven
+    // move. Without this guard, that reset masquerades as "user clicked at
+    // offset 0", which is inside the leading comment (no scene node there),
+    // silently deselecting whatever a gizmo drag had just been editing right
+    // as its own re-render was about to land.
     const cursorSub = editor.onDidChangeCursorPosition((e) => {
+      if (e.reason === monaco.editor.CursorChangeReason.ContentFlush) return;
       const model = editor.getModel();
       if (!model) return;
       const offset = model.getOffsetAt(e.position);

@@ -102,7 +102,7 @@
 <body>
 
 <h1>scadstudio — Milestone Progress</h1>
-<div class="subtitle">Snapshot as of 2026-09-07 (M4 update). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section.</div>
+<div class="subtitle">Snapshot as of 2026-09-07 (M5 update). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section.</div>
 
 <div class="legend">
   <span>🟢 completed</span>
@@ -111,7 +111,7 @@
   <span>🟠 deferred (post-v1)</span>
 </div>
 
-<div class="progress-bar"><div class="progress-bar-fill" style="width: 42%"></div></div>
+<div class="progress-bar"><div class="progress-bar-fill" style="width: 46%"></div></div>
 
 <div class="phase">
   <div class="phase-header">
@@ -191,7 +191,15 @@
 <div class="phase">
   <div class="phase-header">
     <span class="name">M5 — Full transform set + toolbar primitive insertion</span>
-    <span class="badge in_progress">next up</span>
+    <span class="badge in_progress">in progress</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Rotate + scale gizmos, mode toggle (translate/rotate/scale)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Rotate/scale insert "in place" (inside an existing translate), not orbiting the origin</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Toolbar primitive insertion (cube/sphere/cylinder/square/circle)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: negative numbers (`unary_expression`) unrecognized as existing wraps</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: Monaco's setValue cursor-reset could deselect a gizmo's own node</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Parameter panel (editable fields for a selected node's own arguments)</span><span class="badge pending">pending</span></div>
   </div>
 </div>
 
@@ -238,8 +246,8 @@
 </div>
 
 <div class="note">
-  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, and drag a shape's translate gizmo to rewrite its source in place (or insert a new wrap if it had none). Every top-level statement in a file is its own independently-rendered, clickable, draggable object.<br><br>
-  <b>Known gaps (expected, not bugs):</b> only translate exists as a gizmo (rotate/scale/mirror + toolbar primitive insertion are M5), no booleans/extrusions UI (M6-M7), no custom-module detection (M8). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it).<br><br>
+  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, drag a shape with a translate/rotate/scale gizmo to rewrite its source in place (inserting a new wrap if it had none, and doing so "in place" relative to any existing translate rather than orbiting the world origin), or insert a new primitive from the toolbar. Every top-level statement in a file is its own independently-rendered, clickable, draggable object.<br><br>
+  <b>Known gaps (expected, not bugs):</b> no parameter panel yet for editing a selected node's own arguments directly (rest of M5), mirror/color aren't wired to the toolbar, no booleans/extrusions UI (M6-M7), no custom-module detection (M8). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it). Combined multi-axis rotation hasn't been checked against OpenSCAD's own composition order (only single-axis rotation is verified).<br><br>
   <b>Full history:</b> see PLAN.md's per-milestone "build notes" sections in the repo for exact bugs found/fixed at each step.
 </div>
 
