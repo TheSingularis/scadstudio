@@ -210,6 +210,20 @@ M3 (scene-graph + click-to-select) is done, with a deliberately narrowed scope: 
 
 **Known limitation, intentionally deferred**: node "identity" is purely positional (`SceneNode.index`, recomputed fresh on every parse) — there's no stable-ID fingerprinting yet (that's explicitly a later-milestone concern in the architecture, needed once drag-editing requires selection to survive structural edits elsewhere in the file). For now, if the node count shrinks below the previously-selected index, selection is simply cleared rather than guessing at a remapped target.
 
+## CI/CD: AppImage builds (2026-09-07)
+
+Added `.github/workflows/build-appimage.yml`: on every push to `master` (plus manual `workflow_dispatch`), it typechecks, builds, packages a Linux AppImage via `electron-builder`, **actually launches the packaged AppImage headlessly under Xvfb as a smoke test** (not just trusting a successful build), and uploads both the AppImage and the smoke-test screenshot as downloadable workflow artifacts.
+
+**Why the smoke-test step matters, not just "nice to have"**: `electron-builder`'s main-process dependency bundling depends on correctly resolving this repo's npm-workspace-hoisted `node_modules` (the app's own `package.json` lives in `apps/desktop/`, but the actual installed packages sit at the repo root). A build can complete successfully and produce a plausible-looking AppImage while still being missing a runtime dependency the main process needs (e.g. `openscad-wasm`, which `main/index.ts` imports as an external, unbundled specifier via electron-vite's `externalizeDepsPlugin()`) — that failure mode only shows up when the packaged app is actually launched, not at build time. Verified locally first (extracted the AppImage via `--appimage-extract`, ran `./squashfs-root/AppRun` under Xvfb with the same swiftshader flags used for milestone verification, confirmed the default example renders identically to the dev build) before trusting the same steps in CI.
+
+**Config specifics that mattered**:
+- `electron` must be a **pinned exact version** in `package.json` (`"44.1.1"`, not `"^44.1.1"`) — electron-builder needs to resolve a specific release to download platform binaries for, and refuses to proceed from a semver range.
+- `executableName` must be set explicitly in `electron-builder.yml` — it defaults to a sanitized `package.json` "name", and this package is scoped (`@scadstudio/desktop`), which produces an invalid filename (`@scadstudiodesktop`).
+- electron-builder's own dependency scan correctly walks up to the npm workspace root to resolve `node_modules` — confirmed via its build log (`detected workspace root for project using lock file`) and by verifying `openscad-wasm` actually ends up packed inside `app.asar`. No special monorepo configuration was needed beyond letting it do its default scan (the `files` list only needs to name the build output, not `node_modules`).
+- Ubuntu's ALSA package was renamed (`libasound2` → `libasound2t64`) across recent versions — installed as an isolated fallback (`libasound2t64 || libasound2`) in the smoke-test step's apt install, since a single failed package name aborts an entire `apt-get install` batch (the same gotcha hit earlier in this container's own environment setup).
+
+**Not done (kept simple, deliberately)**: no GitHub Release / stable "latest" download link, no third-party GitHub Actions — everything runs through official `actions/*` and downloads happen via the Actions run's artifact list. Worth revisiting if repeatedly hunting down the latest run's artifacts becomes annoying.
+
 ## Verification
 
 Since this is a from-scratch build, "testing" happens milestone-by-milestone rather than against existing code:

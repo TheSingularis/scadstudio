@@ -2,13 +2,16 @@
   "name": "@scadstudio/desktop",
   "private": true,
   "version": "0.0.0",
+  "description": "Visual CAD editor that reads and writes real OpenSCAD source",
+  "author": "scadstudio",
   "type": "module",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
-    "typecheck": "tsc --build tsconfig.json"
+    "typecheck": "tsc --build tsconfig.json",
+    "package:linux": "electron-vite build && electron-builder --linux AppImage --publish never"
   },
   "dependencies": {
     "@holistic-stack/tree-sitter-openscad": "^0.1.0",
@@ -26,7 +29,8 @@
     "@types/react-dom": "^19.2.0",
     "@types/three": "^0.185.0",
     "@vitejs/plugin-react": "^5.0.0",
-    "electron": "^44.1.1",
+    "electron": "44.1.1",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.6"

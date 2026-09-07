@@ -1,0 +1,25 @@
+appId: dev.scadstudio.desktop
+productName: scadstudio
+# package.json's "name" is the scoped "@scadstudio/desktop", which electron-builder
+# can't safely derive a filesystem executable name from — pin these explicitly.
+executableName: scadstudio
+directories:
+  output: dist
+  buildResources: build
+# This is an npm workspace: node_modules are hoisted to the repo root, not
+# apps/desktop/node_modules. electron-builder's own dependency scan (via the
+# package.json "dependencies" list) correctly walks up to find them — verified
+# locally, see PLAN.md CI/CD notes — so "files" only needs the build output.
+files:
+  - out/**/*
+  - package.json
+  - "!**/*.map"
+npmRebuild: false
+nodeGypRebuild: false
+asarUnpack:
+  - "**/*.wasm"
+linux:
+  target:
+    - AppImage
+  category: Utility
+  artifactName: ${productName}-${version}-${arch}.${ext}
