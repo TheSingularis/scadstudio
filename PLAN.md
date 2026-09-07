@@ -224,6 +224,10 @@ Added `.github/workflows/build-appimage.yml`: on every push to `master` (plus ma
 
 **Not done (kept simple, deliberately)**: no GitHub Release / stable "latest" download link, no third-party GitHub Actions — everything runs through official `actions/*` and downloads happen via the Actions run's artifact list. Worth revisiting if repeatedly hunting down the latest run's artifacts becomes annoying.
 
+**Confirmed working on GitHub's own infrastructure, not just this dev container**: pushing the workflow (run [34084388215](https://github.com/TheSingularis/scadstudio/actions/runs/34084388215)) passed every step including the smoke test, and downloading its `smoke-test-screenshot` artifact showed the identical, correctly-rendered default example — independent confirmation the packaging approach isn't relying on anything specific to this sandboxed container.
+
+**Note on pushing workflow files**: the GitHub token used by `gh`/`git` in this environment initially lacked the `workflow` OAuth scope, which GitHub specifically requires for any push that adds/modifies files under `.github/workflows/` (a deliberate safeguard against automation quietly changing CI). Fixed by running `gh auth refresh -h github.com -s workflow` — this uses a device-code flow (prints a one-time code + URL), so it can be completed from any browser on any device, not just one with direct shell access to wherever the token is stored.
+
 ## Verification
 
 Since this is a from-scratch build, "testing" happens milestone-by-milestone rather than against existing code:
