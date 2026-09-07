@@ -60,6 +60,22 @@ function createWindow(): void {
           win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
           await new Promise((r) => setTimeout(r, 500));
         }
+        // M4 gizmo-drag verification: "x1,y1,x2,y2" — a real mouseDown/move.../mouseUp
+        // sequence through the same Chromium input pipeline as SCADSTUDIO_CLICK_AT,
+        // rather than calling the drag handlers directly from JS.
+        if (process.env['SCADSTUDIO_DRAG_AT']) {
+          const [x1, y1, x2, y2] = process.env['SCADSTUDIO_DRAG_AT']!.split(',').map(Number);
+          const steps = 10;
+          win.webContents.sendInputEvent({ type: 'mouseDown', x: x1, y: y1, button: 'left', clickCount: 1 });
+          for (let i = 1; i <= steps; i++) {
+            const x = x1 + ((x2 - x1) * i) / steps;
+            const y = y1 + ((y2 - y1) * i) / steps;
+            win.webContents.sendInputEvent({ type: 'mouseMove', x, y, button: 'left' });
+            await new Promise((r) => setTimeout(r, 30));
+          }
+          win.webContents.sendInputEvent({ type: 'mouseUp', x: x2, y: y2, button: 'left', clickCount: 1 });
+          await new Promise((r) => setTimeout(r, 1500));
+        }
         const image = await win.webContents.capturePage();
         await writeFile(process.env['SCADSTUDIO_SCREENSHOT']!, image.toPNG());
         app.quit();

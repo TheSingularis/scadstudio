@@ -102,7 +102,7 @@
 <body>
 
 <h1>scadstudio — Milestone Progress</h1>
-<div class="subtitle">Snapshot as of 2026-09-07. Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section.</div>
+<div class="subtitle">Snapshot as of 2026-09-07 (M4 update). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section.</div>
 
 <div class="legend">
   <span>🟢 completed</span>
@@ -111,7 +111,7 @@
   <span>🟠 deferred (post-v1)</span>
 </div>
 
-<div class="progress-bar"><div class="progress-bar-fill" style="width: 33%"></div></div>
+<div class="progress-bar"><div class="progress-bar-fill" style="width: 42%"></div></div>
 
 <div class="phase">
   <div class="phase-header">
@@ -177,14 +177,21 @@
 <div class="phase">
   <div class="phase-header">
     <span class="name">M4 — Translate gizmo <span class="tag">gizmo edits AST param via targeted patch</span></span>
-    <span class="badge in_progress">next up</span>
+    <span class="badge completed">completed</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Drag gizmo → patch existing translate([...]) vector in place</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Drag gizmo on unwrapped geometry → insert new translate([...]) wrap</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Skip-WASM-during-drag (only re-renders on drag-end)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: gizmo pivot must be geometry bbox-center, not mesh origin</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: gizmo nested in &lt;Bounds&gt; blew up camera auto-fit</span><span class="badge completed">completed</span></div>
   </div>
 </div>
 
 <div class="phase">
   <div class="phase-header">
     <span class="name">M5 — Full transform set + toolbar primitive insertion</span>
-    <span class="badge pending">pending</span>
+    <span class="badge in_progress">next up</span>
   </div>
 </div>
 
@@ -231,8 +238,8 @@
 </div>
 
 <div class="note">
-  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction. Every top-level statement in a file is its own independently-rendered, clickable object.<br><br>
-  <b>Known gaps (expected, not bugs):</b> no drag/gizmo manipulation yet (M4), no toolbar for inserting primitives (M5), no booleans/extrusions UI (M6-M7), no custom-module detection (M8). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once dragging needs it).<br><br>
+  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, and drag a shape's translate gizmo to rewrite its source in place (or insert a new wrap if it had none). Every top-level statement in a file is its own independently-rendered, clickable, draggable object.<br><br>
+  <b>Known gaps (expected, not bugs):</b> only translate exists as a gizmo (rotate/scale/mirror + toolbar primitive insertion are M5), no booleans/extrusions UI (M6-M7), no custom-module detection (M8). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it).<br><br>
   <b>Full history:</b> see PLAN.md's per-milestone "build notes" sections in the repo for exact bugs found/fixed at each step.
 </div>
 

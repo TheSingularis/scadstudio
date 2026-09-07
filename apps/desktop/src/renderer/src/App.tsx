@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
 import { Viewport, type NodeMesh } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, nodeSource, type SceneNode } from './sceneGraph';
+import { patchTranslate } from './targetedPatch';
 import { createCoalescingRunner } from './coalescingRunner';
 
-const DEFAULT_SOURCE = `// scadstudio M3 — click a shape or click in the code to select it
+const DEFAULT_SOURCE = `// scadstudio M4 — drag a shape with the translate gizmo, or click to select
 module bracket(w=20, h=10, thickness=3) {
     difference() {
         cube([w, h, thickness]);
@@ -38,6 +40,19 @@ export function App() {
   const [status, setStatus] = useState('Rendering...');
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Latest parsed tree + inputs to it, kept outside React state: the gizmo
+  // commit handler (targetedPatch) needs the CST that matches the *currently
+  // displayed* source to locate a node's translate() call, but doesn't want
+  // to be recreated on every keystroke just to close over fresh state.
+  const treeRef = useRef<Tree | null>(null);
+  const sourceRef = useRef(source);
+  const sceneNodesRef = useRef<SceneNode[]>([]);
+  useEffect(() => {
+    sourceRef.current = source;
+  }, [source]);
+  useEffect(() => {
+    sceneNodesRef.current = sceneNodes;
+  }, [sceneNodes]);
 
   const runRender = useMemo(
     () =>
@@ -45,6 +60,7 @@ export function App() {
         setStatus('Rendering...');
         try {
           const { tree, errorCount } = await parseScad(src);
+          treeRef.current = tree;
           setParseErrorCount(errorCount);
           const graph = buildSceneGraph(tree, src);
           setSceneNodes(graph.nodes);
@@ -95,6 +111,23 @@ export function App() {
     runRender(result.contents);
   }, [runRender]);
 
+  // M4: gizmo drag-end -> targeted patch -> same re-parse/re-render pipeline
+  // as a text edit (one derivation path, not two — see PLAN.md "Visual edit
+  // path"). Dragging itself never reaches here; only the drag-end delta does,
+  // which is what makes skip-WASM-during-drag free.
+  const handleTransformCommit = useCallback(
+    (index: number, delta: [number, number, number]) => {
+      const tree = treeRef.current;
+      const node = sceneNodesRef.current.find((n) => n.index === index);
+      if (!tree || !node) return;
+      const patched = patchTranslate(sourceRef.current, tree, node, delta);
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(patched);
+      runRender(patched);
+    },
+    [runRender],
+  );
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'sans-serif' }}>
       <div
@@ -127,7 +160,12 @@ export function App() {
           />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
-          <Viewport meshes={nodeMeshes} selectedIndex={selectedIndex} onSelect={setSelectedIndex} />
+          <Viewport
+            meshes={nodeMeshes}
+            selectedIndex={selectedIndex}
+            onSelect={setSelectedIndex}
+            onTransformCommit={handleTransformCommit}
+          />
         </div>
       </div>
     </div>
