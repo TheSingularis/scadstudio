@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>scadstudio — Progress</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #1a1d24;
+    --border: #2a2e37;
+    --text: #e6e8eb;
+    --muted: #8b929e;
+    --green: #3fb950;
+    --blue: #58a6ff;
+    --gray: #4d5561;
+    --orange: #e8a33d;
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 780px;
+    margin: 40px auto;
+    padding: 0 20px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 28px; font-size: 0.9rem; }
+  .phase {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 14px;
+    overflow: hidden;
+  }
+  .phase-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 18px;
+    font-weight: 600;
+  }
+  .phase-header .name { display: flex; align-items: baseline; gap: 8px; }
+  .phase-header .tag { font-size: 0.75rem; font-weight: 500; color: var(--muted); }
+  .subtasks {
+    border-top: 1px solid var(--border);
+    padding: 6px 18px 12px 18px;
+  }
+  .subtask {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 0;
+    font-size: 0.88rem;
+    border-bottom: 1px dashed var(--border);
+  }
+  .subtask:last-child { border-bottom: none; }
+  .subtask .name { color: var(--text); }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge.completed { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.in_progress { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge.pending { background: rgba(77,85,97,0.25); color: var(--muted); }
+  .badge.deferred { background: rgba(232,163,61,0.15); color: var(--orange); }
+  .note {
+    margin-top: 30px;
+    padding: 14px 18px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .note b { color: var(--text); }
+  .note code {
+    background: rgba(255,255,255,0.06);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--text);
+  }
+  .legend { margin-bottom: 24px; font-size: 0.8rem; color: var(--muted); }
+  .legend span { margin-right: 14px; }
+  .progress-bar {
+    height: 8px;
+    background: var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 28px;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: var(--green);
+    border-radius: 999px;
+  }
+</style>
+</head>
+<body>
+
+<h1>scadstudio — Milestone Progress</h1>
+<div class="subtitle">Snapshot as of 2026-09-07. Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section.</div>
+
+<div class="legend">
+  <span>🟢 completed</span>
+  <span>🔵 in progress</span>
+  <span>⚪ pending</span>
+  <span>🟠 deferred (post-v1)</span>
+</div>
+
+<div class="progress-bar"><div class="progress-bar-fill" style="width: 33%"></div></div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M0 — Spike <span class="tag">parser + WASM render engine de-risking</span></span>
+    <span class="badge completed">completed</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">tree-sitter-openscad parses real-world syntax cleanly</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">openscad-wasm renders valid STL from Node</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found: 2 narrow grammar gaps (bare `each`, chained `for`) — non-blocking</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found: fresh WASM instance required per render call</span><span class="badge completed">completed</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M1 — Static viewer <span class="tag">Electron shell, one-shot render</span></span>
+    <span class="badge completed">completed</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Open a .scad file (native dialog or bundled default)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Full-document render → r3f viewport with orbit controls</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Read-only Monaco editor with OpenSCAD syntax highlighting</span><span class="badge completed">completed</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M2 — Live text→visual sync <span class="tag">editable Monaco, debounced re-render</span></span>
+    <span class="badge completed">completed</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Editable Monaco with real tree-sitter incremental parsing</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Debounced + coalescing render queue (no per-keystroke pile-up)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Graceful parse-error handling (last-good mesh retained)</span><span class="badge completed">completed</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M3 — Scene-graph + click-to-select <span class="tag">first bidirectional selection</span></span>
+    <span class="badge completed">completed</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Per-top-level-statement isolated rendering</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Click a mesh → highlight its source range in Monaco</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Click/move cursor in text → highlight the matching mesh</span><span class="badge completed">completed</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">CI/CD — AppImage builds <span class="tag">not a numbered milestone, added on request</span></span>
+    <span class="badge completed">completed</span>
+  </div>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">GitHub Actions: build + package on every push to master</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Headless smoke-test launch before uploading (catches broken packages)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Verified passing on GitHub's own runners, not just locally</span><span class="badge completed">completed</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M4 — Translate gizmo <span class="tag">gizmo edits AST param via targeted patch</span></span>
+    <span class="badge in_progress">next up</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M5 — Full transform set + toolbar primitive insertion</span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M6 — Booleans <span class="tag">multi-select, wrap-in-block, modifiers</span></span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M7 — Extrusions <span class="tag">linear_extrude / rotate_extrude, 2D sketch mode</span></span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M8 — Custom module auto-toolbar</span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M9 — Polish <span class="tag">undo/redo, error UX, packaging hardening</span></span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M10 — Directional constraints <span class="tag">distance/alignment via plain SCAD expressions</span></span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M11 — Solver-based constraints <span class="tag">tangency etc., "SCAD+" comment annotations</span></span>
+    <span class="badge deferred">post-v1</span>
+  </div>
+</div>
+
+<div class="note">
+  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction. Every top-level statement in a file is its own independently-rendered, clickable object.<br><br>
+  <b>Known gaps (expected, not bugs):</b> no drag/gizmo manipulation yet (M4), no toolbar for inserting primitives (M5), no booleans/extrusions UI (M6-M7), no custom-module detection (M8). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once dragging needs it).<br><br>
+  <b>Full history:</b> see PLAN.md's per-milestone "build notes" sections in the repo for exact bugs found/fixed at each step.
+</div>
+
+</body>
+</html>
