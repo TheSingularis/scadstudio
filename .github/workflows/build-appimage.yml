@@ -3,10 +3,11 @@ name: Build AppImage
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-appimage:
@@ -75,3 +76,19 @@ jobs:
           name: scadstudio-appimage
           path: apps/desktop/dist/*.AppImage
           retention-days: 14
+
+      # Every push to master gets a workflow-artifact build (above) for quick
+      # iteration; pushing a version tag (e.g. v0.1.0-beta.1) additionally cuts
+      # a proper GitHub Release with the AppImage attached as a stable download
+      # link. Uses gh (preinstalled on GitHub-hosted runners) + the
+      # auto-provisioned GITHUB_TOKEN rather than a third-party action.
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APPIMAGE=$(ls apps/desktop/dist/*.AppImage)
+          gh release create "${{ github.ref_name }}" "$APPIMAGE" \
+            --title "scadstudio ${{ github.ref_name }}" \
+            --prerelease \
+            --generate-notes
