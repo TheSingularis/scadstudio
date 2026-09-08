@@ -3,7 +3,7 @@ import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { Vector3, type Group } from 'three';
+import { Quaternion, Vector3, type Group } from 'three';
 
 // Derived from drei's own component rather than three's OrbitControls
 // directly — drei pins a slightly different three.js generic signature and
@@ -13,16 +13,28 @@ type OrbitControlsImpl = ComponentRef<typeof OrbitControls>;
 export interface NodeMesh {
   index: number;
   bytes: Uint8Array;
+  // World-space point OpenSCAD would rotate/scale this node around (an
+  // enclosing translate's xyz, or the origin) — see targetedPatch.ts's
+  // getPivotOrigin. Deliberately *not* the mesh's own bounding-box center:
+  // an off-center primitive (e.g. a default, non-`center=true` cylinder)
+  // would otherwise visibly displace on every rotate/scale commit, since
+  // three.js would be pivoting around a different point than OpenSCAD does.
+  pivot: [number, number, number];
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
+
+// translate/scale commit as a plain 3-vector (delta / ratio); rotate commits
+// as a quaternion (x,y,z,w) — see targetedPatch.ts's patchRotate for why a
+// raw Euler delta isn't enough to compose multi-axis rotations correctly.
+export type GizmoCommitValue = [number, number, number] | [number, number, number, number];
 
 interface ViewportProps {
   meshes: NodeMesh[];
   selectedIndex: number | null;
   onSelect: (index: number | null) => void;
   gizmoMode: GizmoMode;
-  onTransformCommit: (index: number, mode: GizmoMode, value: [number, number, number]) => void;
+  onTransformCommit: (index: number, mode: GizmoMode, value: GizmoCommitValue) => void;
 }
 
 function NodeModel({
@@ -41,18 +53,18 @@ function NodeModel({
   // mesh's own origin sits wherever OpenSCAD's coordinate origin happened to
   // be, not on the shape itself. A gizmo attached directly to the mesh would
   // render there instead of on the shape (see PLAN.md M4 build notes). Fix:
-  // wrap the mesh in a pivot group centered on its own bounding box, offset
-  // the mesh by -center inside it, and attach the gizmo to the *group*. The
-  // mesh is a child, so dragging the group's transform drags the visible
-  // shape along with it for free, via ordinary scene-graph parenting.
-  const { geometry, center } = useMemo(() => {
+  // wrap the mesh in a pivot group positioned at the node's true OpenSCAD
+  // pivot (see NodeMesh.pivot), offset the mesh by -pivot inside it, and
+  // attach the gizmo to the *group*. The mesh is a child, so dragging the
+  // group's transform drags the visible shape along with it for free, via
+  // ordinary scene-graph parenting.
+  const geometry = useMemo(() => {
     const geom = new STLLoader().parse(mesh.bytes.buffer as ArrayBuffer);
     geom.computeVertexNormals();
-    geom.computeBoundingBox();
-    const c = new Vector3();
-    geom.boundingBox?.getCenter(c);
-    return { geometry: geom, center: c };
+    return geom;
   }, [mesh.bytes]);
+
+  const pivot = useMemo(() => new Vector3(...mesh.pivot), [mesh.pivot]);
 
   const groupRef = useRef<Group>(null);
   // A fresh render already bakes any committed rotate/scale into the new STL
@@ -65,7 +77,7 @@ function NodeModel({
   // reapplying it even though TransformControls mutated the live object in
   // between — confirmed by a live drag's `dragStart` reading the previous
   // drag's leftover value instead of identity. Position doesn't have this
-  // problem because `center` is a genuinely new value on every geometry
+  // problem because `pivot` is a genuinely new value on every geometry
   // change. Resetting imperatively on the ref, bypassing prop-diffing
   // entirely, is what actually works.
   useLayoutEffect(() => {
@@ -79,10 +91,10 @@ function NodeModel({
         groupRef.current = g;
         onGroupRef(mesh.index, g);
       }}
-      position={center}
+      position={pivot}
     >
       <mesh
-        position={[-center.x, -center.y, -center.z]}
+        position={[-pivot.x, -pivot.y, -pivot.z]}
         geometry={geometry}
         onClick={(e: ThreeEvent<MouseEvent>) => {
           e.stopPropagation();
@@ -95,21 +107,14 @@ function NodeModel({
   );
 }
 
-const RAD_TO_DEG = 180 / Math.PI;
-
-// What each gizmo mode reads off the target Object3D — translate/rotate read
-// additively (end - start), scale reads as a ratio (end / start, since scale
-// always starts at the group's reset identity of 1 — see NodeModel's
-// rotation/scale reset comment).
-function readModeVector(target: Group, mode: GizmoMode): [number, number, number] {
-  if (mode === 'rotate') return [target.rotation.x, target.rotation.y, target.rotation.z];
-  if (mode === 'scale') return [target.scale.x, target.scale.y, target.scale.z];
-  return [target.position.x, target.position.y, target.position.z];
-}
-
 export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransformCommit }: ViewportProps) {
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
-  const dragStart = useRef<[number, number, number] | null>(null);
+  // Translate/scale drag baseline (position or scale, mode-dependent).
+  const dragStartVector = useRef<[number, number, number] | null>(null);
+  // Rotate drag baseline, kept as a quaternion rather than Euler — see
+  // targetedPatch.ts's patchRotate for why raw Euler deltas can't be summed
+  // correctly across multi-axis drags.
+  const dragStartQuat = useRef<Quaternion | null>(null);
   const groupsByIndex = useRef(new Map<number, Group>());
   // TransformControls' gizmo (rings/arrows) is a raw three.js object, not an
   // r3f-managed one with its own onClick — so releasing a drag on it still
@@ -172,25 +177,43 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransfo
           onMouseDown={() => {
             isTransformingRef.current = true;
             if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
-            dragStart.current = readModeVector(transformTarget, gizmoMode);
+            if (gizmoMode === 'rotate') {
+              dragStartQuat.current = transformTarget.quaternion.clone();
+            } else if (gizmoMode === 'scale') {
+              dragStartVector.current = transformTarget.scale.toArray();
+            } else {
+              dragStartVector.current = transformTarget.position.toArray();
+            }
           }}
           onMouseUp={() => {
             if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
-            const start = dragStart.current;
-            dragStart.current = null;
             // Deferred a tick past the native 'click' that follows this
             // 'mouseup' — see isTransformingRef's declaration above.
             setTimeout(() => {
               isTransformingRef.current = false;
             }, 0);
-            if (!start || selectedIndex === null) return;
-            const end = readModeVector(transformTarget, gizmoMode);
+            if (selectedIndex === null) return;
+
+            if (gizmoMode === 'rotate') {
+              const start = dragStartQuat.current;
+              dragStartQuat.current = null;
+              if (!start) return;
+              // Delta = end * start⁻¹ — the rotation applied *during* this
+              // drag, independent of whatever the group's baseline was.
+              const delta = transformTarget.quaternion.clone().multiply(start.clone().invert());
+              if (Math.abs(delta.w) < 1 - 1e-6) onTransformCommit(selectedIndex, 'rotate', delta.toArray() as GizmoCommitValue);
+              return;
+            }
+
+            const start = dragStartVector.current;
+            dragStartVector.current = null;
+            if (!start) return;
+            const end =
+              gizmoMode === 'scale' ? transformTarget.scale.toArray() : transformTarget.position.toArray();
             const value: [number, number, number] =
               gizmoMode === 'scale'
                 ? [end[0] / start[0], end[1] / start[1], end[2] / start[2]]
-                : gizmoMode === 'rotate'
-                  ? [(end[0] - start[0]) * RAD_TO_DEG, (end[1] - start[1]) * RAD_TO_DEG, (end[2] - start[2]) * RAD_TO_DEG]
-                  : [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+                : [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
             const changed =
               gizmoMode === 'scale' ? value.some((v) => Math.abs(v - 1) > 1e-6) : value.some((v) => Math.abs(v) > 1e-6);
             if (changed) onTransformCommit(selectedIndex, gizmoMode, value);

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
-import { Viewport, type GizmoMode, type NodeMesh } from './components/Viewport';
+import { Viewport, type GizmoCommitValue, type GizmoMode, type NodeMesh } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, nodeSource, type SceneNode } from './sceneGraph';
-import { patchTranslate, patchRotate, patchScale } from './targetedPatch';
+import { patchTranslate, patchRotate, patchScale, getPivotOrigin } from './targetedPatch';
 import { appendPrimitive, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
 
@@ -92,7 +92,7 @@ export function App() {
           for (const node of graph.nodes) {
             try {
               const bytes = await window.scadstudio.renderScad(nodeSource(graph, node, src));
-              meshes.push({ index: node.index, bytes });
+              meshes.push({ index: node.index, bytes, pivot: getPivotOrigin(tree.rootNode, node) });
             } catch (err) {
               console.error(`[scadstudio] node ${node.index} render failed`, err);
             }
@@ -141,12 +141,16 @@ export function App() {
   // "Visual edit path"). Dragging itself never reaches here; only the
   // drag-end value does, which is what makes skip-WASM-during-drag free.
   const handleTransformCommit = useCallback(
-    (index: number, mode: GizmoMode, value: [number, number, number]) => {
+    (index: number, mode: GizmoMode, value: GizmoCommitValue) => {
       const tree = treeRef.current;
       const node = sceneNodesRef.current.find((n) => n.index === index);
       if (!tree || !node) return;
-      const patch = mode === 'rotate' ? patchRotate : mode === 'scale' ? patchScale : patchTranslate;
-      const patched = patch(sourceRef.current, tree, node, value);
+      const patched =
+        mode === 'rotate'
+          ? patchRotate(sourceRef.current, tree, node, value as [number, number, number, number])
+          : mode === 'scale'
+            ? patchScale(sourceRef.current, tree, node, value as [number, number, number])
+            : patchTranslate(sourceRef.current, tree, node, value as [number, number, number]);
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(patched);
       runRender(patched);

@@ -1,5 +1,20 @@
 import type { Node, Tree } from 'web-tree-sitter';
+import { Euler, Quaternion } from 'three';
 import type { SceneNode } from './sceneGraph';
+
+const DEG2RAD = Math.PI / 180;
+const RAD2DEG = 180 / Math.PI;
+
+// Verified empirically (see PLAN.md M5 rotation-composition build notes) by
+// comparing rendered STL vertices: OpenSCAD's `rotate([x,y,z])` is exactly
+// equivalent to `rotate([0,0,z]) rotate([0,y,0]) rotate([x,0,0])` — i.e. the
+// rotation matrix is Rz·Ry·Rx applied to points (X rotates first). Three.js's
+// Euler order string that matches this is `'ZYX'`, *not* the `'XYZ'` default
+// used by Object3D.rotation — reading a live gizmo's `.rotation.{x,y,z}`
+// directly and treating it as an OpenSCAD `[x,y,z]` triple is only valid for
+// single-axis rotation; anything multi-axis needs to go through this order
+// explicitly via quaternions, not raw Euler component arithmetic.
+const OPENSCAD_EULER_ORDER = 'ZYX' as const;
 
 export interface TranslateVector {
   startIndex: number;
@@ -24,6 +39,20 @@ export function findTranslateVector(root: Node, node: SceneNode): TranslateVecto
   if (concrete.childForFieldName('name')?.text !== 'translate') return null;
   const vc = readVectorCall(concrete);
   return vc && { startIndex: vc.vectorStart, endIndex: vc.vectorEnd, xyz: vc.xyz };
+}
+
+// The world-space point OpenSCAD's own rotate/scale would pivot around for
+// this node — i.e. wherever an enclosing translate() has moved the local
+// origin to, or the world origin itself if there's none. This is *not* the
+// same as the rendered mesh's bounding-box center (e.g. a default,
+// non-`center=true` cylinder's bbox center sits at half its height, but
+// OpenSCAD still rotates/scales it around its base) — using the bbox center
+// as the gizmo's pivot silently displaces asymmetric shapes on every
+// rotate/scale commit, since three.js pivots around a different point than
+// OpenSCAD actually does.
+export function getPivotOrigin(root: Node, node: SceneNode): [number, number, number] {
+  const existing = findTranslateVector(root, node);
+  return existing ? existing.xyz : [0, 0, 0];
 }
 
 function formatNumber(n: number): string {
@@ -130,11 +159,8 @@ function walkChainFrom(startConcrete: Node | null): Node[] {
 // rotate/scale are "in place" edits (spin or resize the shape around its own
 // local origin), unlike translate's world-space move — so unlike
 // findTranslateVector, they intentionally look *past* a single leading
-// `translate(...)` wrap (if any) rather than only at the outermost call, and
-// a fresh wrap is inserted at the *innermost* position, immediately before
-// the base primitive. That keeps `translate([40,0,0]) rotate([..]) sphere();`
-// spinning the sphere in place rather than orbiting it around the world
-// origin. Known limitation: only one leading translate is skipped, and only
+// `translate(...)` wrap (if any) rather than only at the outermost call.
+// Known limitation: only one leading translate is skipped, and only
 // vector-form rotate (`rotate([x,y,z])`, not the `rotate(a, v=[...])` or bare
 // scalar forms) is recognized — see M4's findTranslateVector for the same
 // vector-only scoping precedent.
@@ -159,34 +185,65 @@ function findLocalTransform(root: Node, node: SceneNode, kind: LocalTransformKin
   return null;
 }
 
+// Where a brand-new (not-yet-existing) local wrap goes: *outermost* in the
+// local chain — immediately after any enclosing translate, wrapping any
+// rotate/scale that's already there — not innermost next to the base
+// primitive. This matters whenever a shape already has one local transform
+// and the user drags a *different* one for the first time (e.g. rotate
+// already exists, now dragging scale): the gizmo's own pivot group is never
+// itself rotated (M4/M5's earlier fix bakes rotation into geometry, not the
+// group's transform), so every live drag actually happens in the
+// translate-only, axis-aligned frame — inserting the new wrap innermost would
+// put it *inside* the existing rotate, silently reinterpreting the drag in
+// the shape's pre-rotation local axes instead of the frame it was dragged in.
 function localInsertPoint(root: Node, node: SceneNode): number {
   const chain = getLocalChain(root, node);
-  return chain.length > 0 ? chain[chain.length - 1].startIndex : node.startIndex;
+  return chain.length > 0 ? chain[0].startIndex : node.startIndex;
 }
 
-// Rotate gizmo commit: degrees, additive (matches OpenSCAD's rotate([x,y,z])
-// taking degrees). Known limitation, not yet verified: three.js's Euler
-// composition order for combined multi-axis rotation may not exactly match
-// OpenSCAD's own rotate([x,y,z]) composition order — single-axis drags are
-// unambiguous and are what M5's verification actually exercises; combined
-// multi-axis rotates should be treated as unverified until checked directly
-// against real OpenSCAD output.
-export function patchRotate(source: string, tree: Tree, node: SceneNode, deltaDegrees: [number, number, number]): string {
+// Rotate gizmo commit: `deltaQuat` is the rotation applied during the drag,
+// read directly off the gizmo's live quaternion (world-frame-equivalent,
+// since the pivot group itself is never rotated between commits — see
+// localInsertPoint's comment). Composing this correctly with any existing
+// rotate([x,y,z]) requires going through quaternions, not raw Euler
+// arithmetic: naively adding Euler components (the M5-launch approach) is
+// only valid when every drag stays on one axis — combining rotations around
+// *different* axes that way doesn't represent real 3D rotation composition
+// and drifts into garbage values after a few drags. OpenSCAD's own
+// `rotate([x,y,z])` was verified (by comparing rendered STL vertices against
+// nested single-axis rotate calls) to be equivalent to applying X, then Y,
+// then Z — three.js's Euler order `'ZYX'` matches that construction exactly.
+export function patchRotate(
+  source: string,
+  tree: Tree,
+  node: SceneNode,
+  deltaQuat: [number, number, number, number],
+): string {
+  const delta = new Quaternion(...deltaQuat);
   const existing = findLocalTransform(tree.rootNode, node, 'rotate');
+  const existingQuat = existing
+    ? new Quaternion().setFromEuler(
+        new Euler(existing.xyz[0] * DEG2RAD, existing.xyz[1] * DEG2RAD, existing.xyz[2] * DEG2RAD, OPENSCAD_EULER_ORDER),
+      )
+    : new Quaternion();
+  // Delta was dragged in the outer (translate-only) frame, so it composes on
+  // the outside of whatever rotation already exists.
+  const total = delta.multiply(existingQuat);
+  const totalEuler = new Euler().setFromQuaternion(total, OPENSCAD_EULER_ORDER);
+  const newVec = formatVector([totalEuler.x * RAD2DEG, totalEuler.y * RAD2DEG, totalEuler.z * RAD2DEG]);
+
   if (existing) {
-    const [x, y, z] = existing.xyz;
-    const newVec = formatVector([x + deltaDegrees[0], y + deltaDegrees[1], z + deltaDegrees[2]]);
     return source.slice(0, existing.vectorStart) + newVec + source.slice(existing.vectorEnd);
   }
   const insertAt = localInsertPoint(tree.rootNode, node);
-  const newVec = formatVector(deltaDegrees);
   return `${source.slice(0, insertAt)}rotate(${newVec})\n    ${source.slice(insertAt)}`;
 }
 
 // Scale gizmo commit: multiplicative (three.js scale starts at 1 each time
 // the gizmo re-attaches to a freshly-rendered mesh, so `ratio` is `end/start`
 // from the drag, and composes onto any existing scale([...]) by multiplying
-// componentwise rather than adding).
+// componentwise rather than adding). No Euler-order concerns here — scale
+// isn't a rotation, so plain componentwise multiplication is exact.
 export function patchScale(source: string, tree: Tree, node: SceneNode, ratio: [number, number, number]): string {
   const existing = findLocalTransform(tree.rootNode, node, 'scale');
   if (existing) {
