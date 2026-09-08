@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
@@ -54,14 +54,33 @@ function NodeModel({
     return { geometry: geom, center: c };
   }, [mesh.bytes]);
 
+  const groupRef = useRef<Group>(null);
+  // A fresh render already bakes any committed rotate/scale into the new STL
+  // vertices, so the pivot's own rotation/scale must go back to identity —
+  // otherwise a committed value would apply twice: once baked into the
+  // geometry, once left over from the gizmo's last imperative mutation. A
+  // declarative `rotation={[0,0,0]} scale={[1,1,1]}` prop does *not* achieve
+  // this: react-three-fiber diffs against the last value *it* applied, and
+  // since that literal never changes across renders, it silently skips
+  // reapplying it even though TransformControls mutated the live object in
+  // between — confirmed by a live drag's `dragStart` reading the previous
+  // drag's leftover value instead of identity. Position doesn't have this
+  // problem because `center` is a genuinely new value on every geometry
+  // change. Resetting imperatively on the ref, bypassing prop-diffing
+  // entirely, is what actually works.
+  useLayoutEffect(() => {
+    groupRef.current?.rotation.set(0, 0, 0);
+    groupRef.current?.scale.set(1, 1, 1);
+  }, [geometry]);
+
   return (
-    // rotation/scale are set explicitly (not left to default) so that a fresh
-    // render — which already bakes any committed rotate/scale into the STL
-    // vertices themselves — forces the pivot back to identity every time,
-    // clearing whatever the previous drag left on this same Object3D. Without
-    // this, a committed rotate/scale would apply twice: once baked into the
-    // new geometry, once left over from the gizmo's last imperative mutation.
-    <group ref={(g) => onGroupRef(mesh.index, g)} position={center} rotation={[0, 0, 0]} scale={[1, 1, 1]}>
+    <group
+      ref={(g) => {
+        groupRef.current = g;
+        onGroupRef(mesh.index, g);
+      }}
+      position={center}
+    >
       <mesh
         position={[-center.x, -center.y, -center.z]}
         geometry={geometry}
