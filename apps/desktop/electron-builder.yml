@@ -23,3 +23,11 @@ linux:
     - AppImage
   category: Utility
   artifactName: ${productName}-${version}-${arch}.${ext}
+win:
+  # "portable" = a single self-contained .exe, no installer — same
+  # just-run-it spirit as the AppImage, and no code-signing cert needed
+  # (unsigned .exe will show an unrecognized-publisher SmartScreen prompt,
+  # acceptable for a private beta).
+  target:
+    - portable
+  artifactName: ${productName}-${version}-${arch}.${ext}

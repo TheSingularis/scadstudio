@@ -1,0 +1,168 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck --workspace=@scadstudio/desktop
+
+      - name: Build AppImage
+        run: npm run package:linux --workspace=@scadstudio/desktop
+
+      # electron-builder only needs to unzip a prebuilt Electron to *package* the
+      # app, but doesn't need a display or GUI libs for that. This step is a real
+      # smoke test on top: extract the AppImage and actually launch it headlessly
+      # under Xvfb (same technique used for manual milestone verification) so a
+      # packaging regression doesn't silently ship as a broken AppImage. See
+      # PLAN.md's CI/CD notes for why this matters — a plausible-looking build can
+      # still be missing a runtime dependency.
+      - name: Install headless runtime deps for smoke test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libuuid1 libsecret-1-0
+          # Package name flipped (libasound2 -> libasound2t64) across Ubuntu
+          # versions during the 64-bit time_t transition; try both.
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+
+      - name: Smoke test the packaged AppImage
+        run: |
+          set -e
+          APPIMAGE=$(ls apps/desktop/dist/*.AppImage)
+          chmod +x "$APPIMAGE"
+          "$APPIMAGE" --appimage-extract
+          SCADSTUDIO_SCREENSHOT=/tmp/smoke.png \
+            timeout 25 xvfb-run -a ./squashfs-root/AppRun \
+              --no-sandbox --use-gl=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist \
+              2>&1 | tee /tmp/smoke.log
+          test -s /tmp/smoke.png
+          [ "$(stat -c%s /tmp/smoke.png)" -gt 10000 ]
+          ! grep -q "Uncaught" /tmp/smoke.log
+          ! grep -q "render failed" /tmp/smoke.log
+
+      - name: Upload smoke test screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-screenshot-linux
+          path: /tmp/smoke.png
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: scadstudio-appimage
+          path: apps/desktop/dist/*.AppImage
+          retention-days: 14
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck --workspace=@scadstudio/desktop
+
+      # "portable" target: a single self-contained .exe (NSIS stub that
+      # extracts to %TEMP% and launches on run), no installer, same
+      # just-run-it spirit as the Linux AppImage. Unsigned (no code-signing
+      # cert), so Windows SmartScreen will show an unrecognized-publisher
+      # warning on first run — acceptable for a private beta.
+      - name: Build portable exe
+        run: npm run package:win --workspace=@scadstudio/desktop
+
+      # Same principle as the Linux smoke test: a build that completes
+      # doesn't prove the packaged app actually launches. windows-latest
+      # runners have no GPU, so this needs the same software-rendering
+      # fallback as Xvfb-under-Linux; using bash here (present on
+      # windows-latest via Git for Windows) rather than PowerShell so this
+      # stays close to the Linux job's already-proven approach.
+      - name: Smoke test the packaged exe
+        shell: bash
+        run: |
+          set -e
+          EXE=$(ls apps/desktop/dist/*.exe)
+          SCADSTUDIO_SCREENSHOT="$(cygpath -w /tmp/smoke-win.png 2>/dev/null || echo /tmp/smoke-win.png)" \
+            timeout 30 "$EXE" --no-sandbox --disable-gpu --use-gl=swiftshader \
+              2>&1 | tee /tmp/smoke-win.log || true
+          test -s /tmp/smoke-win.png
+          [ "$(stat -c%s /tmp/smoke-win.png 2>/dev/null || stat -f%z /tmp/smoke-win.png)" -gt 10000 ]
+          ! grep -q "Uncaught" /tmp/smoke-win.log
+          ! grep -q "render failed" /tmp/smoke-win.log
+
+      - name: Upload smoke test screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-screenshot-windows
+          path: /tmp/smoke-win.png
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: scadstudio-exe
+          path: apps/desktop/dist/*.exe
+          retention-days: 14
+
+  # Every push to master gets workflow-artifact builds (above) for quick
+  # iteration; pushing a version tag (e.g. v0.1.0-beta.1) additionally cuts a
+  # proper GitHub Release with both platform builds attached as a stable
+  # download link. Runs as its own job (needs both builds) rather than
+  # letting each build job call `gh release create` independently, to avoid
+  # two parallel jobs racing to create the same release. Uses gh
+  # (preinstalled on GitHub-hosted runners) + the auto-provisioned
+  # GITHUB_TOKEN rather than a third-party action.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scadstudio-appimage
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: scadstudio-exe
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.AppImage dist/*.exe \
+            --repo "${{ github.repository }}" \
+            --title "scadstudio ${{ github.ref_name }}" \
+            --prerelease \
+            --generate-notes
