@@ -106,26 +106,34 @@ jobs:
       # runners have no GPU, so this needs the same software-rendering
       # fallback as Xvfb-under-Linux; using bash here (present on
       # windows-latest via Git for Windows) rather than PowerShell so this
-      # stays close to the Linux job's already-proven approach.
+      # stays close to the Linux job's already-proven approach. Screenshot
+      # path uses $RUNNER_TEMP (not /tmp) specifically so both this bash step
+      # and the native-Node upload-artifact step below can resolve the same
+      # file — a hardcoded /tmp path is silently unresolvable by
+      # upload-artifact on Windows even though bash (via Git-Bash's own path
+      # translation) finds it just fine, so the smoke test itself passes
+      # while the screenshot artifact quietly never uploads (caught on this
+      # workflow's first real Windows CI run).
       - name: Smoke test the packaged exe
         shell: bash
         run: |
           set -e
           EXE=$(ls apps/desktop/dist/*.exe)
-          SCADSTUDIO_SCREENSHOT="$(cygpath -w /tmp/smoke-win.png 2>/dev/null || echo /tmp/smoke-win.png)" \
+          SCREENSHOT="$RUNNER_TEMP/smoke-win.png"
+          SCADSTUDIO_SCREENSHOT="$SCREENSHOT" \
             timeout 30 "$EXE" --no-sandbox --disable-gpu --use-gl=swiftshader \
-              2>&1 | tee /tmp/smoke-win.log || true
-          test -s /tmp/smoke-win.png
-          [ "$(stat -c%s /tmp/smoke-win.png 2>/dev/null || stat -f%z /tmp/smoke-win.png)" -gt 10000 ]
-          ! grep -q "Uncaught" /tmp/smoke-win.log
-          ! grep -q "render failed" /tmp/smoke-win.log
+              2>&1 | tee "$RUNNER_TEMP/smoke-win.log" || true
+          test -s "$SCREENSHOT"
+          [ "$(stat -c%s "$SCREENSHOT" 2>/dev/null || stat -f%z "$SCREENSHOT")" -gt 10000 ]
+          ! grep -q "Uncaught" "$RUNNER_TEMP/smoke-win.log"
+          ! grep -q "render failed" "$RUNNER_TEMP/smoke-win.log"
 
       - name: Upload smoke test screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-test-screenshot-windows
-          path: /tmp/smoke-win.png
+          path: ${{ runner.temp }}/smoke-win.png
           retention-days: 14
           if-no-files-found: ignore
 
