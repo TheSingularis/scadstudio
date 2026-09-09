@@ -43,7 +43,24 @@ function createWindow(): void {
   // the render has had time to settle, then exit. See PLAN.md M1 verification notes.
   if (process.env['SCADSTUDIO_SCREENSHOT']) {
     win.webContents.once('did-finish-load', () => {
-      setTimeout(async () => {
+      (async () => {
+        // Poll for the "Rendered" status text instead of a fixed delay — a
+        // fixed wait that happens to be enough on one platform isn't
+        // necessarily enough on another. Caught for real: this fixed-delay
+        // approach shipped a Windows CI smoke-test screenshot showing an
+        // empty viewport still reading "Rendering..." (the exact same wait
+        // that fully completes on Linux), because WASM compile/render is
+        // measurably slower on that runner. "Rendered" doesn't match
+        // mid-render's "Rendering..." (they diverge at the 7th letter).
+        const maxWaitMs = 20000;
+        const pollIntervalMs = 250;
+        const deadline = Date.now() + maxWaitMs;
+        while (Date.now() < deadline) {
+          const rendered = await win.webContents.executeJavaScript('document.body.innerText.includes("Rendered")');
+          if (rendered) break;
+          await new Promise((r) => setTimeout(r, pollIntervalMs));
+        }
+
         if (process.env['SCADSTUDIO_TEST_EDIT']) {
           await win.webContents.executeJavaScript(
             `window.__testEditor.setValue(${JSON.stringify(process.env['SCADSTUDIO_TEST_EDIT'])})`,
@@ -95,7 +112,7 @@ function createWindow(): void {
         const image = await win.webContents.capturePage();
         await writeFile(process.env['SCADSTUDIO_SCREENSHOT']!, image.toPNG());
         app.quit();
-      }, 3000);
+      })();
     });
   }
 }
