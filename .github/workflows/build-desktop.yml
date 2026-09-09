@@ -120,8 +120,13 @@ jobs:
           set -e
           EXE=$(ls apps/desktop/dist/*.exe)
           SCREENSHOT="$RUNNER_TEMP/smoke-win.png"
+          # 90s, not the Linux job's 25s: this runner's WASM compile/render
+          # is measurably slower (see the render-completion poll loop added
+          # to main/index.ts for the same reason) — a tighter timeout here
+          # killed the process mid-poll on the first attempt with this fix,
+          # before it ever reached the screenshot capture.
           SCADSTUDIO_SCREENSHOT="$SCREENSHOT" \
-            timeout 30 "$EXE" --no-sandbox --disable-gpu --use-gl=swiftshader \
+            timeout 90 "$EXE" --no-sandbox --disable-gpu --use-gl=swiftshader \
               2>&1 | tee "$RUNNER_TEMP/smoke-win.log" || true
           test -s "$SCREENSHOT"
           [ "$(stat -c%s "$SCREENSHOT" 2>/dev/null || stat -f%z "$SCREENSHOT")" -gt 10000 ]

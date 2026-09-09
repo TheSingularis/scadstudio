@@ -52,7 +52,7 @@ function createWindow(): void {
         // that fully completes on Linux), because WASM compile/render is
         // measurably slower on that runner. "Rendered" doesn't match
         // mid-render's "Rendering..." (they diverge at the 7th letter).
-        const maxWaitMs = 20000;
+        const maxWaitMs = 60000;
         const pollIntervalMs = 250;
         const deadline = Date.now() + maxWaitMs;
         while (Date.now() < deadline) {
