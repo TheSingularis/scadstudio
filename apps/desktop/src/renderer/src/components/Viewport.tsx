@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { Quaternion, Vector3, type Group } from 'three';
+import { Vector3, type Group } from 'three';
+import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform } from '../targetedPatch';
 
 // Derived from drei's own component rather than three's OrbitControls
 // directly — drei pins a slightly different three.js generic signature and
@@ -13,28 +14,24 @@ type OrbitControlsImpl = ComponentRef<typeof OrbitControls>;
 export interface NodeMesh {
   index: number;
   bytes: Uint8Array;
-  // World-space point OpenSCAD would rotate/scale this node around (an
-  // enclosing translate's xyz, or the origin) — see targetedPatch.ts's
-  // getPivotOrigin. Deliberately *not* the mesh's own bounding-box center:
-  // an off-center primitive (e.g. a default, non-`center=true` cylinder)
-  // would otherwise visibly displace on every rotate/scale commit, since
-  // three.js would be pivoting around a different point than OpenSCAD does.
-  pivot: [number, number, number];
+  // Placement is a real transform now, not baked into the geometry — see
+  // targetedPatch.ts's decomposeNode. This is what actually fixed the pivot
+  // bug (rotate/scale correctly pivot around the shape's own local origin,
+  // since that's where the geometry's own (0,0,0) already is) *and* the
+  // "scale looks world-aligned after rotating" bug (the gizmo can now
+  // legitimately operate in the object's local space, because the object
+  // really does carry the rotation as its own transform).
+  transform: NodeTransform;
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
-
-// translate/scale commit as a plain 3-vector (delta / ratio); rotate commits
-// as a quaternion (x,y,z,w) — see targetedPatch.ts's patchRotate for why a
-// raw Euler delta isn't enough to compose multi-axis rotations correctly.
-export type GizmoCommitValue = [number, number, number] | [number, number, number, number];
 
 interface ViewportProps {
   meshes: NodeMesh[];
   selectedIndex: number | null;
   onSelect: (index: number | null) => void;
   gizmoMode: GizmoMode;
-  onTransformCommit: (index: number, mode: GizmoMode, value: GizmoCommitValue) => void;
+  onTransformCommit: (index: number, transform: NodeTransform) => void;
 }
 
 function NodeModel({
@@ -48,53 +45,31 @@ function NodeModel({
   onSelect: (index: number) => void;
   onGroupRef: (index: number, group: Group | null) => void;
 }) {
-  // openscad-wasm bakes every node's absolute position into its STL vertices
-  // (there's no separate "transform" the mesh Object3D could hold) — so the
-  // mesh's own origin sits wherever OpenSCAD's coordinate origin happened to
-  // be, not on the shape itself. A gizmo attached directly to the mesh would
-  // render there instead of on the shape (see PLAN.md M4 build notes). Fix:
-  // wrap the mesh in a pivot group positioned at the node's true OpenSCAD
-  // pivot (see NodeMesh.pivot), offset the mesh by -pivot inside it, and
-  // attach the gizmo to the *group*. The mesh is a child, so dragging the
-  // group's transform drags the visible shape along with it for free, via
-  // ordinary scene-graph parenting.
+  // openscad-wasm renders just the bare primitive now (translate/rotate/
+  // scale are stripped before sending source to WASM — see App.tsx), so this
+  // geometry already sits at the primitive's own OpenSCAD-local origin with
+  // no placement baked in. The pivot group's position/quaternion/scale *are*
+  // the node's translate/rotate/scale, applied via three.js's own transform
+  // composition (T·R·S, the same order OpenSCAD composes them in) — so no
+  // manual pivot/bounding-box math and no reset-on-render hack are needed:
+  // these props are always driven fresh from the parsed source, exactly like
+  // a normal declarative React prop.
   const geometry = useMemo(() => {
     const geom = new STLLoader().parse(mesh.bytes.buffer as ArrayBuffer);
     geom.computeVertexNormals();
     return geom;
   }, [mesh.bytes]);
 
-  const pivot = useMemo(() => new Vector3(...mesh.pivot), [mesh.pivot]);
-
-  const groupRef = useRef<Group>(null);
-  // A fresh render already bakes any committed rotate/scale into the new STL
-  // vertices, so the pivot's own rotation/scale must go back to identity —
-  // otherwise a committed value would apply twice: once baked into the
-  // geometry, once left over from the gizmo's last imperative mutation. A
-  // declarative `rotation={[0,0,0]} scale={[1,1,1]}` prop does *not* achieve
-  // this: react-three-fiber diffs against the last value *it* applied, and
-  // since that literal never changes across renders, it silently skips
-  // reapplying it even though TransformControls mutated the live object in
-  // between — confirmed by a live drag's `dragStart` reading the previous
-  // drag's leftover value instead of identity. Position doesn't have this
-  // problem because `pivot` is a genuinely new value on every geometry
-  // change. Resetting imperatively on the ref, bypassing prop-diffing
-  // entirely, is what actually works.
-  useLayoutEffect(() => {
-    groupRef.current?.rotation.set(0, 0, 0);
-    groupRef.current?.scale.set(1, 1, 1);
-  }, [geometry]);
+  const quaternion = useMemo(() => transformToQuaternion(mesh.transform.rotateDeg), [mesh.transform.rotateDeg]);
 
   return (
     <group
-      ref={(g) => {
-        groupRef.current = g;
-        onGroupRef(mesh.index, g);
-      }}
-      position={pivot}
+      ref={(g) => onGroupRef(mesh.index, g)}
+      position={mesh.transform.translate}
+      quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
+      scale={mesh.transform.scale}
     >
       <mesh
-        position={[-pivot.x, -pivot.y, -pivot.z]}
         geometry={geometry}
         onClick={(e: ThreeEvent<MouseEvent>) => {
           e.stopPropagation();
@@ -107,14 +82,15 @@ function NodeModel({
   );
 }
 
+interface DragSnapshot {
+  position: Vector3;
+  quaternion: [number, number, number, number];
+  scale: Vector3;
+}
+
 export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransformCommit }: ViewportProps) {
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
-  // Translate/scale drag baseline (position or scale, mode-dependent).
-  const dragStartVector = useRef<[number, number, number] | null>(null);
-  // Rotate drag baseline, kept as a quaternion rather than Euler — see
-  // targetedPatch.ts's patchRotate for why raw Euler deltas can't be summed
-  // correctly across multi-axis drags.
-  const dragStartQuat = useRef<Quaternion | null>(null);
+  const dragStart = useRef<DragSnapshot | null>(null);
   const groupsByIndex = useRef(new Map<number, Group>());
   // TransformControls' gizmo (rings/arrows) is a raw three.js object, not an
   // r3f-managed one with its own onClick — so releasing a drag on it still
@@ -174,16 +150,25 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransfo
         <TransformControls
           object={transformTarget}
           mode={gizmoMode}
+          // Translate stays world-space (moving "up" should mean world-up
+          // even for a rotated object — the usual 3D-tool convention).
+          // Rotate/scale operate in the object's *current* local frame: this
+          // is what actually fixes "scale looks like it's applied with
+          // global directions in mind" once a shape has been rotated —
+          // previously the pivot group was never really rotated (rotation
+          // was baked into geometry instead), so a "local" mode would have
+          // been meaningless; now the group's own quaternion is the real
+          // rotation, so local-space handles genuinely track the shape's
+          // current orientation.
+          space={gizmoMode === 'translate' ? 'world' : 'local'}
           onMouseDown={() => {
             isTransformingRef.current = true;
             if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
-            if (gizmoMode === 'rotate') {
-              dragStartQuat.current = transformTarget.quaternion.clone();
-            } else if (gizmoMode === 'scale') {
-              dragStartVector.current = transformTarget.scale.toArray();
-            } else {
-              dragStartVector.current = transformTarget.position.toArray();
-            }
+            dragStart.current = {
+              position: transformTarget.position.clone(),
+              quaternion: transformTarget.quaternion.toArray() as [number, number, number, number],
+              scale: transformTarget.scale.clone(),
+            };
           }}
           onMouseUp={() => {
             if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
@@ -192,31 +177,34 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransfo
             setTimeout(() => {
               isTransformingRef.current = false;
             }, 0);
-            if (selectedIndex === null) return;
+            const start = dragStart.current;
+            dragStart.current = null;
+            if (!start || selectedIndex === null) return;
 
-            if (gizmoMode === 'rotate') {
-              const start = dragStartQuat.current;
-              dragStartQuat.current = null;
-              if (!start) return;
-              // Delta = end * start⁻¹ — the rotation applied *during* this
-              // drag, independent of whatever the group's baseline was.
-              const delta = transformTarget.quaternion.clone().multiply(start.clone().invert());
-              if (Math.abs(delta.w) < 1 - 1e-6) onTransformCommit(selectedIndex, 'rotate', delta.toArray() as GizmoCommitValue);
-              return;
-            }
-
-            const start = dragStartVector.current;
-            dragStartVector.current = null;
-            if (!start) return;
-            const end =
-              gizmoMode === 'scale' ? transformTarget.scale.toArray() : transformTarget.position.toArray();
-            const value: [number, number, number] =
-              gizmoMode === 'scale'
-                ? [end[0] / start[0], end[1] / start[1], end[2] / start[2]]
-                : [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+            const q = transformTarget.quaternion;
             const changed =
-              gizmoMode === 'scale' ? value.some((v) => Math.abs(v - 1) > 1e-6) : value.some((v) => Math.abs(v) > 1e-6);
-            if (changed) onTransformCommit(selectedIndex, gizmoMode, value);
+              !start.position.equals(transformTarget.position) ||
+              !start.scale.equals(transformTarget.scale) ||
+              start.quaternion[0] !== q.x ||
+              start.quaternion[1] !== q.y ||
+              start.quaternion[2] !== q.z ||
+              start.quaternion[3] !== q.w;
+            if (!changed) return;
+
+            // The group's current absolute position/quaternion/scale *is*
+            // the node's new transform — no delta/ratio/composition math
+            // needed, since (unlike the pre-refactor baked-geometry model)
+            // there's no separate "existing" value living in the source to
+            // combine with; this object's transform is the single source of
+            // truth for placement.
+            const p = transformTarget.position;
+            const s = transformTarget.scale;
+            const transform: NodeTransform = {
+              translate: [p.x, p.y, p.z],
+              rotateDeg: quaternionToRotateDeg(q),
+              scale: [s.x, s.y, s.z],
+            };
+            onTransformCommit(selectedIndex, transform);
           }}
         />
       )}

@@ -60,7 +60,3 @@ export function buildSceneGraph(tree: Tree, source: string): SceneGraph {
 
   return { nodes, context: contextParts.join('\n') };
 }
-
-export function nodeSource(graph: SceneGraph, node: SceneNode, fullSource: string): string {
-  return `${graph.context}\n${fullSource.slice(node.startIndex, node.endIndex)}`;
-}
