@@ -25,12 +25,14 @@ export interface NodeMesh {
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
+export type RotateSpace = 'local' | 'world';
 
 interface ViewportProps {
   meshes: NodeMesh[];
   selectedIndex: number | null;
   onSelect: (index: number | null) => void;
   gizmoMode: GizmoMode;
+  rotateSpace: RotateSpace;
   onTransformCommit: (index: number, transform: NodeTransform) => void;
 }
 
@@ -88,7 +90,7 @@ interface DragSnapshot {
   scale: Vector3;
 }
 
-export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransformCommit }: ViewportProps) {
+export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpace, onTransformCommit }: ViewportProps) {
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
   const dragStart = useRef<DragSnapshot | null>(null);
   const groupsByIndex = useRef(new Map<number, Group>());
@@ -152,15 +154,17 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, onTransfo
           mode={gizmoMode}
           // Translate stays world-space (moving "up" should mean world-up
           // even for a rotated object — the usual 3D-tool convention).
-          // Rotate/scale operate in the object's *current* local frame: this
-          // is what actually fixes "scale looks like it's applied with
-          // global directions in mind" once a shape has been rotated —
-          // previously the pivot group was never really rotated (rotation
-          // was baked into geometry instead), so a "local" mode would have
-          // been meaningless; now the group's own quaternion is the real
-          // rotation, so local-space handles genuinely track the shape's
-          // current orientation.
-          space={gizmoMode === 'translate' ? 'world' : 'local'}
+          // Scale stays local-only: OpenSCAD's scale() is always a plain
+          // per-axis stretch in whatever frame it's placed in, and there's
+          // no way to express "stretch along a world axis that doesn't line
+          // up with the object's own axes" without a shear-capable
+          // multmatrix() call, which isn't supported here — a "global scale"
+          // toggle could only ever be honest for unrotated shapes. Rotate is
+          // the one mode where both are meaningful and both round-trip
+          // cleanly (see onMouseUp below — space only changes how a drag
+          // *feels*, not how the result is read back), so it's user-toggled
+          // via rotateSpace.
+          space={gizmoMode === 'translate' ? 'world' : gizmoMode === 'rotate' ? rotateSpace : 'local'}
           onMouseDown={() => {
             isTransformingRef.current = true;
             if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;

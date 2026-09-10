@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
-import { Viewport, type GizmoMode, type NodeMesh } from './components/Viewport';
+import { Viewport, type GizmoMode, type NodeMesh, type RotateSpace } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import { patchTransform, primitiveSource, decomposeNode, IDENTITY_TRANSFORM, type NodeTransform } from './targetedPatch';
@@ -20,6 +20,15 @@ const GIZMO_MODE_BUTTONS: { mode: GizmoMode; label: string }[] = [
   { mode: 'translate', label: 'Move' },
   { mode: 'rotate', label: 'Rotate' },
   { mode: 'scale', label: 'Scale' },
+];
+
+// Only rotate gets a local/world toggle — translate is always world (moving
+// "up" should mean world-up even for a rotated shape), and scale is always
+// local (OpenSCAD's scale() can't express a world-axis stretch on a rotated
+// shape without a multmatrix() shear, which isn't supported here).
+const ROTATE_SPACE_BUTTONS: { space: RotateSpace; label: string }[] = [
+  { space: 'local', label: 'Local' },
+  { space: 'world', label: 'World' },
 ];
 
 const DEFAULT_SOURCE = `// scadstudio M5 — drag the gizmo (Move/Rotate/Scale), insert primitives, or click to select
@@ -53,6 +62,7 @@ export function App() {
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>('translate');
+  const [rotateSpace, setRotateSpace] = useState<RotateSpace>('local');
   const [status, setStatus] = useState('Rendering...');
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -226,6 +236,20 @@ export function App() {
             </button>
           ))}
         </span>
+        {gizmoMode === 'rotate' && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Space:
+            {ROTATE_SPACE_BUTTONS.map(({ space, label }) => (
+              <button
+                key={space}
+                onClick={() => setRotateSpace(space)}
+                style={{ fontWeight: rotateSpace === space ? 'bold' : 'normal' }}
+              >
+                {label}
+              </button>
+            ))}
+          </span>
+        )}
       </div>
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -243,6 +267,7 @@ export function App() {
             selectedIndex={selectedIndex}
             onSelect={setSelectedIndex}
             gizmoMode={gizmoMode}
+            rotateSpace={rotateSpace}
             onTransformCommit={handleTransformCommit}
           />
         </div>
