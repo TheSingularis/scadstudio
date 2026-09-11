@@ -113,6 +113,11 @@ export interface DecomposedNode {
   // is none) — replacing [wrapStart, primitiveStart) rewrites the whole
   // translate/rotate/scale prefix in one targeted edit.
   wrapStart: number;
+  // The base primitive's own call node (e.g. the `sphere(...)` in
+  // `translate(...) sphere(...)`) — used by primitiveArgs/patchArgument
+  // below to read/edit the primitive's *own* arguments, as opposed to its
+  // placement wraps.
+  primitiveNode: Node;
 }
 
 // A mirror() vector is only representable as a sign flip on `scale` (see
@@ -188,7 +193,7 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   }
 
   transform.scale = transform.scale.map((v, i) => v * mirrorSign[i]) as [number, number, number];
-  return { transform, primitiveStart: current.startIndex, wrapStart };
+  return { transform, primitiveStart: current.startIndex, wrapStart, primitiveNode: current };
 }
 
 // Isolated-render source for a node: just the base primitive (context +
@@ -240,4 +245,61 @@ export function patchTransform(source: string, tree: Tree, node: SceneNode, tran
   if (!decomposed) return source;
   const prefix = formatTransformPrefix(transform);
   return source.slice(0, decomposed.wrapStart) + prefix + source.slice(decomposed.primitiveStart);
+}
+
+export interface PrimitiveArg {
+  // Argument name as written in source (e.g. `r` in `sphere(r=8)`), or null
+  // for a positional argument (e.g. the `[10,10,10]` in `cube([10,10,10])`).
+  // Deliberately not resolved against the primitive's real parameter names
+  // for positional args (that needs a schema of every built-in's signature,
+  // or — for custom modules — the module's own definition, which is M8's
+  // module-introspection scope, not this one) — labeled by position instead.
+  name: string | null;
+  // Verbatim source text of the argument's value, whatever expression it is
+  // (number, vector, string, or an arbitrary expression like `x * 2`) — the
+  // panel edits this as opaque text, not a parsed/typed value, so any valid
+  // OpenSCAD expression a user types is preserved as-is.
+  valueText: string;
+  valueStart: number;
+  valueEnd: number;
+}
+
+// Reads a primitive call's own arguments (name if any, verbatim value text
+// and byte range) — works for any module_instantiation, built-in or custom,
+// since it only depends on the grammar's generic argument/argument_list
+// shape, not per-primitive knowledge of what arguments a given call expects.
+export function primitiveArgs(root: Node, node: SceneNode): { callName: string; args: PrimitiveArg[] } | null {
+  const decomposed = decomposeNode(root, node);
+  if (!decomposed) return null;
+  const call = decomposed.primitiveNode;
+  const callName = call.childForFieldName('name')?.text;
+  if (!callName) return null;
+  const argsNode = call.childForFieldName('arguments')?.namedChild(0); // `arguments` node, absent if call has zero args
+  const args: PrimitiveArg[] = [];
+  for (let i = 0; i < (argsNode?.namedChildCount ?? 0); i++) {
+    const argument = argsNode!.namedChild(i);
+    const value = argument?.childForFieldName('value');
+    if (!value) continue;
+    args.push({
+      name: argument!.childForFieldName('name')?.text ?? null,
+      valueText: value.text,
+      valueStart: value.startIndex,
+      valueEnd: value.endIndex,
+    });
+  }
+  return { callName, args };
+}
+
+// Minimal-diff edit of a single argument's value, identified by its position
+// in `primitiveArgs`'s own list (stable within one render — a full
+// re-render, which any commit triggers, reassigns byte ranges anyway, so
+// this only ever needs to be valid for one edit against one known source).
+// Same one-derivation-path philosophy as patchTransform: only the targeted
+// byte range changes, the rest of the file (including comments/formatting
+// around this call) is untouched.
+export function patchArgument(source: string, tree: Tree, node: SceneNode, argIndex: number, newValueText: string): string {
+  const decomposed = primitiveArgs(tree.rootNode, node);
+  const arg = decomposed?.args[argIndex];
+  if (!arg) return source;
+  return source.slice(0, arg.valueStart) + newValueText + source.slice(arg.valueEnd);
 }

@@ -4,7 +4,15 @@ import { Editor } from './components/Editor';
 import { Viewport, type GizmoMode, type NodeMesh, type RotateSpace } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
-import { patchTransform, primitiveSource, decomposeNode, IDENTITY_TRANSFORM, type NodeTransform } from './targetedPatch';
+import {
+  patchTransform,
+  primitiveSource,
+  decomposeNode,
+  primitiveArgs,
+  patchArgument,
+  IDENTITY_TRANSFORM,
+  type NodeTransform,
+} from './targetedPatch';
 import { appendPrimitive, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
 
@@ -91,6 +99,11 @@ export function App() {
   const [rotateSpace, setRotateSpace] = useState<RotateSpace>('local');
   const [status, setStatus] = useState('Rendering...');
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
+  // Reactive mirror of treeRef below, purely so the parameter panel (a
+  // useMemo over tree+sceneNodes+selectedIndex) can recompute when a render
+  // lands — treeRef itself is intentionally non-reactive so gizmo commits
+  // don't get recreated on every keystroke (see its own comment).
+  const [tree, setTree] = useState<Tree | null>(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Set right before an insertion-triggered render so that render's own
   // selection-preserving logic (below) knows to select the newly-appended
@@ -115,10 +128,11 @@ export function App() {
       createCoalescingRunner(async (src: string) => {
         setStatus('Rendering...');
         try {
-          const { tree, errorCount } = await parseScad(src);
-          treeRef.current = tree;
+          const { tree: parsedTree, errorCount } = await parseScad(src);
+          treeRef.current = parsedTree;
+          setTree(parsedTree);
           setParseErrorCount(errorCount);
-          const graph = buildSceneGraph(tree, src);
+          const graph = buildSceneGraph(parsedTree, src);
           setSceneNodes(graph.nodes);
 
           // Isolated per-node renders (M3 scope: one call per top-level
@@ -131,8 +145,8 @@ export function App() {
               // scale are applied as a real three.js transform on the pivot
               // group instead of being baked into the rendered geometry (see
               // targetedPatch.ts's decomposeNode for why).
-              const bytes = await window.scadstudio.renderScad(primitiveSource(tree.rootNode, node, src, graph.context));
-              const transform = decomposeNode(tree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
+              const bytes = await window.scadstudio.renderScad(primitiveSource(parsedTree.rootNode, node, src, graph.context));
+              const transform = decomposeNode(parsedTree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
               meshes.push({ index: node.index, bytes, transform });
             } catch (err) {
               console.error(`[scadstudio] node ${node.index} render failed`, err);
@@ -233,6 +247,31 @@ export function App() {
     if (!current) return;
     handleTransformCommit(selectedIndex, { ...current, color: null });
   }, [selectedIndex, nodeMeshes, handleTransformCommit]);
+
+  // M5 (final piece): parameter panel. Reads the selected node's own
+  // arguments straight from the live tree — recomputes whenever a render
+  // lands (tree/sceneNodes change) or selection changes, so it always
+  // reflects the currently-displayed source, same as everything else here.
+  const selectedArgs = useMemo(() => {
+    if (!tree || selectedIndex === null) return null;
+    const node = sceneNodes.find((n) => n.index === selectedIndex);
+    if (!node) return null;
+    return primitiveArgs(tree.rootNode, node);
+  }, [tree, sceneNodes, selectedIndex]);
+
+  const handleArgCommit = useCallback(
+    (argIndex: number, newValueText: string) => {
+      const currentTree = treeRef.current;
+      const node = sceneNodesRef.current.find((n) => n.index === selectedIndex);
+      if (!currentTree || !node) return;
+      const patched = patchArgument(sourceRef.current, currentTree, node, argIndex, newValueText);
+      if (patched === sourceRef.current) return; // no-op: node/arg vanished, or text unchanged
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(patched);
+      runRender(patched);
+    },
+    [selectedIndex, runRender],
+  );
 
   // M5: toolbar primitive insertion, reusing the same targeted-patch +
   // re-render pipeline as every other edit path.
@@ -337,6 +376,40 @@ export function App() {
           </span>
         )}
       </div>
+      {selectedArgs && selectedArgs.args.length > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: '6px 12px',
+            background: '#252526',
+            color: '#ccc',
+            fontSize: 12,
+            borderBottom: '1px solid #333',
+          }}
+        >
+          <span style={{ opacity: 0.7 }}>{selectedArgs.callName}:</span>
+          {selectedArgs.args.map((arg, i) => (
+            // Keyed on the value text too, not just index: after a commit
+            // lands, the canonical (possibly reformatted) text should
+            // replace whatever the user typed, which an uncontrolled input
+            // only does on remount — see handleArgCommit's comment.
+            <span key={`${i}-${arg.name}-${arg.valueText}`} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ opacity: 0.6 }}>{arg.name ?? `#${i + 1}`}:</span>
+              <input
+                type="text"
+                defaultValue={arg.valueText}
+                size={Math.max(4, arg.valueText.length)}
+                onBlur={(e) => handleArgCommit(i, e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur();
+                }}
+              />
+            </span>
+          ))}
+        </div>
+      )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <Editor

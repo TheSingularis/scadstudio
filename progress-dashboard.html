@@ -103,7 +103,7 @@
 <body>
 
 <h1>scadstudio — Milestone Progress</h1>
-<div class="subtitle">Snapshot as of 2026-09-11 (mirror/color update). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section. Progress bar covers M0-M11 (the full v1 + already-planned post-v1 scope); M12 is a stretch goal and isn't counted toward it.</div>
+<div class="subtitle">Snapshot as of 2026-09-11 (M5 complete). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section. Progress bar covers M0-M11 (the full v1 + already-planned post-v1 scope); M12 is a stretch goal and isn't counted toward it.</div>
 
 <div class="legend">
   <span>🟢 completed</span>
@@ -193,7 +193,7 @@
 <div class="phase">
   <div class="phase-header">
     <span class="name">M5 — Full transform set + toolbar primitive insertion</span>
-    <span class="badge in_progress">in progress</span>
+    <span class="badge completed">completed</span>
   </div>
   <div class="subtasks">
     <div class="subtask"><span class="name">Rotate + scale gizmos, mode toggle (translate/rotate/scale)</span><span class="badge completed">completed</span></div>
@@ -210,7 +210,7 @@
     <div class="subtask"><span class="name">Mirror X/Y/Z toolbar toggles (folded into scale's sign, writes real mirror() calls back to source)</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Color picker + Clear button, wired to color() decomposition</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Found + fixed (via manual/screenshot verification): negative-scale mirror needed DoubleSide material to avoid backface-culling artifacts</span><span class="badge completed">completed</span></div>
-    <div class="subtask"><span class="name">Parameter panel (editable fields for a selected node's own arguments)</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">Parameter panel: generic editable fields for a selected node's own call arguments (named or positional, any built-in or custom module)</span><span class="badge completed">completed</span></div>
   </div>
 </div>
 
@@ -264,8 +264,8 @@
 </div>
 
 <div class="note">
-  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, drag a shape with a translate/rotate/scale gizmo to rewrite its source in place (inserting a new wrap if it had none, and doing so "in place" relative to any existing translate rather than orbiting the world origin), toggle mirror or pick a color from the toolbar, or insert a new primitive. Placement (position/rotation/scale) is now a real three.js transform on each shape's pivot group rather than baked-in geometry, which is what makes local-space rotate/scale legitimate — the rotate gizmo has a Local/World toggle as a result (scale stays local-only, translate stays world-only; see build notes for why). Mirror is folded into scale's sign (an axis-aligned mirror and a matching negative scale are the same matrix) but always round-trips through real `mirror()` calls in source, never a literal negative `scale()`. Every top-level statement in a file is its own independently-rendered, clickable, draggable object.<br><br>
-  <b>Known gaps (expected, not bugs):</b> no parameter panel yet for editing a selected node's own arguments directly (the one remaining M5 piece), no booleans/extrusions UI (M6-M7), no custom-module detection (M8), no fillets/chamfers (M12, stretch goal — OpenSCAD has no native edge-selective rounding; see PLAN.md). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it). The placement architecture assumes canonical color→translate→rotate→mirror→scale ordering regardless of how a file is actually written — documented in PLAN.md, fails visibly rather than silently if violated.<br><br>
+  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, drag a shape with a translate/rotate/scale gizmo to rewrite its source in place (inserting a new wrap if it had none, and doing so "in place" relative to any existing translate rather than orbiting the world origin), toggle mirror or pick a color from the toolbar, edit a selected node's own call arguments directly in a generic parameter panel, or insert a new primitive. Placement (position/rotation/scale) is now a real three.js transform on each shape's pivot group rather than baked-in geometry, which is what makes local-space rotate/scale legitimate — the rotate gizmo has a Local/World toggle as a result (scale stays local-only, translate stays world-only; see build notes for why). Mirror is folded into scale's sign (an axis-aligned mirror and a matching negative scale are the same matrix) but always round-trips through real `mirror()` calls in source, never a literal negative `scale()`. The parameter panel is schema-free — it reflects whatever arguments (named or positional) a call actually has in source, with no hardcoded per-primitive knowledge. Every top-level statement in a file is its own independently-rendered, clickable, draggable object. <b>M5 is fully done.</b><br><br>
+  <b>Known gaps (expected, not bugs):</b> no booleans/extrusions UI (M6-M7), no custom-module detection (M8) — so positional parameter-panel arguments show as `#1`/`#2`/... rather than a module's real parameter names, since resolving that is M8's job — no fillets/chamfers (M12, stretch goal — OpenSCAD has no native edge-selective rounding; see PLAN.md). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it). The placement architecture assumes canonical color→translate→rotate→mirror→scale ordering regardless of how a file is actually written — documented in PLAN.md, fails visibly rather than silently if violated.<br><br>
   <b>Full history:</b> see PLAN.md's per-milestone "build notes" sections in the repo for exact bugs found/fixed at each step.
 </div>
 
