@@ -127,6 +127,18 @@ Two distinct kinds of constraint, handled very differently, both persisting into
 - **M9 — Polish**: undo/redo (mostly Monaco's native stack + re-derivation, with explicit transaction grouping for structural edits), invalid-syntax error UX, save/reload/external-change handling, isolated-render cache tuning, jump-to-module-definition, electron-builder packaging.
 - **M10 — Directional constraints**: distance/offset/alignment/array-spacing tools that generate plain dependent SCAD variables/expressions (no solver); this is the first constraints milestone and ships as part of the v1 target.
 - **M11 — Solver-based constraints (post-v1)**: the `constraints/` package, `@constraint:` comment-annotation convention, minimal geometric solver (tangency, parallel, perpendicular, coincident, symmetric), staleness detection on reopen. Explicitly scoped as a later phase, not v1.
+- **M12 — BOSL2 fillets/chamfers (stretch goal, not v1)**: bundle the [BOSL2](https://github.com/BelfrySCAD/BOSL2) library (`use <BOSL2/std.scad>` + relevant submodules) and add toolbar/gizmo support for its edge-selective `fillet()`/`chamfer()` operations. See "Fillets/chamfers" section below for why this needs its own milestone rather than folding into M6 (booleans) or M9 (polish).
+
+## Fillets/chamfers (stretch goal): BOSL2 integration
+
+OpenSCAD has no native "select an edge, round it" primitive the way a B-rep CAD kernel (Fusion, SolidWorks, Onshape) does — CSG/mesh boolean engines like Manifold don't carry edge identity to blend. Two real ways to get fillets in plain OpenSCAD, decided 2026-09-11 (with Jordan, weighing selectivity vs. dependency cost):
+
+1. **`minkowski()` with a sphere** — rounds *every* convex edge of a shape uniformly; not selective, and expensive on the Manifold backend at anything beyond simple shapes. No new dependency, but doesn't match what users expect from "fillet this one edge."
+2. **[BOSL2](https://github.com/BelfrySCAD/BOSL2)** — a widely-used third-party OpenSCAD library providing real `fillet()`/`chamfer()` modules with edge/face selection (positional keywords like `edges=TOP+FRONT`, not literal click-to-select, but far closer to real CAD fillet behavior than Minkowski). Chosen over option 1 as the target — it stays inside the "always valid, editable plain SCAD" constraint (BOSL2 is itself just `.scad` source, pulled in via `use`, consistent with the project's existing library-import model from "Custom module auto-toolbar" above), and its selectivity is what actually delivers a "full CAD workflow" feel.
+
+**Why this is its own milestone, not folded into M6/M9**: BOSL2 support means (a) bundling/vendoring the library and resolving its `use` path reliably across both dev and the packaged Electron app (same asset-shipping question as the WASM/font/MCAD assets noted in the tech-stack table), (b) toolbar/gizmo UI for BOSL2's specific edge-selector syntax — a materially different interaction than the plain-primitive toolbar tools built in M4/M5, since "selecting an edge" isn't a concept `scene-graph` currently has (it only knows about whole nodes, not their sub-features), and (c) module-introspection (M8) needs to either special-case BOSL2 modules or generalize enough to toolbar-ify a third-party library, not just user-authored local modules. None of that is a natural fit inside an existing milestone's scope.
+
+**Status**: not started — stretch goal, deliberately sequenced after the v1 milestones (M0-M10). Revisit scoping once M6/M7 (booleans/extrusions) are done, since real edge-selection UX will want a solid boolean/scene-graph foundation under it.
 
 ## Critical first files
 
