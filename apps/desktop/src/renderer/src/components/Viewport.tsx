@@ -3,7 +3,10 @@ import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { Vector3, type Group } from 'three';
+import { Color, Vector3, type Group } from 'three';
+
+const DEFAULT_MESH_COLOR = '#4a90d9';
+const SELECTED_MESH_COLOR = '#e8a33d';
 import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform } from '../targetedPatch';
 
 // Derived from drei's own component rather than three's OrbitControls
@@ -63,6 +66,12 @@ function NodeModel({
   }, [mesh.bytes]);
 
   const quaternion = useMemo(() => transformToQuaternion(mesh.transform.rotateDeg), [mesh.transform.rotateDeg]);
+  // OpenSCAD's color() takes 0-1 floats, which is exactly what three.js's
+  // Color(r, g, b) constructor expects — no conversion needed.
+  const materialColor = useMemo(
+    () => (selected ? SELECTED_MESH_COLOR : mesh.transform.color ? new Color(...mesh.transform.color) : DEFAULT_MESH_COLOR),
+    [selected, mesh.transform.color],
+  );
 
   return (
     <group
@@ -78,7 +87,7 @@ function NodeModel({
           onSelect(mesh.index);
         }}
       >
-        <meshStandardMaterial color={selected ? '#e8a33d' : '#4a90d9'} />
+        <meshStandardMaterial color={materialColor} side={2} />
       </mesh>
     </group>
   );
@@ -200,12 +209,15 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpa
             // needed, since (unlike the pre-refactor baked-geometry model)
             // there's no separate "existing" value living in the source to
             // combine with; this object's transform is the single source of
-            // truth for placement.
+            // truth for placement. color isn't part of the gizmo drag at
+            // all, so it's carried forward unchanged from the node's last
+            // known transform rather than dropped.
             const p = transformTarget.position;
             const s = transformTarget.scale;
             const transform: NodeTransform = {
               translate: [p.x, p.y, p.z],
               rotateDeg: quaternionToRotateDeg(q),
+              color: meshes.find((m) => m.index === selectedIndex)?.transform.color ?? null,
               scale: [s.x, s.y, s.z],
             };
             onTransformCommit(selectedIndex, transform);

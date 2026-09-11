@@ -16,13 +16,24 @@ const OPENSCAD_EULER_ORDER = 'ZYX' as const;
 export interface NodeTransform {
   translate: [number, number, number];
   rotateDeg: [number, number, number];
+  // Axis-aligned mirroring is folded into scale rather than kept as its own
+  // field: mirror([1,0,0]) and scale([-1,1,1]) are mathematically identical
+  // (both are the diagonal matrix diag(-1,1,1)) for a plane through the
+  // local origin, which is the only kind of mirror the toolbar generates.
+  // Negative components here round-trip through mirror() calls in source
+  // (see formatTransformPrefix/decomposeNode) rather than a literal
+  // negative scale(), since `mirror([1,0,0])` is what reads as intentional
+  // in real OpenSCAD source — `scale([-1,1,1])` would look like a stretch.
   scale: [number, number, number];
+  // null means "no color() wrap" — distinct from an explicit black [0,0,0].
+  color: [number, number, number] | null;
 }
 
 export const IDENTITY_TRANSFORM: NodeTransform = {
   translate: [0, 0, 0],
   rotateDeg: [0, 0, 0],
   scale: [1, 1, 1],
+  color: null,
 };
 
 export function transformToQuaternion(rotateDeg: [number, number, number]): Quaternion {
@@ -104,17 +115,30 @@ export interface DecomposedNode {
   wrapStart: number;
 }
 
-// Walks a node's translate/rotate/scale wrap chain — in whatever order it's
-// actually written — and decomposes it into independent translate/rotate/
-// scale values plus the base primitive's own byte range.
+// A mirror() vector is only representable as a sign flip on `scale` (see
+// NodeTransform.scale) when it's axis-aligned through the origin — i.e.
+// exactly one of its three components is nonzero. `mirror([1,1,0])` mirrors
+// across a diagonal plane, which has no equivalent diagonal-scale
+// representation; unrecognized on read-back (same graceful-degradation
+// policy as any other unrecognized wrap — see decomposeNode below).
+function axisAlignedMirrorAxis(xyz: [number, number, number]): 0 | 1 | 2 | null {
+  const nonzero = xyz.map((v) => v !== 0);
+  if (nonzero.filter(Boolean).length !== 1) return null;
+  return nonzero.indexOf(true) as 0 | 1 | 2;
+}
+
+// Walks a node's color/translate/rotate/mirror/scale wrap chain — in
+// whatever order it's actually written — and decomposes it into independent
+// translate/rotate/scale/color values (mirror folds into scale's sign, see
+// its field comment) plus the base primitive's own byte range.
 //
-// Known, deliberate scope limitation: this treats translate/rotate/scale as
-// three independent slots regardless of their original nesting order, and
+// Known, deliberate scope limitation: this treats color/translate/rotate/
+// scale as independent slots regardless of their original nesting order, and
 // `patchTransform` below always rewrites them back in canonical
-// translate→rotate→scale order (matching three.js's own TRS composition,
-// and OpenSCAD's own idiomatic convention). A hand-written file using a
-// *different* order (e.g. `rotate(...) translate(...)`, which orbits the
-// shape around the world origin rather than translating then rotating in
+// color→translate→rotate→mirror→scale order (matching three.js's own TRS
+// composition, and OpenSCAD's own idiomatic convention). A hand-written file
+// using a *different* order (e.g. `rotate(...) translate(...)`, which orbits
+// the shape around the world origin rather than translating then rotating in
 // place) will render differently once decomposed this way — this is a
 // correctness tradeoff for gizmo-editable files, not a bug in the common
 // (and gizmo-generated) canonical-order case.
@@ -122,24 +146,48 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   const top = topConcreteNode(root, node);
   if (!top || top.type !== 'module_instantiation') return null;
 
-  const transform: NodeTransform = { translate: [0, 0, 0], rotateDeg: [0, 0, 0], scale: [1, 1, 1] };
+  const transform: NodeTransform = { translate: [0, 0, 0], rotateDeg: [0, 0, 0], scale: [1, 1, 1], color: null };
+  const mirrorSign: [number, number, number] = [1, 1, 1];
+  let sawColor = false;
   const wrapStart = top.startIndex;
   let current: Node = top;
 
   while (current.type === 'module_instantiation') {
     const name = current.childForFieldName('name')?.text;
-    if (name !== 'translate' && name !== 'rotate' && name !== 'scale') break;
-    const vc = readVectorCall(current);
-    if (!vc) break;
-    if (name === 'translate') transform.translate = vc.xyz;
-    else if (name === 'rotate') transform.rotateDeg = vc.xyz;
-    else transform.scale = vc.xyz;
+    if (name === 'color') {
+      if (sawColor) break; // a second color() wrap is unusual; stop rather than guess which wins
+      const vc = readVectorCall(current);
+      if (!vc) break;
+      transform.color = vc.xyz;
+      sawColor = true;
+    } else if (name === 'translate') {
+      const vc = readVectorCall(current);
+      if (!vc) break;
+      transform.translate = vc.xyz;
+    } else if (name === 'rotate') {
+      const vc = readVectorCall(current);
+      if (!vc) break;
+      transform.rotateDeg = vc.xyz;
+    } else if (name === 'mirror') {
+      const vc = readVectorCall(current);
+      if (!vc) break;
+      const axis = axisAlignedMirrorAxis(vc.xyz);
+      if (axis === null) break;
+      mirrorSign[axis] *= -1;
+    } else if (name === 'scale') {
+      const vc = readVectorCall(current);
+      if (!vc) break;
+      transform.scale = vc.xyz;
+    } else {
+      break;
+    }
 
     const last = current.child(current.childCount - 1);
     if (last?.type !== 'statement' || !last.child(0)) break;
     current = last.child(0)!;
   }
 
+  transform.scale = transform.scale.map((v, i) => v * mirrorSign[i]) as [number, number, number];
   return { transform, primitiveStart: current.startIndex, wrapStart };
 }
 
@@ -153,11 +201,29 @@ export function primitiveSource(root: Node, node: SceneNode, fullSource: string,
   return `${context}\n${fullSource.slice(start, node.endIndex)}`;
 }
 
+const MIRROR_AXIS_VECTORS: [number, number, number][] = [
+  [1, 0, 0],
+  [0, 1, 0],
+  [0, 0, 1],
+];
+
 function formatTransformPrefix(t: NodeTransform): string {
   let prefix = '';
+  if (t.color) prefix += `color(${formatVector(t.color)})\n    `;
   if (t.translate.some((v) => v !== 0)) prefix += `translate(${formatVector(t.translate)})\n    `;
   if (t.rotateDeg.some((v) => v !== 0)) prefix += `rotate(${formatVector(t.rotateDeg)})\n    `;
-  if (t.scale.some((v) => v !== 1)) prefix += `scale(${formatVector(t.scale)})\n    `;
+  // Negative scale components are written back out as real mirror() calls
+  // rather than a literal negative scale() — see NodeTransform.scale's
+  // comment for why they're equivalent and why source should read as
+  // "mirrored", not "stretched negative".
+  const absScale: [number, number, number] = [...t.scale];
+  for (let axis = 0; axis < 3; axis++) {
+    if (t.scale[axis] < 0) {
+      prefix += `mirror(${formatVector(MIRROR_AXIS_VECTORS[axis])})\n    `;
+      absScale[axis] = -t.scale[axis];
+    }
+  }
+  if (absScale.some((v) => v !== 1)) prefix += `scale(${formatVector(absScale)})\n    `;
   return prefix;
 }
 

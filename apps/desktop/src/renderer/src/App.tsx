@@ -31,6 +31,32 @@ const ROTATE_SPACE_BUTTONS: { space: RotateSpace; label: string }[] = [
   { space: 'world', label: 'World' },
 ];
 
+// Mirror is a toggle, not a drag — there's no continuous gesture that reads
+// as "mirror this shape" the way translate/rotate/scale have one. Each
+// button flips the sign of one axis of the selected node's current scale
+// (mathematically identical to an axis-aligned mirror() through the local
+// origin — see targetedPatch.ts's NodeTransform.scale comment).
+const MIRROR_AXIS_BUTTONS: { axis: 0 | 1 | 2; label: string }[] = [
+  { axis: 0, label: 'Mirror X' },
+  { axis: 1, label: 'Mirror Y' },
+  { axis: 2, label: 'Mirror Z' },
+];
+
+// The default color-input value (a plain HTML <input type="color">, no
+// alpha support — matches decomposeNode/formatTransformPrefix's RGB-only
+// scope) when a node has no color() wrap, i.e. it'll render at whatever
+// material color the viewport defaults to.
+const NO_COLOR_HEX = '#4a90d9';
+
+function rgbToHex(rgb: [number, number, number] | null): string {
+  if (!rgb) return NO_COLOR_HEX;
+  const toHex = (v: number) =>
+    Math.round(Math.min(1, Math.max(0, v)) * 255)
+      .toString(16)
+      .padStart(2, '0');
+  return `#${toHex(rgb[0])}${toHex(rgb[1])}${toHex(rgb[2])}`;
+}
+
 const DEFAULT_SOURCE = `// scadstudio M5 — drag the gizmo (Move/Rotate/Scale), insert primitives, or click to select
 module bracket(w=20, h=10, thickness=3) {
     difference() {
@@ -170,6 +196,44 @@ export function App() {
     [runRender],
   );
 
+  // M5: mirror + color toolbar actions. Both edit a single field of the
+  // selected node's *current* transform (read from its already-rendered
+  // mesh, which reflects the source as-of the last successful render) and
+  // reuse handleTransformCommit's targeted-patch pipeline — same one-
+  // derivation-path philosophy as every other edit here, just triggered by a
+  // toolbar click instead of a gizmo drag or a text edit.
+  const handleMirrorAxis = useCallback(
+    (axis: 0 | 1 | 2) => {
+      if (selectedIndex === null) return;
+      const current = nodeMeshes.find((m) => m.index === selectedIndex)?.transform;
+      if (!current) return;
+      const scale = [...current.scale] as [number, number, number];
+      scale[axis] *= -1;
+      handleTransformCommit(selectedIndex, { ...current, scale });
+    },
+    [selectedIndex, nodeMeshes, handleTransformCommit],
+  );
+
+  const handleColorChange = useCallback(
+    (hex: string) => {
+      if (selectedIndex === null) return;
+      const current = nodeMeshes.find((m) => m.index === selectedIndex)?.transform;
+      if (!current) return;
+      const r = parseInt(hex.slice(1, 3), 16) / 255;
+      const g = parseInt(hex.slice(3, 5), 16) / 255;
+      const b = parseInt(hex.slice(5, 7), 16) / 255;
+      handleTransformCommit(selectedIndex, { ...current, color: [r, g, b] });
+    },
+    [selectedIndex, nodeMeshes, handleTransformCommit],
+  );
+
+  const handleClearColor = useCallback(() => {
+    if (selectedIndex === null) return;
+    const current = nodeMeshes.find((m) => m.index === selectedIndex)?.transform;
+    if (!current) return;
+    handleTransformCommit(selectedIndex, { ...current, color: null });
+  }, [selectedIndex, nodeMeshes, handleTransformCommit]);
+
   // M5: toolbar primitive insertion, reusing the same targeted-patch +
   // re-render pipeline as every other edit path.
   const handleInsertPrimitive = useCallback(
@@ -248,6 +312,28 @@ export function App() {
                 {label}
               </button>
             ))}
+          </span>
+        )}
+        {selectedIndex !== null && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {MIRROR_AXIS_BUTTONS.map(({ axis, label }) => (
+              <button key={axis} onClick={() => handleMirrorAxis(axis)}>
+                {label}
+              </button>
+            ))}
+          </span>
+        )}
+        {selectedIndex !== null && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Color:
+            <input
+              type="color"
+              value={rgbToHex(nodeMeshes.find((m) => m.index === selectedIndex)?.transform.color ?? null)}
+              onChange={(e) => handleColorChange(e.target.value)}
+            />
+            {nodeMeshes.find((m) => m.index === selectedIndex)?.transform.color && (
+              <button onClick={handleClearColor}>Clear</button>
+            )}
           </span>
         )}
       </div>
