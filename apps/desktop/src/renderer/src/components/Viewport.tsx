@@ -32,8 +32,14 @@ export type RotateSpace = 'local' | 'world';
 
 interface ViewportProps {
   meshes: NodeMesh[];
-  selectedIndex: number | null;
-  onSelect: (index: number | null) => void;
+  // Ordered by selection sequence (oldest first), not document order — M6's
+  // boolean toolbar needs click order to know which shape is "the base" vs
+  // "the tool" for difference(), where argument order is semantically load-
+  // bearing. The last entry is the "primary" selection: the one the gizmo
+  // attaches to and the one mirror/color/parameter-panel edit, since those
+  // are inherently single-target operations.
+  selectedIndices: number[];
+  onSelect: (index: number | null, additive: boolean) => void;
   gizmoMode: GizmoMode;
   rotateSpace: RotateSpace;
   onTransformCommit: (index: number, transform: NodeTransform) => void;
@@ -47,7 +53,7 @@ function NodeModel({
 }: {
   mesh: NodeMesh;
   selected: boolean;
-  onSelect: (index: number) => void;
+  onSelect: (index: number, additive: boolean) => void;
   onGroupRef: (index: number, group: Group | null) => void;
 }) {
   // openscad-wasm renders just the bare primitive now (translate/rotate/
@@ -84,7 +90,7 @@ function NodeModel({
         geometry={geometry}
         onClick={(e: ThreeEvent<MouseEvent>) => {
           e.stopPropagation();
-          onSelect(mesh.index);
+          onSelect(mesh.index, e.shiftKey);
         }}
       >
         <meshStandardMaterial color={materialColor} side={2} />
@@ -99,7 +105,9 @@ interface DragSnapshot {
   scale: Vector3;
 }
 
-export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpace, onTransformCommit }: ViewportProps) {
+export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateSpace, onTransformCommit }: ViewportProps) {
+  // The gizmo only ever targets one object — the most recently selected one.
+  const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
   const dragStart = useRef<DragSnapshot | null>(null);
   const groupsByIndex = useRef(new Map<number, Group>());
@@ -124,20 +132,20 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpa
     (index: number, group: Group | null) => {
       if (group) groupsByIndex.current.set(index, group);
       else groupsByIndex.current.delete(index);
-      if (index === selectedIndex) setTransformTarget(group);
+      if (index === primaryIndex) setTransformTarget(group);
     },
-    [selectedIndex],
+    [primaryIndex],
   );
 
   useEffect(() => {
-    setTransformTarget(selectedIndex !== null ? (groupsByIndex.current.get(selectedIndex) ?? null) : null);
-  }, [selectedIndex]);
+    setTransformTarget(primaryIndex !== null ? (groupsByIndex.current.get(primaryIndex) ?? null) : null);
+  }, [primaryIndex]);
 
   return (
     <Canvas
       camera={{ position: [50, 50, 50], fov: 45 }}
       onPointerMissed={() => {
-        if (!isTransformingRef.current) onSelect(null);
+        if (!isTransformingRef.current) onSelect(null, false);
       }}
     >
       <ambientLight intensity={0.6} />
@@ -149,7 +157,7 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpa
               <NodeModel
                 key={mesh.index}
                 mesh={mesh}
-                selected={mesh.index === selectedIndex}
+                selected={selectedIndices.includes(mesh.index)}
                 onSelect={onSelect}
                 onGroupRef={handleGroupRef}
               />
@@ -192,7 +200,7 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpa
             }, 0);
             const start = dragStart.current;
             dragStart.current = null;
-            if (!start || selectedIndex === null) return;
+            if (!start || primaryIndex === null) return;
 
             const q = transformTarget.quaternion;
             const changed =
@@ -217,10 +225,10 @@ export function Viewport({ meshes, selectedIndex, onSelect, gizmoMode, rotateSpa
             const transform: NodeTransform = {
               translate: [p.x, p.y, p.z],
               rotateDeg: quaternionToRotateDeg(q),
-              color: meshes.find((m) => m.index === selectedIndex)?.transform.color ?? null,
+              color: meshes.find((m) => m.index === primaryIndex)?.transform.color ?? null,
               scale: [s.x, s.y, s.z],
             };
-            onTransformCommit(selectedIndex, transform);
+            onTransformCommit(primaryIndex, transform);
           }}
         />
       )}

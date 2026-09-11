@@ -10,8 +10,10 @@ import {
   decomposeNode,
   primitiveArgs,
   patchArgument,
+  wrapInBoolean,
   IDENTITY_TRANSFORM,
   type NodeTransform,
+  type BooleanOp,
 } from './targetedPatch';
 import { appendPrimitive, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
@@ -50,6 +52,15 @@ const MIRROR_AXIS_BUTTONS: { axis: 0 | 1 | 2; label: string }[] = [
   { axis: 2, label: 'Mirror Z' },
 ];
 
+// M6: boolean ops need 2+ selected nodes (shift-click in the viewport to
+// multi-select) — see wrapInBoolean's comment for why selection order
+// (not document order) determines the generated block's child order.
+const BOOLEAN_OP_BUTTONS: { op: BooleanOp; label: string }[] = [
+  { op: 'union', label: 'Union' },
+  { op: 'difference', label: 'Difference' },
+  { op: 'intersection', label: 'Intersection' },
+];
+
 // The default color-input value (a plain HTML <input type="color">, no
 // alpha support — matches decomposeNode/formatTransformPrefix's RGB-only
 // scope) when a node has no color() wrap, i.e. it'll render at whatever
@@ -65,7 +76,8 @@ function rgbToHex(rgb: [number, number, number] | null): string {
   return `#${toHex(rgb[0])}${toHex(rgb[1])}${toHex(rgb[2])}`;
 }
 
-const DEFAULT_SOURCE = `// scadstudio M5 — drag the gizmo (Move/Rotate/Scale), insert primitives, or click to select
+const DEFAULT_SOURCE = `// scadstudio — drag the gizmo (Move/Rotate/Scale), insert primitives, click
+// to select, or shift-click to multi-select two+ shapes for a boolean op
 module bracket(w=20, h=10, thickness=3) {
     difference() {
         cube([w, h, thickness]);
@@ -94,13 +106,18 @@ export function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  // Ordered by selection sequence (shift-click to add), not document order —
+  // see Viewport.tsx's ViewportProps.selectedIndices comment. The last entry
+  // is the "primary" selection that gizmo/mirror/color/parameter-panel
+  // editing (all single-target operations) act on.
+  const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const primarySelectedIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>('translate');
   const [rotateSpace, setRotateSpace] = useState<RotateSpace>('local');
   const [status, setStatus] = useState('Rendering...');
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   // Reactive mirror of treeRef below, purely so the parameter panel (a
-  // useMemo over tree+sceneNodes+selectedIndex) can recompute when a render
+  // useMemo over tree+sceneNodes+selection) can recompute when a render
   // lands — treeRef itself is intentionally non-reactive so gizmo commits
   // don't get recreated on every keystroke (see its own comment).
   const [tree, setTree] = useState<Tree | null>(null);
@@ -109,6 +126,11 @@ export function App() {
   // selection-preserving logic (below) knows to select the newly-appended
   // node instead of trying to preserve whatever was selected before.
   const pendingSelectLast = useRef(false);
+  // Same idea, for edits that land at a *known* index rather than always the
+  // last node — currently just the boolean-op merge (M6), whose result
+  // always lands at the selected node with the smallest index (see
+  // handleBooleanOp).
+  const pendingSelectAfterEdit = useRef<number | null>(null);
   // Latest parsed tree + inputs to it, kept outside React state: the gizmo
   // commit handler (targetedPatch) needs the CST that matches the *currently
   // displayed* source to locate a node's translate() call, but doesn't want
@@ -155,9 +177,13 @@ export function App() {
           setNodeMeshes(meshes);
           if (pendingSelectLast.current) {
             pendingSelectLast.current = false;
-            setSelectedIndex(graph.nodes.length > 0 ? graph.nodes.length - 1 : null);
+            setSelectedIndices(graph.nodes.length > 0 ? [graph.nodes.length - 1] : []);
+          } else if (pendingSelectAfterEdit.current !== null) {
+            const idx = pendingSelectAfterEdit.current;
+            pendingSelectAfterEdit.current = null;
+            setSelectedIndices(idx < graph.nodes.length ? [idx] : []);
           } else {
-            setSelectedIndex((prev) => (prev !== null && prev < graph.nodes.length ? prev : null));
+            setSelectedIndices((prev) => prev.filter((i) => i < graph.nodes.length));
           }
           setStatus(meshes.length === graph.nodes.length ? 'Rendered' : `Rendered ${meshes.length}/${graph.nodes.length} nodes`);
         } catch (err) {
@@ -218,51 +244,89 @@ export function App() {
   // toolbar click instead of a gizmo drag or a text edit.
   const handleMirrorAxis = useCallback(
     (axis: 0 | 1 | 2) => {
-      if (selectedIndex === null) return;
-      const current = nodeMeshes.find((m) => m.index === selectedIndex)?.transform;
+      if (primarySelectedIndex === null) return;
+      const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
       if (!current) return;
       const scale = [...current.scale] as [number, number, number];
       scale[axis] *= -1;
-      handleTransformCommit(selectedIndex, { ...current, scale });
+      handleTransformCommit(primarySelectedIndex, { ...current, scale });
     },
-    [selectedIndex, nodeMeshes, handleTransformCommit],
+    [primarySelectedIndex, nodeMeshes, handleTransformCommit],
   );
 
   const handleColorChange = useCallback(
     (hex: string) => {
-      if (selectedIndex === null) return;
-      const current = nodeMeshes.find((m) => m.index === selectedIndex)?.transform;
+      if (primarySelectedIndex === null) return;
+      const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
       if (!current) return;
       const r = parseInt(hex.slice(1, 3), 16) / 255;
       const g = parseInt(hex.slice(3, 5), 16) / 255;
       const b = parseInt(hex.slice(5, 7), 16) / 255;
-      handleTransformCommit(selectedIndex, { ...current, color: [r, g, b] });
+      handleTransformCommit(primarySelectedIndex, { ...current, color: [r, g, b] });
     },
-    [selectedIndex, nodeMeshes, handleTransformCommit],
+    [primarySelectedIndex, nodeMeshes, handleTransformCommit],
   );
 
   const handleClearColor = useCallback(() => {
-    if (selectedIndex === null) return;
-    const current = nodeMeshes.find((m) => m.index === selectedIndex)?.transform;
+    if (primarySelectedIndex === null) return;
+    const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
     if (!current) return;
-    handleTransformCommit(selectedIndex, { ...current, color: null });
-  }, [selectedIndex, nodeMeshes, handleTransformCommit]);
+    handleTransformCommit(primarySelectedIndex, { ...current, color: null });
+  }, [primarySelectedIndex, nodeMeshes, handleTransformCommit]);
+
+  // M6: multi-select toggle (shift-click) vs single-select (plain click),
+  // shared by Viewport clicks and (non-additive only) Editor cursor moves.
+  const handleSelect = useCallback((index: number | null, additive: boolean) => {
+    if (index === null) {
+      setSelectedIndices([]);
+      return;
+    }
+    setSelectedIndices((prev) => {
+      if (!additive) return [index];
+      // Shift-clicking an already-selected node toggles it back off, same
+      // as most other multi-select UIs.
+      return prev.includes(index) ? prev.filter((i) => i !== index) : [...prev, index];
+    });
+  }, []);
+
+  // M6: boolean toolbar. Wraps the selected nodes' verbatim source into a
+  // new union()/difference()/intersection() block and reuses the same
+  // targeted-patch + re-render pipeline as every other edit path.
+  const handleBooleanOp = useCallback(
+    (op: BooleanOp) => {
+      if (selectedIndices.length < 2) return;
+      const nodesInSelectionOrder = selectedIndices
+        .map((i) => sceneNodesRef.current.find((n) => n.index === i))
+        .filter((n): n is SceneNode => n !== undefined);
+      if (nodesInSelectionOrder.length < 2) return;
+      const next = wrapInBoolean(sourceRef.current, nodesInSelectionOrder, op);
+      if (next === sourceRef.current) return;
+      // The merged statement always ends up at the selected node with the
+      // smallest index — see wrapInBoolean's comment on why nothing before
+      // it needs to move.
+      pendingSelectAfterEdit.current = Math.min(...selectedIndices);
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(next);
+      runRender(next);
+    },
+    [selectedIndices, runRender],
+  );
 
   // M5 (final piece): parameter panel. Reads the selected node's own
   // arguments straight from the live tree — recomputes whenever a render
   // lands (tree/sceneNodes change) or selection changes, so it always
   // reflects the currently-displayed source, same as everything else here.
   const selectedArgs = useMemo(() => {
-    if (!tree || selectedIndex === null) return null;
-    const node = sceneNodes.find((n) => n.index === selectedIndex);
+    if (!tree || primarySelectedIndex === null) return null;
+    const node = sceneNodes.find((n) => n.index === primarySelectedIndex);
     if (!node) return null;
     return primitiveArgs(tree.rootNode, node);
-  }, [tree, sceneNodes, selectedIndex]);
+  }, [tree, sceneNodes, primarySelectedIndex]);
 
   const handleArgCommit = useCallback(
     (argIndex: number, newValueText: string) => {
       const currentTree = treeRef.current;
-      const node = sceneNodesRef.current.find((n) => n.index === selectedIndex);
+      const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
       if (!currentTree || !node) return;
       const patched = patchArgument(sourceRef.current, currentTree, node, argIndex, newValueText);
       if (patched === sourceRef.current) return; // no-op: node/arg vanished, or text unchanged
@@ -270,7 +334,7 @@ export function App() {
       setSource(patched);
       runRender(patched);
     },
-    [selectedIndex, runRender],
+    [primarySelectedIndex, runRender],
   );
 
   // M5: toolbar primitive insertion, reusing the same targeted-patch +
@@ -353,7 +417,7 @@ export function App() {
             ))}
           </span>
         )}
-        {selectedIndex !== null && (
+        {primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             {MIRROR_AXIS_BUTTONS.map(({ axis, label }) => (
               <button key={axis} onClick={() => handleMirrorAxis(axis)}>
@@ -362,17 +426,27 @@ export function App() {
             ))}
           </span>
         )}
-        {selectedIndex !== null && (
+        {primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Color:
             <input
               type="color"
-              value={rgbToHex(nodeMeshes.find((m) => m.index === selectedIndex)?.transform.color ?? null)}
+              value={rgbToHex(nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform.color ?? null)}
               onChange={(e) => handleColorChange(e.target.value)}
             />
-            {nodeMeshes.find((m) => m.index === selectedIndex)?.transform.color && (
+            {nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform.color && (
               <button onClick={handleClearColor}>Clear</button>
             )}
+          </span>
+        )}
+        {selectedIndices.length >= 2 && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Boolean ({selectedIndices.length} selected):
+            {BOOLEAN_OP_BUTTONS.map(({ op, label }) => (
+              <button key={op} onClick={() => handleBooleanOp(op)}>
+                {label}
+              </button>
+            ))}
           </span>
         )}
       </div>
@@ -416,15 +490,15 @@ export function App() {
             value={source}
             onChange={handleSourceChange}
             nodes={sceneNodes}
-            selectedIndex={selectedIndex}
-            onSelectNode={setSelectedIndex}
+            selectedIndex={primarySelectedIndex}
+            onSelectNode={(index) => handleSelect(index, false)}
           />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
           <Viewport
             meshes={nodeMeshes}
-            selectedIndex={selectedIndex}
-            onSelect={setSelectedIndex}
+            selectedIndices={selectedIndices}
+            onSelect={handleSelect}
             gizmoMode={gizmoMode}
             rotateSpace={rotateSpace}
             onTransformCommit={handleTransformCommit}

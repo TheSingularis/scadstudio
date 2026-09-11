@@ -278,7 +278,14 @@ export function primitiveArgs(root: Node, node: SceneNode): { callName: string; 
   const args: PrimitiveArg[] = [];
   for (let i = 0; i < (argsNode?.namedChildCount ?? 0); i++) {
     const argument = argsNode!.namedChild(i);
-    const value = argument?.childForFieldName('value');
+    // The grammar only tags a `value` field for the *named* branch of
+    // `argument` (`name = value`) — a bare positional argument is just the
+    // expression itself with no field name at all, so `value` comes back
+    // null for e.g. cube's `[20,20,20]` in `cube([20,20,20], center=true)`
+    // and has to be read positionally instead (this is exactly why
+    // readVectorCall above reads translate's vector via `.child(0)`, not a
+    // field name).
+    const value = argument?.childForFieldName('value') ?? argument?.child(0);
     if (!value) continue;
     args.push({
       name: argument!.childForFieldName('name')?.text ?? null,
@@ -302,4 +309,55 @@ export function patchArgument(source: string, tree: Tree, node: SceneNode, argIn
   const arg = decomposed?.args[argIndex];
   if (!arg) return source;
   return source.slice(0, arg.valueStart) + newValueText + source.slice(arg.valueEnd);
+}
+
+export type BooleanOp = 'union' | 'difference' | 'intersection';
+
+function indent(text: string, spaces: string): string {
+  return text
+    .split('\n')
+    .map((line) => spaces + line)
+    .join('\n');
+}
+
+// Wraps two or more top-level nodes' verbatim source into a single new
+// `union()`/`difference()`/`intersection() { ... }` block, removing them
+// from their original positions.
+//
+// `nodesInSelectionOrder` is deliberately click order, not document order:
+// difference()'s first child is the base and every child after it is
+// subtracted, so which shape the user selected *first* is semantically
+// load-bearing, the same way it would be in any other CAD tool's boolean
+// tool. Document order only matters for one thing — *where* the new
+// combined statement goes — and that's always the position of whichever
+// selected node comes first in the file, regardless of click order, so nodes
+// before it that were never selected don't need to move at all.
+//
+// Implementation is a single left-to-right pass over the selected nodes in
+// document order: the earliest one's byte range is replaced with the new
+// block, every other selected node's byte range (plus one trailing newline,
+// so deleting a shape doesn't leave a blank line behind) is deleted
+// entirely, and everything else is untouched — same minimal-diff philosophy
+// as patchTransform/patchArgument, just applied to multiple disjoint ranges
+// in one edit instead of one.
+export function wrapInBoolean(source: string, nodesInSelectionOrder: SceneNode[], op: BooleanOp): string {
+  if (nodesInSelectionOrder.length < 2) return source;
+  const byDocOrder = [...nodesInSelectionOrder].sort((a, b) => a.startIndex - b.startIndex);
+  const first = byDocOrder[0];
+
+  const body = nodesInSelectionOrder
+    .map((n) => indent(source.slice(n.startIndex, n.endIndex).trim(), '    '))
+    .join('\n');
+  const block = `${op}() {\n${body}\n}`;
+
+  let result = '';
+  let cursor = 0;
+  for (const node of byDocOrder) {
+    result += source.slice(cursor, node.startIndex);
+    result += node === first ? block : '';
+    cursor = node.endIndex;
+    if (node !== first && source[cursor] === '\n') cursor++;
+  }
+  result += source.slice(cursor);
+  return result;
 }
