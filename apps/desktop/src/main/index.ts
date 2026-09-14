@@ -72,19 +72,20 @@ function createWindow(): void {
           await new Promise((r) => setTimeout(r, 500));
         }
         if (process.env['SCADSTUDIO_CLICK_AT']) {
-          // ";"-separated list of "x,y" or "x,y,shift" triples, clicked in
-          // sequence — lets a single verification run chain UI actions (e.g.
-          // pick a gizmo mode, then select a shape) before a
+          // ";"-separated list of "x,y" or "x,y,shift" or "x,y,ctrl" triples,
+          // clicked in sequence — lets a single verification run chain UI
+          // actions (e.g. pick a gizmo mode, then select a shape) before a
           // SCADSTUDIO_DRAG_AT. The optional third field is a real Electron
-          // input modifier (only "shift" is used so far, for M6's
-          // multi-select) — sent through sendInputEvent's own `modifiers`
-          // array so it exercises the same shiftKey the real DOM/r3f click
-          // handler reads, not a JS-level shortcut around it.
+          // input modifier ("shift" for range-select, "ctrl" for toggle-
+          // select — see Viewport.tsx's SelectMode) — sent through
+          // sendInputEvent's own `modifiers` array so it exercises the same
+          // shiftKey/ctrlKey the real DOM/r3f click handler reads, not a
+          // JS-level shortcut around it.
           for (const triple of process.env['SCADSTUDIO_CLICK_AT']!.split(';')) {
             const [xStr, yStr, modifier] = triple.split(',');
             const x = Number(xStr);
             const y = Number(yStr);
-            const modifiers = modifier === 'shift' ? ['shift' as const] : undefined;
+            const modifiers = modifier === 'shift' ? ['shift' as const] : modifier === 'ctrl' ? ['control' as const] : undefined;
             win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1, modifiers });
             win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1, modifiers });
             await new Promise((r) => setTimeout(r, 500));

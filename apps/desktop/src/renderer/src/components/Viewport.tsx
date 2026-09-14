@@ -29,17 +29,22 @@ export interface NodeMesh {
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
 export type RotateSpace = 'local' | 'world';
+// 'replace' (plain click) and 'toggle' (ctrl/cmd-click) preserve selection
+// *sequence* order — M6's boolean toolbar needs click order to know which
+// shape is "the base" vs "the tool" for difference(), where argument order
+// is semantically load-bearing. 'range' (shift-click) instead produces a
+// fresh contiguous span in document order between the last replace/toggle
+// target and the clicked node, same as the usual file-manager convention.
+export type SelectMode = 'replace' | 'toggle' | 'range';
 
 interface ViewportProps {
   meshes: NodeMesh[];
-  // Ordered by selection sequence (oldest first), not document order — M6's
-  // boolean toolbar needs click order to know which shape is "the base" vs
-  // "the tool" for difference(), where argument order is semantically load-
-  // bearing. The last entry is the "primary" selection: the one the gizmo
-  // attaches to and the one mirror/color/parameter-panel edit, since those
-  // are inherently single-target operations.
+  // See SelectMode above for how this gets ordered. The last entry is the
+  // "primary" selection: the one the gizmo attaches to and the one mirror/
+  // color/parameter-panel edit, since those are inherently single-target
+  // operations.
   selectedIndices: number[];
-  onSelect: (index: number | null, additive: boolean) => void;
+  onSelect: (index: number | null, mode: SelectMode) => void;
   gizmoMode: GizmoMode;
   rotateSpace: RotateSpace;
   onTransformCommit: (index: number, transform: NodeTransform) => void;
@@ -53,7 +58,7 @@ function NodeModel({
 }: {
   mesh: NodeMesh;
   selected: boolean;
-  onSelect: (index: number, additive: boolean) => void;
+  onSelect: (index: number, mode: SelectMode) => void;
   onGroupRef: (index: number, group: Group | null) => void;
 }) {
   // openscad-wasm renders just the bare primitive now (translate/rotate/
@@ -90,7 +95,9 @@ function NodeModel({
         geometry={geometry}
         onClick={(e: ThreeEvent<MouseEvent>) => {
           e.stopPropagation();
-          onSelect(mesh.index, e.shiftKey);
+          // metaKey covers Cmd on macOS, where ctrl-click is reserved for
+          // the OS's own right-click emulation.
+          onSelect(mesh.index, e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace');
         }}
       >
         <meshStandardMaterial color={materialColor} side={2} />
@@ -145,7 +152,7 @@ export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateS
     <Canvas
       camera={{ position: [50, 50, 50], fov: 45 }}
       onPointerMissed={() => {
-        if (!isTransformingRef.current) onSelect(null, false);
+        if (!isTransformingRef.current) onSelect(null, 'replace');
       }}
     >
       <ambientLight intensity={0.6} />

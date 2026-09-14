@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
-import { Viewport, type GizmoMode, type NodeMesh, type RotateSpace } from './components/Viewport';
+import { Viewport, type GizmoMode, type NodeMesh, type RotateSpace, type SelectMode } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import {
@@ -106,10 +106,9 @@ export function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
-  // Ordered by selection sequence (shift-click to add), not document order —
-  // see Viewport.tsx's ViewportProps.selectedIndices comment. The last entry
-  // is the "primary" selection that gizmo/mirror/color/parameter-panel
-  // editing (all single-target operations) act on.
+  // See Viewport.tsx's SelectMode/ViewportProps.selectedIndices comments for
+  // ordering. The last entry is the "primary" selection that gizmo/mirror/
+  // color/parameter-panel editing (all single-target operations) act on.
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const primarySelectedIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>('translate');
@@ -274,19 +273,36 @@ export function App() {
     handleTransformCommit(primarySelectedIndex, { ...current, color: null });
   }, [primarySelectedIndex, nodeMeshes, handleTransformCommit]);
 
-  // M6: multi-select toggle (shift-click) vs single-select (plain click),
-  // shared by Viewport clicks and (non-additive only) Editor cursor moves.
-  const handleSelect = useCallback((index: number | null, additive: boolean) => {
+  // M6: multi-select, shared by Viewport clicks and (plain-click only)
+  // Editor cursor moves. Plain click replaces the selection; ctrl/cmd-click
+  // toggles one node in or out (standard multi-select convention); shift-
+  // click selects the contiguous range between the last replace/toggle
+  // target and the clicked node (standard range-select convention). Node
+  // `index` is assigned sequentially in document order (see sceneGraph.ts),
+  // so a plain numeric range between anchor and the clicked index already
+  // matches document order — no separate lookup needed.
+  const selectionAnchor = useRef<number | null>(null);
+  const handleSelect = useCallback((index: number | null, mode: SelectMode) => {
     if (index === null) {
+      selectionAnchor.current = null;
       setSelectedIndices([]);
       return;
     }
-    setSelectedIndices((prev) => {
-      if (!additive) return [index];
-      // Shift-clicking an already-selected node toggles it back off, same
-      // as most other multi-select UIs.
-      return prev.includes(index) ? prev.filter((i) => i !== index) : [...prev, index];
-    });
+    if (mode === 'range') {
+      const anchor = selectionAnchor.current ?? index;
+      const step = index >= anchor ? 1 : -1;
+      const range: number[] = [];
+      for (let i = anchor; i !== index + step; i += step) range.push(i);
+      setSelectedIndices(range);
+      return;
+    }
+    selectionAnchor.current = index;
+    if (mode === 'replace') {
+      setSelectedIndices([index]);
+      return;
+    }
+    // 'toggle'
+    setSelectedIndices((prev) => (prev.includes(index) ? prev.filter((i) => i !== index) : [...prev, index]));
   }, []);
 
   // M6: boolean toolbar. Wraps the selected nodes' verbatim source into a
@@ -491,7 +507,7 @@ export function App() {
             onChange={handleSourceChange}
             nodes={sceneNodes}
             selectedIndex={primarySelectedIndex}
-            onSelectNode={(index) => handleSelect(index, false)}
+            onSelectNode={(index) => handleSelect(index, 'replace')}
           />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
