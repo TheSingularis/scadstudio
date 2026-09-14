@@ -67,7 +67,7 @@ jobs:
         with:
           name: smoke-test-screenshot-linux
           path: /tmp/smoke.png
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Upload AppImage
@@ -75,7 +75,7 @@ jobs:
         with:
           name: scadstudio-appimage
           path: apps/desktop/dist/*.AppImage
-          retention-days: 14
+          retention-days: 7
 
   build-windows:
     runs-on: windows-latest
@@ -139,7 +139,7 @@ jobs:
         with:
           name: smoke-test-screenshot-windows
           path: ${{ runner.temp }}/smoke-win.png
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Upload portable exe
@@ -147,7 +147,7 @@ jobs:
         with:
           name: scadstudio-exe
           path: apps/desktop/dist/*.exe
-          retention-days: 14
+          retention-days: 7
 
   # Every push to master gets workflow-artifact builds (above) for quick
   # iteration; pushing a version tag (e.g. v0.1.0-beta.1) additionally cuts a
