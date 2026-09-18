@@ -39,6 +39,21 @@
     padding: 14px 18px;
     font-weight: 600;
   }
+  /* Only phases with a .subtasks list are rendered as <details> (see
+     bottom of body) — collapsing a phase with nothing underneath it would
+     be a no-op, so those stay plain, non-interactive headers. */
+  summary.phase-header {
+    cursor: pointer;
+    list-style: none;
+  }
+  summary.phase-header::-webkit-details-marker { display: none; }
+  summary.phase-header .chevron {
+    display: inline-block;
+    margin-right: 4px;
+    color: var(--muted);
+    transition: transform 0.15s ease;
+  }
+  details[open] > summary.phase-header .chevron { transform: rotate(90deg); }
   .phase-header .name { display: flex; align-items: baseline; gap: 8px; }
   .phase-header .tag { font-size: 0.75rem; font-weight: 500; color: var(--muted); }
   .subtasks {
@@ -84,8 +99,10 @@
     border-radius: 4px;
     color: var(--text);
   }
-  .legend { margin-bottom: 24px; font-size: 0.8rem; color: var(--muted); }
+  .legend { margin-bottom: 24px; font-size: 0.8rem; color: var(--muted); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
   .legend span { margin-right: 14px; }
+  .toggle-all { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 3px 10px; font-size: 0.75rem; cursor: pointer; }
+  .toggle-all:hover { color: var(--text); border-color: var(--muted); }
   .progress-bar {
     height: 8px;
     background: var(--border);
@@ -103,84 +120,96 @@
 <body>
 
 <h1>scadstudio — Milestone Progress</h1>
-<div class="subtitle">Snapshot as of 2026-09-14 (M6 in progress: multi-select + boolean wrap). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section. Progress bar covers M0-M11 (the full v1 + already-planned post-v1 scope); M12 and M13 are stretch goals and aren't counted toward it.</div>
+<div class="subtitle">Snapshot as of 2026-09-17 (M7 complete; M7.5 in progress — slice 1: plane picker + camera lock). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section — M7.5 (sketch mode) sits between M7 and M8, kept as a ".5" rather than renumbering M8-M14 again. Progress bar covers M0-M12 plus M7.5 (the full v1 + already-planned post-v1 scope); M13 and M14 are stretch goals and aren't counted toward it.</div>
 
 <div class="legend">
-  <span>🟢 completed</span>
-  <span>🔵 in progress</span>
-  <span>⚪ pending</span>
-  <span>🟠 deferred (post-v1)</span>
-  <span>⚫ stretch goal</span>
+  <div>
+    <span>🟢 completed</span>
+    <span>🔵 in progress</span>
+    <span>⚪ pending</span>
+    <span>🟠 deferred (post-v1)</span>
+    <span>⚫ stretch goal</span>
+  </div>
+  <div>
+    <button class="toggle-all" onclick="document.querySelectorAll('details.phase').forEach(d => d.open = true)">Expand all</button>
+    <button class="toggle-all" onclick="document.querySelectorAll('details.phase').forEach(d => d.open = false)">Collapse all</button>
+  </div>
 </div>
 
-<div class="progress-bar"><div class="progress-bar-fill" style="width: 54%"></div></div>
+<div class="progress-bar"><div class="progress-bar-fill" style="width: 57%"></div></div>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M0 — Spike <span class="tag">parser + WASM render engine de-risking</span></span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">tree-sitter-openscad parses real-world syntax cleanly</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">openscad-wasm renders valid STL from Node</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Found: 2 narrow grammar gaps (bare `each`, chained `for`) — non-blocking</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Found: fresh WASM instance required per render call</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M1 — Static viewer <span class="tag">Electron shell, one-shot render</span></span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Open a .scad file (native dialog or bundled default)</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Full-document render → r3f viewport with orbit controls</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Read-only Monaco editor with OpenSCAD syntax highlighting</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M2 — Live text→visual sync <span class="tag">editable Monaco, debounced re-render</span></span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Editable Monaco with real tree-sitter incremental parsing</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Debounced + coalescing render queue (no per-keystroke pile-up)</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Graceful parse-error handling (last-good mesh retained)</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M3 — Scene-graph + click-to-select <span class="tag">first bidirectional selection</span></span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Per-top-level-statement isolated rendering</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Click a mesh → highlight its source range in Monaco</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Click/move cursor in text → highlight the matching mesh</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">CI/CD — AppImage builds <span class="tag">not a numbered milestone, added on request</span></span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">GitHub Actions: build + package on every push to master</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Headless smoke-test launch before uploading (catches broken packages)</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Verified passing on GitHub's own runners, not just locally</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M4 — Translate gizmo <span class="tag">gizmo edits AST param via targeted patch</span></span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Drag gizmo → patch existing translate([...]) vector in place</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Drag gizmo on unwrapped geometry → insert new translate([...]) wrap</span><span class="badge completed">completed</span></div>
@@ -188,13 +217,14 @@
     <div class="subtask"><span class="name">Found + fixed: gizmo pivot must be geometry bbox-center, not mesh origin</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Found + fixed: gizmo nested in &lt;Bounds&gt; blew up camera auto-fit</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M5 — Full transform set + toolbar primitive insertion</span>
     <span class="badge completed">completed</span>
-  </div>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Rotate + scale gizmos, mode toggle (translate/rotate/scale)</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Rotate/scale insert "in place" (inside an existing translate), not orbiting the origin</span><span class="badge completed">completed</span></div>
@@ -212,29 +242,60 @@
     <div class="subtask"><span class="name">Found + fixed (via manual/screenshot verification): negative-scale mirror needed DoubleSide material to avoid backface-culling artifacts</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Parameter panel: generic editable fields for a selected node's own call arguments (named or positional, any built-in or custom module)</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
     <span class="name">M6 — Booleans <span class="tag">multi-select, wrap-in-block, modifiers</span></span>
-    <span class="badge in_progress">in progress</span>
-  </div>
+    <span class="badge completed">completed</span>
+  </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Multi-select in the viewport: ctrl/cmd-click toggles one shape, shift-click range-selects (usual file-manager convention)</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Union/Difference/Intersection toolbar — minimal-diff wrap-in-block codegen</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Found + fixed: M5 parameter panel silently dropped positional arguments (grammar only tags a `value` field for named args)</span><span class="badge completed">completed</span></div>
-    <div class="subtask"><span class="name">Verified with a real CSG cut (overlapping cube/sphere fixture), not just a source-text round-trip</span><span class="badge completed">completed</span></div>
-    <div class="subtask"><span class="name">Per-child selection/dragging inside a merged boolean group ("lazy isolated-render expansion")</span><span class="badge pending">pending</span></div>
-    <div class="subtask"><span class="name">Modifier character support (`# % ! *`)</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">Verified with real CSG results for all three ops (overlapping fixtures), not just source-text round-trips — Union fuses with no seam, Intersection yields only the shared lens volume, Difference hollows out a real cavity</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Base vs. tool(s) shown as distinct colors in the viewport (amber = base, red = tool(s)), with a matching legend in the Boolean toolbar row</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Position (translate) now editable in the parameter panel, not just via the gizmo</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Camera no longer auto-recenters on every edit — only on file-open or an explicit "Reset View" click</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Modifier characters (`# % ! *`): highlight (violet), ghost (translucent), show-only (hides everything else), disable (skips the WASM call entirely)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: a modifier with no transform wrap leaked into the WASM-bound primitive source, making `%`-marked shapes silently render as empty geometry</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">(Per-child selection inside a merged boolean group moved to M9 — nested selection &amp; drill-in navigation — as the generalized version, not tracked here anymore)</span><span class="badge deferred">moved to M9</span></div>
   </div>
-</div>
+</details>
 
-<div class="phase">
-  <div class="phase-header">
-    <span class="name">M7 — Extrusions <span class="tag">linear_extrude / rotate_extrude, 2D sketch mode</span></span>
-    <span class="badge pending">pending</span>
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
+    <span class="name">M7 — Extrusions <span class="tag">linear_extrude / rotate_extrude toolbar tools</span></span>
+    <span class="badge completed">completed</span>
+  </summary>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Extrude mechanics (selection, gizmo, parameter editing, boolean-combining) — turned out to already work for free via the existing generic node machinery, zero new code</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Linear Extrude / Rotate Extrude toolbar buttons, inserting a pre-wrapped default 2D profile</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: bare 2D primitives (square/circle) silently failed to render at all — real OpenSCAD can't STL-export pure-2D geometry; fixed by retrying a failed render wrapped in a hairline linear_extrude, reusing the existing WASM/STL pipeline</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Interactive sketching (plane picking, drawing/reshaping a profile, nav-cube camera) split out into its own milestone, M7.5</span><span class="badge deferred">moved to M7.5</span></div>
   </div>
-</div>
+</details>
+
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
+    <span class="name">M7.5 — Sketch mode <span class="tag">plane picking, line/point sketching, on-plane editing, nav-cube camera</span></span>
+    <span class="badge in_progress">in progress</span>
+  </summary>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Slice 1: global plane picker (XY/XZ/YZ) + camera mode that animates to a straight-on view and locks rotation (pan/zoom still work); "Exit Sketch" returns to normal free-orbit</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Reused Bounds.moveTo()/.lookAt() for the camera animation, same primitive the nav-cube will need later, instead of a second animation system</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Found + fixed: entering sketch mode (or clicking "Reset View") on an empty scene silently did nothing — Bounds/FitController/SketchController never mounted when there were zero visible meshes; a pre-existing bug since M6, not introduced by this slice</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Face-based plane picking (click a face of an existing solid to sketch on it)</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">2D sketch-entity model (points/lines/loops) with drawing UI, round-tripping to polygon()</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">On-plane drag editing of sketch points/edges</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">Draw-time snapping (horizontal/vertical, coincident endpoints) — the cheap constraints tier; full parametric sketch constraints route through M12 instead</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">Extrude hand-off into M7's existing Linear/Rotate Extrude tools</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">Orientation nav-cube + shading-mode dropdown (decoupled from the rest of M7.5 — works against the existing free-orbit camera, could ship standalone)</span><span class="badge pending">pending</span></div>
+  </div>
+</details>
 
 <div class="phase">
   <div class="phase-header">
@@ -245,42 +306,49 @@
 
 <div class="phase">
   <div class="phase-header">
-    <span class="name">M9 — Polish <span class="tag">undo/redo, error UX, packaging hardening</span></span>
+    <span class="name">M9 — Nested selection &amp; drill-in navigation <span class="tag">click into a boolean/extrusion/module's children, breadcrumb back out</span></span>
     <span class="badge pending">pending</span>
   </div>
 </div>
 
 <div class="phase">
   <div class="phase-header">
-    <span class="name">M10 — Directional constraints <span class="tag">distance/alignment via plain SCAD expressions</span></span>
+    <span class="name">M10 — Polish <span class="tag">undo/redo, error UX, packaging hardening, growing UX backlog</span></span>
     <span class="badge pending">pending</span>
   </div>
 </div>
 
 <div class="phase">
   <div class="phase-header">
-    <span class="name">M11 — Solver-based constraints <span class="tag">tangency etc., "SCAD+" comment annotations</span></span>
+    <span class="name">M11 — Directional constraints <span class="tag">distance/alignment via plain SCAD expressions</span></span>
+    <span class="badge pending">pending</span>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="name">M12 — Solver-based constraints <span class="tag">tangency etc., "SCAD+" comment annotations</span></span>
     <span class="badge deferred">post-v1</span>
   </div>
 </div>
 
 <div class="phase">
   <div class="phase-header">
-    <span class="name">M12 — BOSL2 fillets/chamfers <span class="tag">edge-selective rounding, not just Minkowski</span></span>
+    <span class="name">M13 — BOSL2 fillets/chamfers <span class="tag">edge-selective rounding, not just Minkowski</span></span>
     <span class="badge stretch">stretch goal</span>
   </div>
 </div>
 
 <div class="phase">
   <div class="phase-header">
-    <span class="name">M13 — Customizable keybinds <span class="tag">rebind selection/gizmo/boolean shortcuts, persisted</span></span>
+    <span class="name">M14 — Customizable keybinds <span class="tag">rebind selection/gizmo/boolean shortcuts, persisted</span></span>
     <span class="badge stretch">stretch goal</span>
   </div>
 </div>
 
 <div class="note">
-  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, drag a shape with a translate/rotate/scale gizmo to rewrite its source in place (inserting a new wrap if it had none, and doing so "in place" relative to any existing translate rather than orbiting the world origin), toggle mirror or pick a color from the toolbar, edit a selected node's own call arguments directly in a generic parameter panel, insert a new primitive, or select two+ shapes (ctrl/cmd-click to toggle one, shift-click to range-select) and combine them with a real Union/Difference/Intersection (verified with an actual CSG cut, not just a source-text change). Placement (position/rotation/scale) is now a real three.js transform on each shape's pivot group rather than baked-in geometry, which is what makes local-space rotate/scale legitimate — the rotate gizmo has a Local/World toggle as a result (scale stays local-only, translate stays world-only; see build notes for why). Mirror is folded into scale's sign (an axis-aligned mirror and a matching negative scale are the same matrix) but always round-trips through real `mirror()` calls in source, never a literal negative `scale()`. The parameter panel is schema-free — it reflects whatever arguments (named or positional) a call actually has in source, with no hardcoded per-primitive knowledge. Every top-level statement in a file is its own independently-rendered, clickable, draggable object (until merged into a boolean group — see gaps below). <b>M5 is fully done; M6 is in progress.</b><br><br>
-  <b>Known gaps (expected, not bugs):</b> a merged boolean group's children aren't independently selectable/draggable yet (clicking one selects the whole group — M6's "lazy isolated-render expansion" piece), no modifier characters (`# % ! *`, also M6), no extrusions UI (M7), no custom-module detection (M8) — so positional parameter-panel arguments show as `#1`/`#2`/... rather than a module's real parameter names, since resolving that is M8's job — no fillets/chamfers (M12, stretch goal — OpenSCAD has no native edge-selective rounding; see PLAN.md). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it). The placement architecture assumes canonical color→translate→rotate→mirror→scale ordering regardless of how a file is actually written — documented in PLAN.md, fails visibly rather than silently if violated.<br><br>
+  <b>Where things stand:</b> the core edit loop is real and working — open a file, edit it live, click between code and 3D shapes in either direction, drag a shape with a translate/rotate/scale gizmo to rewrite its source in place (inserting a new wrap if it had none, and doing so "in place" relative to any existing translate rather than orbiting the world origin), toggle mirror or pick a color from the toolbar, edit a selected node's own call arguments (including position) directly in a generic parameter panel, insert a new primitive, or select two+ shapes (ctrl/cmd-click to toggle one, shift-click to range-select) and combine them with a real Union/Difference/Intersection — all three independently verified with real CSG results (a fused blob, a shared-volume lens, a hollowed-out cavity), not just source-text changes — with the base (click-order-first) shape and the tool(s) being combined/subtracted rendered in distinct colors with a matching toolbar legend. A shape can also be flagged with any of OpenSCAD's four modifier characters (highlight, ghost, show-only, disable), each with real render/visibility behavior, not just a source-text toggle. The camera only re-fits on file-open or an explicit "Reset View" click, not on every edit. Placement (position/rotation/scale) is now a real three.js transform on each shape's pivot group rather than baked-in geometry, which is what makes local-space rotate/scale legitimate — the rotate gizmo has a Local/World toggle as a result (scale stays local-only, translate stays world-only; see build notes for why). Mirror is folded into scale's sign (an axis-aligned mirror and a matching negative scale are the same matrix) but always round-trips through real `mirror()` calls in source, never a literal negative `scale()`. The parameter panel is schema-free — it reflects whatever arguments (named or positional) a call actually has in source, with no hardcoded per-primitive knowledge. Every top-level statement in a file is its own independently-rendered, clickable, draggable object (until merged into a boolean group — see gaps below). Linear Extrude / Rotate Extrude toolbar buttons insert a pre-wrapped 2D profile that gets all the same editing for free (extrude mechanics needed no new code at all), and bare 2D primitives (Square/Circle) — previously silently broken — now render too, via a hairline-extrude fallback on the existing WASM pipeline rather than a separate geometry path. A first slice of sketch mode also landed: pick a global plane (XY/XZ/YZ) and the camera animates to a true straight-on orthogonal view with rotation locked (pan/zoom still work), "Exit Sketch" returns to normal free orbit — no drawing yet, but the camera-mode-switch mechanism (the riskiest, most novel piece) is proven out and reused by `Bounds.moveTo()/.lookAt()` rather than a second animation system. <b>M5, M6, and M7 are all fully done; M7.5 is in progress.</b><br><br>
+  <b>Known gaps (expected, not bugs):</b> a merged boolean group's children aren't independently selectable/draggable yet (clicking one selects the whole group — moved to M9's "nested selection & drill-in navigation" scope, not tracked under M6 anymore), no interactive sketching (plane picking, drawing/reshaping a 2D profile, nav-cube camera — all M7.5), no custom-module detection (M8) — so positional parameter-panel arguments show as `#1`/`#2`/... rather than a module's real parameter names, since resolving that is M8's job — no fillets/chamfers (M13, stretch goal — OpenSCAD has no native edge-selective rounding; see PLAN.md). Selection is positional and can reset after a structural edit (a stable-ID fingerprint comes later, once multi-node dragging needs it). The placement architecture assumes canonical color→translate→rotate→mirror→scale ordering regardless of how a file is actually written — documented in PLAN.md, fails visibly rather than silently if violated.<br><br>
   <b>Full history:</b> see PLAN.md's per-milestone "build notes" sections in the repo for exact bugs found/fixed at each step.
 </div>
 

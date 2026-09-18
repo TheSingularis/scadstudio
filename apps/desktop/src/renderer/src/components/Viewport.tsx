@@ -1,13 +1,29 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from 'react';
-import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Bounds, Center, TransformControls } from '@react-three/drei';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
+import { OrbitControls, Bounds, Center, TransformControls, useBounds } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
 import { Color, Vector3, type Group } from 'three';
 
 const DEFAULT_MESH_COLOR = '#4a90d9';
-const SELECTED_MESH_COLOR = '#e8a33d';
-import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform } from '../targetedPatch';
+// A single selection (or the *first*-clicked shape in a multi-select) reads
+// as the "base" — the thing difference() subtracts from, union()/
+// intersection()'s first argument, etc. Every other selected shape reads as
+// an "operand" being combined/subtracted into it, in a visually distinct
+// color, so which-shape-cuts-which is legible in the viewport itself instead
+// of only inferable from click order (see App.tsx's Boolean toolbar legend).
+export const SELECTED_MESH_COLOR = '#e8a33d';
+export const OPERAND_MESH_COLOR = '#d9534f';
+// `#` (highlight) styling — distinct from both the default and the two
+// selection-role colors above so it reads unambiguously regardless of
+// whether the highlighted node is also currently selected.
+export const HIGHLIGHT_MESH_COLOR = '#a855f7';
+// `%` (background/ghost) opacity — real OpenSCAD renders these translucent
+// and excludes them from the final CSG output; this app only ever renders
+// top-level statements independently (no single merged CSG output to
+// exclude from), so the translucency is the whole of what's reproduced here.
+const GHOST_OPACITY = 0.35;
+import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform, type Modifier } from '../targetedPatch';
 
 // Derived from drei's own component rather than three's OrbitControls
 // directly — drei pins a slightly different three.js generic signature and
@@ -25,6 +41,10 @@ export interface NodeMesh {
   // legitimately operate in the object's local space, because the object
   // really does carry the rotation as its own transform).
   transform: NodeTransform;
+  // `*` (disable) never reaches here — App.tsx skips rendering (and the WASM
+  // call entirely) for disabled nodes, same as real OpenSCAD not evaluating
+  // disabled geometry — so this is only ever '#' | '!' | '%' | null.
+  modifier: Modifier | null;
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
@@ -48,16 +68,29 @@ interface ViewportProps {
   gizmoMode: GizmoMode;
   rotateSpace: RotateSpace;
   onTransformCommit: (index: number, transform: NodeTransform) => void;
+  // Changing this value re-fits/re-centers the camera on the current scene
+  // (see the <Bounds key={fitToken}> below) — deliberately *not* derived from
+  // `meshes` itself, so routine edits (dragging a gizmo, tweaking a
+  // parameter) don't yank the camera around. App.tsx changes it only when a
+  // genuinely new file is opened or the user explicitly clicks "Reset View".
+  fitToken: string;
+  // M7.5 slice 1: null outside sketch mode (free orbit, as today). Non-null
+  // drives the camera to that plane's canonical view (SketchController) and
+  // locks orbit rotation (pan/zoom still work) for the duration — see PLAN.md
+  // "Sketch mode (M7.5)".
+  sketchPlane: SketchPlane | null;
 }
+
+type SelectionRole = 'none' | 'base' | 'operand';
 
 function NodeModel({
   mesh,
-  selected,
+  role,
   onSelect,
   onGroupRef,
 }: {
   mesh: NodeMesh;
-  selected: boolean;
+  role: SelectionRole;
   onSelect: (index: number, mode: SelectMode) => void;
   onGroupRef: (index: number, group: Group | null) => void;
 }) {
@@ -79,10 +112,16 @@ function NodeModel({
   const quaternion = useMemo(() => transformToQuaternion(mesh.transform.rotateDeg), [mesh.transform.rotateDeg]);
   // OpenSCAD's color() takes 0-1 floats, which is exactly what three.js's
   // Color(r, g, b) constructor expects — no conversion needed.
-  const materialColor = useMemo(
-    () => (selected ? SELECTED_MESH_COLOR : mesh.transform.color ? new Color(...mesh.transform.color) : DEFAULT_MESH_COLOR),
-    [selected, mesh.transform.color],
-  );
+  const materialColor = useMemo(() => {
+    if (role === 'base') return SELECTED_MESH_COLOR;
+    if (role === 'operand') return OPERAND_MESH_COLOR;
+    if (mesh.modifier === '#') return HIGHLIGHT_MESH_COLOR;
+    return mesh.transform.color ? new Color(...mesh.transform.color) : DEFAULT_MESH_COLOR;
+  }, [role, mesh.modifier, mesh.transform.color]);
+  // `%` stays translucent regardless of selection/highlight — it's a
+  // persistent "ghost reference" state, not something selecting the node
+  // should visually override.
+  const isGhost = mesh.modifier === '%';
 
   return (
     <group
@@ -100,10 +139,69 @@ function NodeModel({
           onSelect(mesh.index, e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace');
         }}
       >
-        <meshStandardMaterial color={materialColor} side={2} />
+        <meshStandardMaterial color={materialColor} side={2} transparent={isGhost} opacity={isGhost ? GHOST_OPACITY : 1} />
       </mesh>
     </group>
   );
+}
+
+// Matches <Canvas camera={{ position: DEFAULT_CAMERA_POSITION, ... }}> below —
+// the one true "default angle" every fit should return to.
+const DEFAULT_CAMERA_POSITION: [number, number, number] = [50, 50, 50];
+
+// Lives inside <Bounds> (needs its context via useBounds) and fires whenever
+// fitToken changes. drei's own bounds.reset()/fit() fits distance along
+// whatever direction the camera *currently* faces — exactly wrong for an
+// explicit reset after the user has orbited away, since it would just
+// re-frame along the orbited angle instead of returning to the standard
+// isometric view. Snapping the camera back to the canonical position first
+// makes reset()'s direction computation come out canonical too.
+function FitController({ fitToken, orbitControlsRef }: { fitToken: string; orbitControlsRef: RefObject<OrbitControlsImpl | null> }) {
+  const bounds = useBounds();
+  const camera = useThree((state) => state.camera);
+  useEffect(() => {
+    camera.position.set(...DEFAULT_CAMERA_POSITION);
+    const controls = orbitControlsRef.current;
+    if (controls) {
+      controls.target.set(0, 0, 0);
+      controls.update();
+    }
+    bounds.refresh().fit().clip();
+    // fitToken is the only intentional trigger — see its own doc comment on
+    // ViewportProps for why this must NOT depend on meshes/content.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitToken]);
+  return null;
+}
+
+// M7.5 slice 1: global sketch planes only (no face-picking yet — see PLAN.md
+// "Sketch mode (M7.5)"). Tuples are used directly as three.js vectors, same
+// as translate/rotate everywhere else in this app (see App.tsx/targetedPatch
+// — there's no OpenSCAD-Z-up-to-three.js-Y-up remap anywhere), so "XY plane"
+// here means the plane where the third (Z) component is 0, matching real
+// OpenSCAD's own XY/XZ/YZ naming, not three.js's default Y-up framing.
+export type SketchPlane = 'XY' | 'XZ' | 'YZ';
+const SKETCH_PLANE_VIEWS: Record<SketchPlane, { position: [number, number, number]; up: [number, number, number] }> = {
+  XY: { position: [0, 0, 60], up: [0, 1, 0] },
+  XZ: { position: [0, -60, 0], up: [0, 0, 1] },
+  YZ: { position: [60, 0, 0], up: [0, 0, 1] },
+};
+
+// Sibling to FitController, same "lives inside <Bounds> for useBounds, fires
+// on prop change only" shape — but calls the lower-level moveTo/lookAt
+// directly instead of fit()/reset(), since a sketch plane view is a fixed
+// given orientation, not something derived from current content/camera
+// state. This is the "animate camera to a target orientation" primitive the
+// nav-cube (PLAN.md M7.5 point 5) will want too — reuse this rather than
+// building a second animation path when the nav-cube is built.
+function SketchController({ sketchPlane }: { sketchPlane: SketchPlane | null }) {
+  const bounds = useBounds();
+  useEffect(() => {
+    if (!sketchPlane) return;
+    const { position, up } = SKETCH_PLANE_VIEWS[sketchPlane];
+    bounds.refresh().moveTo(position).lookAt({ target: [0, 0, 0], up });
+  }, [sketchPlane, bounds]);
+  return null;
 }
 
 interface DragSnapshot {
@@ -112,7 +210,16 @@ interface DragSnapshot {
   scale: Vector3;
 }
 
-export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateSpace, onTransformCommit }: ViewportProps) {
+export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateSpace, onTransformCommit, fitToken, sketchPlane }: ViewportProps) {
+  // `!` ("show only this") — real OpenSCAD discards everything else from the
+  // render entirely when any statement is marked. Nothing stops marking more
+  // than one, so this shows the union of all of them rather than assuming a
+  // single one.
+  const hasRootModifier = useMemo(() => meshes.some((m) => m.modifier === '!'), [meshes]);
+  const visibleMeshes = useMemo(
+    () => (hasRootModifier ? meshes.filter((m) => m.modifier === '!') : meshes),
+    [meshes, hasRootModifier],
+  );
   // The gizmo only ever targets one object — the most recently selected one.
   const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
@@ -148,30 +255,52 @@ export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateS
     setTransformTarget(primaryIndex !== null ? (groupsByIndex.current.get(primaryIndex) ?? null) : null);
   }, [primaryIndex]);
 
+  // M7.5 slice 1: lock rotation while sketching (pan/zoom still allowed) so
+  // the plane view SketchController just animated to doesn't get orbited
+  // away from immediately after — the whole point of a sketch-plane view is
+  // that it stays straight-on while you work.
+  useEffect(() => {
+    const controls = orbitControlsRef.current;
+    if (controls) controls.enableRotate = sketchPlane === null;
+  }, [sketchPlane]);
+
   return (
     <Canvas
-      camera={{ position: [50, 50, 50], fov: 45 }}
+      camera={{ position: DEFAULT_CAMERA_POSITION, fov: 45 }}
       onPointerMissed={() => {
         if (!isTransformingRef.current) onSelect(null, 'replace');
       }}
     >
       <ambientLight intensity={0.6} />
       <directionalLight position={[10, 20, 10]} intensity={0.8} />
-      {meshes.length > 0 && (
-        <Bounds fit clip observe margin={1.2}>
-          <Center>
-            {meshes.map((mesh) => (
-              <NodeModel
-                key={mesh.index}
-                mesh={mesh}
-                selected={selectedIndices.includes(mesh.index)}
-                onSelect={onSelect}
-                onGroupRef={handleGroupRef}
-              />
-            ))}
-          </Center>
-        </Bounds>
-      )}
+      {
+        // Unconditional now (previously gated on visibleMeshes.length > 0):
+        // that gate meant FitController/SketchController never mounted on an
+        // empty scene, so "Reset View" and entering sketch mode silently did
+        // nothing until at least one shape existed — a real bug for the
+        // "start sketching on a blank file" case, found while testing M7.5
+        // slice 1. Bounds' own refresh() already falls back gracefully on an
+        // empty box (see its source), and <Center> with zero children is a
+        // no-op, so there's no real reason for the gate to exist.
+        //
+        // No `fit`/`clip`/`observe` here: those re-fit/re-center the camera
+        // on every geometry change, which was yanking the camera around on
+        // routine edits (a gizmo drag, a parameter tweak) — not just on
+        // load. FitController below is the sole trigger instead, firing only
+        // when App.tsx's fitToken changes: a new file opened, or an explicit
+        // "Reset View" click — never as a side effect of editing.
+      }
+      <Bounds margin={1.2}>
+        <FitController fitToken={fitToken} orbitControlsRef={orbitControlsRef} />
+        <SketchController sketchPlane={sketchPlane} />
+        <Center>
+          {visibleMeshes.map((mesh) => {
+            const selPos = selectedIndices.indexOf(mesh.index);
+            const role: SelectionRole = selPos === -1 ? 'none' : selPos === 0 ? 'base' : 'operand';
+            return <NodeModel key={mesh.index} mesh={mesh} role={role} onSelect={onSelect} onGroupRef={handleGroupRef} />;
+          })}
+        </Center>
+      </Bounds>
       {transformTarget && (
         <TransformControls
           object={transformTarget}

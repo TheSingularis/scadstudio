@@ -154,7 +154,14 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   const transform: NodeTransform = { translate: [0, 0, 0], rotateDeg: [0, 0, 0], scale: [1, 1, 1], color: null };
   const mirrorSign: [number, number, number] = [1, 1, 1];
   let sawColor = false;
-  const wrapStart = top.startIndex;
+  // A leading modifier character (`# % ! *`, see readModifier/patchModifier
+  // below) is `top`'s own first child, not part of the transform/primitive
+  // content — wrapStart must start *after* it, or patchTransform's rewrite
+  // would silently delete the modifier on the next gizmo drag. Only matters
+  // when there's no translate/rotate/etc. wrap to skip past anyway (see
+  // primitiveStart below for the other half of this).
+  const modifierNode = top.child(0)?.type === 'modifier' ? top.child(0) : null;
+  const wrapStart = modifierNode ? modifierNode.endIndex : top.startIndex;
   let current: Node = top;
 
   while (current.type === 'module_instantiation') {
@@ -193,7 +200,50 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   }
 
   transform.scale = transform.scale.map((v, i) => v * mirrorSign[i]) as [number, number, number];
-  return { transform, primitiveStart: current.startIndex, wrapStart, primitiveNode: current };
+  // If the loop above never advanced past `top` (no translate/rotate/etc.
+  // wrap to walk through — e.g. a bare `%cube(10);`), `current` is still
+  // `top` itself, whose startIndex is the modifier's position, not the
+  // primitive's — the max() picks wrapStart (past the modifier) in that
+  // case, and current.startIndex (already correctly past both the modifier
+  // and any consumed wraps) in every other case.
+  const primitiveStart = Math.max(current.startIndex, wrapStart);
+  return { transform, primitiveStart, wrapStart, primitiveNode: current };
+}
+
+// M6's four OpenSCAD modifier characters — highlight (#), background/ghost
+// (%), root/show-only (!), disable (*). Grammar-level, these prefix a
+// statement's *outermost* call (`modifier: ($) => choice('#', '!', '%', '*')`
+// as an unlabeled optional child of `module_instantiation`) — the same node
+// decomposeNode's wrap-walk starts from (`top`/`topConcreteNode`), not the
+// inner primitive `primitiveNode` descends to. Real OpenSCAD applies a
+// modifier recursively to a statement's children too, but since this app
+// only models top-level statements (nested-child modeling is M9's job), a
+// modifier here only ever affects the one top-level statement it's written
+// on.
+export type Modifier = '#' | '!' | '%' | '*';
+
+export function readModifier(root: Node, node: SceneNode): Modifier | null {
+  const top = topConcreteNode(root, node);
+  if (!top || top.type !== 'module_instantiation') return null;
+  const first = top.child(0);
+  return first && first.type === 'modifier' ? (first.text as Modifier) : null;
+}
+
+// Toggles a modifier: re-applying the one that's already active clears it
+// (real OpenSCAD only ever has zero or one modifier per statement, so
+// there's no "stack" to manage), applying a different one replaces it.
+export function patchModifier(source: string, tree: Tree, node: SceneNode, modifier: Modifier): string {
+  const top = topConcreteNode(tree.rootNode, node);
+  if (!top || top.type !== 'module_instantiation') return source;
+  const first = top.child(0);
+  const existing = first && first.type === 'modifier' ? first : null;
+  if (existing) {
+    const withoutExisting = source.slice(0, existing.startIndex) + source.slice(existing.endIndex);
+    if (existing.text === modifier) return withoutExisting; // toggle off
+    // existing.startIndex is still valid against `withoutExisting` — nothing before it moved.
+    return withoutExisting.slice(0, existing.startIndex) + modifier + withoutExisting.slice(existing.startIndex);
+  }
+  return source.slice(0, top.startIndex) + modifier + source.slice(top.startIndex);
 }
 
 // Isolated-render source for a node: just the base primitive (context +
@@ -204,6 +254,22 @@ export function primitiveSource(root: Node, node: SceneNode, fullSource: string,
   const decomposed = decomposeNode(root, node);
   const start = decomposed ? decomposed.primitiveStart : node.startIndex;
   return `${context}\n${fullSource.slice(start, node.endIndex)}`;
+}
+
+// M7: real OpenSCAD can't export pure-2D geometry (square/circle/polygon,
+// or anything else that evaluates to 2D, e.g. a 2D boolean) to STL — a bare
+// `circle();` at the top level fails the isolated render entirely (App.tsx
+// catches this and retries with this wrapper). Wrapping in a hairline
+// linear_extrude reuses the exact same WASM/STL pipeline as every 3D node
+// instead of a separate client-side 2D geometry path, so every real
+// OpenSCAD 2D semantic ($fn, center, d vs r, 2D booleans, text()'s font
+// caveat aside) is handled by actually running OpenSCAD, not reimplemented.
+// A block child (not a direct call) so this also works when `src` is
+// several statements (context assignments + the primitive) — non-geometry
+// statements inside a block are valid and simply produce no geometry of
+// their own.
+export function wrapAsThinExtrude(src: string): string {
+  return `linear_extrude(height=0.01) {\n${src}\n}`;
 }
 
 const MIRROR_AXIS_VECTORS: [number, number, number][] = [

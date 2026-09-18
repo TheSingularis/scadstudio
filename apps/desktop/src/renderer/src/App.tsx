@@ -1,19 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
-import { Viewport, type GizmoMode, type NodeMesh, type RotateSpace, type SelectMode } from './components/Viewport';
+import {
+  Viewport,
+  type GizmoMode,
+  type NodeMesh,
+  type RotateSpace,
+  type SelectMode,
+  type SketchPlane,
+  SELECTED_MESH_COLOR,
+  OPERAND_MESH_COLOR,
+} from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import {
   patchTransform,
   primitiveSource,
+  wrapAsThinExtrude,
   decomposeNode,
   primitiveArgs,
   patchArgument,
   wrapInBoolean,
+  readModifier,
+  patchModifier,
   IDENTITY_TRANSFORM,
   type NodeTransform,
   type BooleanOp,
+  type Modifier,
 } from './targetedPatch';
 import { appendPrimitive, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
@@ -24,6 +37,22 @@ const PRIMITIVE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
   { kind: 'cylinder', label: 'Cylinder' },
   { kind: 'square', label: 'Square' },
   { kind: 'circle', label: 'Circle' },
+];
+
+// M7: extrusions insert a whole pre-wrapped statement (extrude + default 2D
+// profile) via the same append path as the primitives above — separated into
+// their own labelled toolbar group only for clarity, since they're a distinct
+// operation category (a 2D→3D feature, not a bare primitive).
+const EXTRUDE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
+  { kind: 'linear_extrude', label: 'Linear Extrude' },
+  { kind: 'rotate_extrude', label: 'Rotate Extrude' },
+];
+
+// M7.5 slice 1: global planes only — no face-picking yet (see PLAN.md).
+const SKETCH_PLANE_BUTTONS: { plane: SketchPlane; label: string }[] = [
+  { plane: 'XY', label: 'XY' },
+  { plane: 'XZ', label: 'XZ' },
+  { plane: 'YZ', label: 'YZ' },
 ];
 
 const GIZMO_MODE_BUTTONS: { mode: GizmoMode; label: string }[] = [
@@ -50,6 +79,17 @@ const MIRROR_AXIS_BUTTONS: { axis: 0 | 1 | 2; label: string }[] = [
   { axis: 0, label: 'Mirror X' },
   { axis: 1, label: 'Mirror Y' },
   { axis: 2, label: 'Mirror Z' },
+];
+
+// M6: OpenSCAD's four statement modifier characters — clicking the one
+// that's already active toggles it off (see patchModifier's comment); real
+// OpenSCAD only ever has zero or one per statement, so these are mutually
+// exclusive, same spirit as the gizmo-mode buttons above.
+const MODIFIER_BUTTONS: { modifier: Modifier; label: string }[] = [
+  { modifier: '#', label: 'Highlight #' },
+  { modifier: '%', label: 'Ghost %' },
+  { modifier: '!', label: 'Show only !' },
+  { modifier: '*', label: 'Disable *' },
 ];
 
 // M6: boolean ops need 2+ selected nodes (shift-click in the viewport to
@@ -104,6 +144,14 @@ const RENDER_DEBOUNCE_MS = 400;
 export function App() {
   const [source, setSource] = useState(DEFAULT_SOURCE);
   const [filePath, setFilePath] = useState<string | null>(null);
+  // Bumped by the "Reset View" button — combined with filePath into
+  // Viewport's fitToken, so the camera re-fits on an explicit request too,
+  // not just on opening a new file.
+  const [resetViewToken, setResetViewToken] = useState(0);
+  // M7.5 slice 1: null outside sketch mode. See Viewport.tsx's SketchPlane/
+  // SketchController for the camera-lock/animate-to-plane behavior this
+  // drives.
+  const [sketchPlane, setSketchPlane] = useState<SketchPlane | null>(null);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
   // See Viewport.tsx's SelectMode/ViewportProps.selectedIndices comments for
@@ -160,17 +208,44 @@ export function App() {
           // statement, sequential — see PLAN.md M3 build notes on why this
           // stays simple rather than the full render-worker job queue).
           const meshes: NodeMesh[] = [];
+          let disabledCount = 0;
           for (const node of graph.nodes) {
+            // `*` (disable) — real OpenSCAD never evaluates disabled
+            // geometry at all, so skip the WASM call entirely rather than
+            // rendering it and hiding it after the fact. The node stays
+            // selectable via the editor (sceneNodes/tree don't depend on
+            // nodeMeshes), just absent from the viewport — same fallback
+            // shape as a node whose render call fails below, but tracked
+            // separately so the status line doesn't read a deliberate
+            // disable as a render failure.
+            const modifier = readModifier(parsedTree.rootNode, node);
+            if (modifier === '*') {
+              disabledCount++;
+              continue;
+            }
+            const source = primitiveSource(parsedTree.rootNode, node, src, graph.context);
             try {
               // Only the bare primitive goes to WASM — translate/rotate/
               // scale are applied as a real three.js transform on the pivot
               // group instead of being baked into the rendered geometry (see
               // targetedPatch.ts's decomposeNode for why).
-              const bytes = await window.scadstudio.renderScad(primitiveSource(parsedTree.rootNode, node, src, graph.context));
+              const bytes = await window.scadstudio.renderScad(source);
               const transform = decomposeNode(parsedTree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
-              meshes.push({ index: node.index, bytes, transform });
+              meshes.push({ index: node.index, bytes, transform, modifier });
             } catch (err) {
-              console.error(`[scadstudio] node ${node.index} render failed`, err);
+              // M7: a pure-2D node (bare square/circle/polygon, a 2D
+              // boolean, ...) fails here every time — real OpenSCAD can't
+              // STL-export 2D geometry. Retry once wrapped in a hairline
+              // linear_extrude (see wrapAsThinExtrude) before giving up, so
+              // 2D shapes are at least visible/selectable instead of
+              // silently missing from the viewport.
+              try {
+                const bytes = await window.scadstudio.renderScad(wrapAsThinExtrude(source));
+                const transform = decomposeNode(parsedTree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
+                meshes.push({ index: node.index, bytes, transform, modifier });
+              } catch (err2) {
+                console.error(`[scadstudio] node ${node.index} render failed`, err, err2);
+              }
             }
           }
           setNodeMeshes(meshes);
@@ -184,7 +259,9 @@ export function App() {
           } else {
             setSelectedIndices((prev) => prev.filter((i) => i < graph.nodes.length));
           }
-          setStatus(meshes.length === graph.nodes.length ? 'Rendered' : `Rendered ${meshes.length}/${graph.nodes.length} nodes`);
+          const expected = graph.nodes.length - disabledCount;
+          const disabledSuffix = disabledCount > 0 ? ` (${disabledCount} disabled)` : '';
+          setStatus(meshes.length === expected ? `Rendered${disabledSuffix}` : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}`);
         } catch (err) {
           setStatus(`Render failed: ${(err as Error).message}`);
           console.error('[scadstudio] render failed', err);
@@ -215,6 +292,15 @@ export function App() {
     setSource(result.contents);
     runRender(result.contents);
   }, [runRender]);
+
+  // M7.5 slice 1: exiting sketch mode also bumps resetViewToken to trigger
+  // the existing fit-to-content behavior (same as clicking "Reset View")
+  // rather than needing to remember/restore whatever the camera's pre-sketch
+  // state was — reuses FitController's mechanism instead of a second one.
+  const handleExitSketch = useCallback(() => {
+    setSketchPlane(null);
+    setResetViewToken((t) => t + 1);
+  }, []);
 
   // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
   // pipeline as a text edit (one derivation path, not two — see PLAN.md
@@ -272,6 +358,42 @@ export function App() {
     if (!current) return;
     handleTransformCommit(primarySelectedIndex, { ...current, color: null });
   }, [primarySelectedIndex, nodeMeshes, handleTransformCommit]);
+
+  // Position fields in the toolbar: same single-field-edit-of-current-
+  // transform pattern as mirror/color above, just for translate instead.
+  // Previously the only way to see or edit a shape's position was the
+  // translate gizmo itself — this surfaces the actual numbers too.
+  const handlePositionCommit = useCallback(
+    (axis: 0 | 1 | 2, valueText: string) => {
+      if (primarySelectedIndex === null) return;
+      const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
+      if (!current) return;
+      const value = Number(valueText);
+      if (!Number.isFinite(value)) return; // invalid input — ignore, leave source untouched
+      const translate = [...current.translate] as [number, number, number];
+      translate[axis] = value;
+      handleTransformCommit(primarySelectedIndex, { ...current, translate });
+    },
+    [primarySelectedIndex, nodeMeshes, handleTransformCommit],
+  );
+
+  // M6: modifier characters (# % ! *). This edits the node's outermost call
+  // directly via patchModifier (targetedPatch.ts), not handleTransformCommit
+  // — a modifier isn't part of NodeTransform, it's a separate prefix
+  // targetedPatch reads/writes on its own (see readModifier/patchModifier).
+  const handleModifierToggle = useCallback(
+    (modifier: Modifier) => {
+      const tree = treeRef.current;
+      const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
+      if (!tree || !node) return;
+      const patched = patchModifier(sourceRef.current, tree, node, modifier);
+      if (patched === sourceRef.current) return;
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(patched);
+      runRender(patched);
+    },
+    [primarySelectedIndex, runRender],
+  );
 
   // M6: multi-select, shared by Viewport clicks and (plain-click only)
   // Editor cursor moves. Plain click replaces the selection; ctrl/cmd-click
@@ -339,6 +461,16 @@ export function App() {
     return primitiveArgs(tree.rootNode, node);
   }, [tree, sceneNodes, primarySelectedIndex]);
 
+  // Same reasoning as selectedArgs above, for the modifier toolbar's active-
+  // button styling — read fresh from the tree rather than from nodeMeshes,
+  // since a disabled ('*') node has no mesh at all to read from.
+  const selectedModifier = useMemo(() => {
+    if (!tree || primarySelectedIndex === null) return null;
+    const node = sceneNodes.find((n) => n.index === primarySelectedIndex);
+    if (!node) return null;
+    return readModifier(tree.rootNode, node);
+  }, [tree, sceneNodes, primarySelectedIndex]);
+
   const handleArgCommit = useCallback(
     (argIndex: number, newValueText: string) => {
       const currentTree = treeRef.current;
@@ -381,6 +513,7 @@ export function App() {
         }}
       >
         <button onClick={handleOpen}>Open .scad file...</button>
+        <button onClick={() => setResetViewToken((t) => t + 1)}>Reset View</button>
         <span>{filePath ?? '(unsaved default example)'}</span>
         <span style={{ marginLeft: 'auto', opacity: 0.7 }}>
           {parseErrorCount ? `${parseErrorCount} parse error(s) — ` : ''}
@@ -390,6 +523,7 @@ export function App() {
       <div
         style={{
           display: 'flex',
+          flexWrap: 'wrap',
           alignItems: 'center',
           gap: 16,
           padding: '6px 12px',
@@ -406,6 +540,31 @@ export function App() {
               {label}
             </button>
           ))}
+        </span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          Extrude:
+          {EXTRUDE_BUTTONS.map(({ kind, label }) => (
+            <button key={kind} onClick={() => handleInsertPrimitive(kind)}>
+              {label}
+            </button>
+          ))}
+        </span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {sketchPlane === null ? (
+            <>
+              Sketch:
+              {SKETCH_PLANE_BUTTONS.map(({ plane, label }) => (
+                <button key={plane} onClick={() => setSketchPlane(plane)}>
+                  {label}
+                </button>
+              ))}
+            </>
+          ) : (
+            <>
+              <span style={{ opacity: 0.7 }}>Sketching on {sketchPlane} plane</span>
+              <button onClick={handleExitSketch}>Exit Sketch</button>
+            </>
+          )}
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Gizmo:
@@ -444,6 +603,46 @@ export function App() {
         )}
         {primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Modifier:
+            {MODIFIER_BUTTONS.map(({ modifier, label }) => (
+              <button
+                key={modifier}
+                onClick={() => handleModifierToggle(modifier)}
+                style={{ fontWeight: selectedModifier === modifier ? 'bold' : 'normal' }}
+              >
+                {label}
+              </button>
+            ))}
+          </span>
+        )}
+        {primarySelectedIndex !== null && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Position:
+            {(['X', 'Y', 'Z'] as const).map((label, axis) => {
+              const translate = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform.translate;
+              const value = translate?.[axis] ?? 0;
+              return (
+                <span key={label} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                  <span style={{ opacity: 0.6 }}>{label}:</span>
+                  {/* Keyed on the value too, same reformat-after-commit reasoning as the parameter panel's inputs below. */}
+                  <input
+                    key={`${primarySelectedIndex}-${axis}-${value}`}
+                    type="number"
+                    defaultValue={value}
+                    step="any"
+                    size={5}
+                    onBlur={(e) => handlePositionCommit(axis as 0 | 1 | 2, e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
+                    }}
+                  />
+                </span>
+              );
+            })}
+          </span>
+        )}
+        {primarySelectedIndex !== null && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Color:
             <input
               type="color"
@@ -457,7 +656,16 @@ export function App() {
         )}
         {selectedIndices.length >= 2 && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Boolean ({selectedIndices.length} selected):
+            Boolean ({selectedIndices.length} selected —
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: SELECTED_MESH_COLOR, display: 'inline-block' }} />
+              base
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: OPERAND_MESH_COLOR, display: 'inline-block' }} />
+              tool(s)
+            </span>
+            ):
             {BOOLEAN_OP_BUTTONS.map(({ op, label }) => (
               <button key={op} onClick={() => handleBooleanOp(op)}>
                 {label}
@@ -518,6 +726,8 @@ export function App() {
             gizmoMode={gizmoMode}
             rotateSpace={rotateSpace}
             onTransformCommit={handleTransformCommit}
+            fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
+            sketchPlane={sketchPlane}
           />
         </div>
       </div>
