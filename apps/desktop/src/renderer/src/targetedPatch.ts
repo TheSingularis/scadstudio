@@ -47,7 +47,10 @@ export function quaternionToRotateDeg(q: Quaternion): [number, number, number] {
   return [e.x * RAD2DEG, e.y * RAD2DEG, e.z * RAD2DEG];
 }
 
-function formatNumber(n: number): string {
+// Exported for reuse by primitives.ts's sketch-polygon codegen (M7.5) — same
+// float-noise rounding is just as relevant to drawn sketch points as it is
+// to repeated gizmo drags.
+export function formatNumber(n: number): string {
   // Round away float noise from repeated drags (e.g. 4.999999999) without
   // mangling intentionally-precise values.
   const rounded = Math.round(n * 1000) / 1000;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, Bounds, Center, TransformControls, useBounds } from '@react-three/drei';
+import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
 import { Color, Vector3, type Group } from 'three';
@@ -79,6 +79,12 @@ interface ViewportProps {
   // locks orbit rotation (pan/zoom still work) for the duration — see PLAN.md
   // "Sketch mode (M7.5)".
   sketchPlane: SketchPlane | null;
+  // M7.5 slice 2: sketch-local (u,v) points placed so far this session —
+  // App.tsx owns the array (cleared on entering/finishing/exiting a sketch),
+  // Viewport just renders it (SketchPointsPreview) and appends to it
+  // (SketchDrawingPlane's onAddPoint, wired to onAddSketchPoint below).
+  sketchPoints: [number, number][];
+  onAddSketchPoint: (u: number, v: number) => void;
 }
 
 type SelectionRole = 'none' | 'base' | 'operand';
@@ -88,11 +94,19 @@ function NodeModel({
   role,
   onSelect,
   onGroupRef,
+  sketchActive,
 }: {
   mesh: NodeMesh;
   role: SelectionRole;
   onSelect: (index: number, mode: SelectMode) => void;
   onGroupRef: (index: number, group: Group | null) => void;
+  // M7.5 slice 2: existing shapes stop intercepting clicks while sketching,
+  // so clicking anywhere (including "through" a shape sitting between the
+  // camera and the sketch plane) always reaches the sketch surface below
+  // instead of selecting/occluding it — sketching and normal shape
+  // selection are mutually exclusive modes, not competing for the same
+  // click.
+  sketchActive: boolean;
 }) {
   // openscad-wasm renders just the bare primitive now (translate/rotate/
   // scale are stripped before sending source to WASM — see App.tsx), so this
@@ -132,7 +146,12 @@ function NodeModel({
     >
       <mesh
         geometry={geometry}
+        // Disables raycasting for this mesh entirely while sketching (three.js
+        // calls this instead of its default Mesh.raycast; doing nothing means
+        // no hit is ever recorded) — see the sketchActive prop's doc comment.
+        raycast={sketchActive ? () => null : undefined}
         onClick={(e: ThreeEvent<MouseEvent>) => {
+          if (sketchActive) return;
           e.stopPropagation();
           // metaKey covers Cmd on macOS, where ctrl-click is reserved for
           // the OS's own right-click emulation.
@@ -187,6 +206,21 @@ const SKETCH_PLANE_VIEWS: Record<SketchPlane, { position: [number, number, numbe
   YZ: { position: [60, 0, 0], up: [0, 0, 1] },
 };
 
+// M7.5 slice 2: the rotate() that places a flat (z=0) sketch's local (u,v)
+// points onto each plane in world space. Exported and reused as-is by
+// primitives.ts's `appendSketchPolygon` codegen for the final `rotate([...])
+// polygon(...)` statement — using the exact same numbers for the live
+// in-progress preview (below) and the committed source is what guarantees
+// they can never drift apart; the actual world-space mapping this produces
+// per axis is a documented side effect of the rotation math, not something
+// independently chosen to match the SKETCH_PLANE_VIEWS camera "up" above
+// (getting both to agree is a cosmetic nice-to-have, not attempted here).
+export const SKETCH_PLANE_ROTATIONS: Record<SketchPlane, [number, number, number]> = {
+  XY: [0, 0, 0],
+  XZ: [90, 0, 0],
+  YZ: [0, 90, 0],
+};
+
 // Sibling to FitController, same "lives inside <Bounds> for useBounds, fires
 // on prop change only" shape — but calls the lower-level moveTo/lookAt
 // directly instead of fit()/reset(), since a sketch plane view is a fixed
@@ -204,13 +238,82 @@ function SketchController({ sketchPlane }: { sketchPlane: SketchPlane | null }) 
   return null;
 }
 
+// M7.5 slice 2: a large invisible mesh exactly at the active sketch plane —
+// the actual click target for placing points. Real r3f mesh + onClick
+// (not a raw DOM listener) so it participates in the normal raycast/event
+// system rather than fighting it; existing shapes disable their own
+// raycasting while sketching (NodeModel's sketchActive prop), so this plane
+// is always what a click lands on regardless of what's visually in front of
+// it from the camera's angle. Lives outside <Bounds> (same reasoning as the
+// gizmo below) — its generous 1000x1000 size would badly skew any
+// fit-to-content bounding box if it were counted.
+function SketchDrawingPlane({ sketchPlane, onAddPoint }: { sketchPlane: SketchPlane; onAddPoint: (u: number, v: number) => void }) {
+  const quaternion = useMemo(() => transformToQuaternion(SKETCH_PLANE_ROTATIONS[sketchPlane]), [sketchPlane]);
+  const inverseQuaternion = useMemo(() => quaternion.clone().invert(), [quaternion]);
+  return (
+    <mesh
+      quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
+      onClick={(e: ThreeEvent<MouseEvent>) => {
+        e.stopPropagation();
+        // e.point is the world-space hit — inverse-rotating it back through
+        // the same rotation that places the plane recovers the sketch-local
+        // (u,v) the click landed on (local z comes out ~0, discarded).
+        const local = e.point.clone().applyQuaternion(inverseQuaternion);
+        onAddPoint(local.x, local.y);
+      }}
+    >
+      <planeGeometry args={[1000, 1000]} />
+      {/* Invisible material, not an invisible mesh — Object3D.visible=false
+          would also disable raycasting; material.visible=false only skips
+          drawing it, which is exactly the "clickable but unseen" split
+          this needs. */}
+      <meshBasicMaterial visible={false} />
+    </mesh>
+  );
+}
+
+// In-progress sketch points/edges, rendered live as they're placed — an open
+// polyline (not yet closed into the final polygon(), which only happens on
+// "Finish Sketch"). Same outside-<Bounds> reasoning as the drawing plane:
+// this is drawing-session UI, not modeled content.
+function SketchPointsPreview({ sketchPlane, points }: { sketchPlane: SketchPlane; points: [number, number][] }) {
+  const quaternion = useMemo(() => transformToQuaternion(SKETCH_PLANE_ROTATIONS[sketchPlane]), [sketchPlane]);
+  const worldPoints = useMemo(
+    () => points.map(([u, v]) => new Vector3(u, v, 0).applyQuaternion(quaternion)),
+    [points, quaternion],
+  );
+  if (worldPoints.length === 0) return null;
+  return (
+    <>
+      {worldPoints.length > 1 && <Line points={worldPoints} color={SELECTED_MESH_COLOR} lineWidth={2} />}
+      {worldPoints.map((p, i) => (
+        <mesh key={i} position={p}>
+          <sphereGeometry args={[0.8, 12, 12]} />
+          <meshBasicMaterial color={SELECTED_MESH_COLOR} />
+        </mesh>
+      ))}
+    </>
+  );
+}
+
 interface DragSnapshot {
   position: Vector3;
   quaternion: [number, number, number, number];
   scale: Vector3;
 }
 
-export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateSpace, onTransformCommit, fitToken, sketchPlane }: ViewportProps) {
+export function Viewport({
+  meshes,
+  selectedIndices,
+  onSelect,
+  gizmoMode,
+  rotateSpace,
+  onTransformCommit,
+  fitToken,
+  sketchPlane,
+  sketchPoints,
+  onAddSketchPoint,
+}: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
   // render entirely when any statement is marked. Nothing stops marking more
   // than one, so this shows the union of all of them rather than assuming a
@@ -297,11 +400,22 @@ export function Viewport({ meshes, selectedIndices, onSelect, gizmoMode, rotateS
           {visibleMeshes.map((mesh) => {
             const selPos = selectedIndices.indexOf(mesh.index);
             const role: SelectionRole = selPos === -1 ? 'none' : selPos === 0 ? 'base' : 'operand';
-            return <NodeModel key={mesh.index} mesh={mesh} role={role} onSelect={onSelect} onGroupRef={handleGroupRef} />;
+            return (
+              <NodeModel
+                key={mesh.index}
+                mesh={mesh}
+                role={role}
+                onSelect={onSelect}
+                onGroupRef={handleGroupRef}
+                sketchActive={sketchPlane !== null}
+              />
+            );
           })}
         </Center>
       </Bounds>
-      {transformTarget && (
+      {sketchPlane && <SketchDrawingPlane sketchPlane={sketchPlane} onAddPoint={onAddSketchPoint} />}
+      {sketchPlane && <SketchPointsPreview sketchPlane={sketchPlane} points={sketchPoints} />}
+      {transformTarget && !sketchPlane && (
         <TransformControls
           object={transformTarget}
           mode={gizmoMode}

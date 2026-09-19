@@ -1,3 +1,5 @@
+import { formatNumber } from './targetedPatch';
+
 // M5 toolbar primitive insertion. Deliberately minimal codegen: append a new
 // statement with sensible defaults at the end of the document. Insertion at
 // the cursor/a chosen point is still out of scope; booleans (M6) are their
@@ -20,7 +22,25 @@ const PRIMITIVE_DEFAULTS: Record<PrimitiveKind, string> = {
   rotate_extrude: 'rotate_extrude($fn=48) translate([15, 0, 0]) circle(r=4, $fn=32);',
 };
 
-export function appendPrimitive(source: string, kind: PrimitiveKind): string {
+function appendStatement(source: string, statement: string): string {
   const separator = source.endsWith('\n\n') ? '' : source.endsWith('\n') ? '\n' : '\n\n';
-  return `${source}${separator}${PRIMITIVE_DEFAULTS[kind]}\n`;
+  return `${source}${separator}${statement}\n`;
+}
+
+export function appendPrimitive(source: string, kind: PrimitiveKind): string {
+  return appendStatement(source, PRIMITIVE_DEFAULTS[kind]);
+}
+
+// M7.5 slice 2: the sketch→SCAD hand-off. `rotation` must be the exact same
+// SKETCH_PLANE_ROTATIONS value SketchPointsPreview used to render the live
+// in-progress points (Viewport.tsx) — using one shared source of truth for
+// both is what guarantees the committed polygon lands exactly where the
+// preview showed it, not just approximately. Identity rotation (the XY
+// plane) omits the wrap entirely, matching how patchTransform/
+// formatTransformPrefix already skip identity components elsewhere.
+export function appendSketchPolygon(source: string, rotation: [number, number, number], points: [number, number][]): string {
+  const pointsText = points.map(([u, v]) => `[${formatNumber(u)}, ${formatNumber(v)}]`).join(', ');
+  const polygon = `polygon(points=[${pointsText}]);`;
+  const statement = rotation.some((v) => v !== 0) ? `rotate([${rotation.map(formatNumber).join(', ')}]) ${polygon}` : polygon;
+  return appendStatement(source, statement);
 }

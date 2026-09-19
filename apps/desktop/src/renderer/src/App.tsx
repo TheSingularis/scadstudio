@@ -10,6 +10,7 @@ import {
   type SketchPlane,
   SELECTED_MESH_COLOR,
   OPERAND_MESH_COLOR,
+  SKETCH_PLANE_ROTATIONS,
 } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
@@ -28,7 +29,7 @@ import {
   type BooleanOp,
   type Modifier,
 } from './targetedPatch';
-import { appendPrimitive, type PrimitiveKind } from './primitives';
+import { appendPrimitive, appendSketchPolygon, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
 
 const PRIMITIVE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
@@ -152,6 +153,10 @@ export function App() {
   // SketchController for the camera-lock/animate-to-plane behavior this
   // drives.
   const [sketchPlane, setSketchPlane] = useState<SketchPlane | null>(null);
+  // M7.5 slice 2: sketch-local (u,v) points placed so far — cleared whenever
+  // a sketch starts, finishes, or is exited/cancelled, never partially
+  // carried over between sessions.
+  const [sketchPoints, setSketchPoints] = useState<[number, number][]>([]);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
   // See Viewport.tsx's SelectMode/ViewportProps.selectedIndices comments for
@@ -297,10 +302,42 @@ export function App() {
   // the existing fit-to-content behavior (same as clicking "Reset View")
   // rather than needing to remember/restore whatever the camera's pre-sketch
   // state was — reuses FitController's mechanism instead of a second one.
+  // M7.5 slice 2: also doubles as "cancel" — any in-progress, unfinished
+  // points are discarded, never silently carried into a later session.
   const handleExitSketch = useCallback(() => {
     setSketchPlane(null);
+    setSketchPoints([]);
     setResetViewToken((t) => t + 1);
   }, []);
+
+  // M7.5 slice 2: click-to-add-point handler wired to Viewport's
+  // SketchDrawingPlane. Plain append — no snapping yet (the "cheap
+  // constraints" tier from PLAN.md is still ahead of this slice).
+  const handleAddSketchPoint = useCallback((u: number, v: number) => {
+    setSketchPoints((prev) => [...prev, [u, v]]);
+  }, []);
+
+  const handleUndoSketchPoint = useCallback(() => {
+    setSketchPoints((prev) => prev.slice(0, -1));
+  }, []);
+
+  // Commits the drawn points as a real polygon() statement (wrapped in the
+  // plane's rotate(), if non-identity) via the same append+select+render
+  // path every other toolbar insertion uses, then leaves sketch mode the
+  // same way Exit Sketch does — one sketch session produces one profile,
+  // consistent with keeping this slice's interaction model simple to reason
+  // about (multi-profile sessions can be a later refinement).
+  const handleFinishSketch = useCallback(() => {
+    if (!sketchPlane || sketchPoints.length < 3) return;
+    const next = appendSketchPolygon(sourceRef.current, SKETCH_PLANE_ROTATIONS[sketchPlane], sketchPoints);
+    pendingSelectLast.current = true;
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    setSource(next);
+    runRender(next);
+    setSketchPlane(null);
+    setSketchPoints([]);
+    setResetViewToken((t) => t + 1);
+  }, [sketchPlane, sketchPoints, runRender]);
 
   // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
   // pipeline as a text edit (one derivation path, not two — see PLAN.md
@@ -554,14 +591,28 @@ export function App() {
             <>
               Sketch:
               {SKETCH_PLANE_BUTTONS.map(({ plane, label }) => (
-                <button key={plane} onClick={() => setSketchPlane(plane)}>
+                <button
+                  key={plane}
+                  onClick={() => {
+                    setSketchPlane(plane);
+                    setSketchPoints([]);
+                  }}
+                >
                   {label}
                 </button>
               ))}
             </>
           ) : (
             <>
-              <span style={{ opacity: 0.7 }}>Sketching on {sketchPlane} plane</span>
+              <span style={{ opacity: 0.7 }}>
+                Sketching on {sketchPlane} plane — click to place points ({sketchPoints.length})
+              </span>
+              <button onClick={handleUndoSketchPoint} disabled={sketchPoints.length === 0}>
+                Undo Point
+              </button>
+              <button onClick={handleFinishSketch} disabled={sketchPoints.length < 3}>
+                Finish Sketch
+              </button>
               <button onClick={handleExitSketch}>Exit Sketch</button>
             </>
           )}
@@ -728,6 +779,8 @@ export function App() {
             onTransformCommit={handleTransformCommit}
             fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
             sketchPlane={sketchPlane}
+            sketchPoints={sketchPoints}
+            onAddSketchPoint={handleAddSketchPoint}
           />
         </div>
       </div>
