@@ -430,3 +430,22 @@ export function wrapInBoolean(source: string, nodesInSelectionOrder: SceneNode[]
   result += source.slice(cursor);
   return result;
 }
+
+export type ExtrudeOp = 'linear_extrude' | 'rotate_extrude';
+
+const EXTRUDE_DEFAULT_ARGS: Record<ExtrudeOp, string> = {
+  linear_extrude: 'height=10',
+  rotate_extrude: '$fn=48',
+};
+
+// M7.5: wraps a single existing node's verbatim source in a new
+// linear_extrude()/rotate_extrude() block, in place — the extrude
+// equivalent of wrapInBoolean above, just single-node instead of
+// multi-node. This is what actually lets a drawn sketch (or any other
+// existing 2D shape) get extruded, as opposed to the toolbar's Insert-style
+// buttons which always append an unrelated new default shape.
+export function wrapInExtrude(source: string, node: SceneNode, op: ExtrudeOp): string {
+  const body = indent(source.slice(node.startIndex, node.endIndex).trim(), '    ');
+  const block = `${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n}`;
+  return source.slice(0, node.startIndex) + block + source.slice(node.endIndex);
+}

@@ -41,11 +41,29 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: 
     });
     editorRef.current = editor;
     decorationsRef.current = editor.createDecorationsCollection();
-    // Manual verification hook: lets SCADSTUDIO_TEST_EDIT (main/index.ts) script
-    // an edit via executeJavaScript for screenshot-based milestone verification.
+    // Raw Monaco instance, exposed for ad-hoc manual debugging via devtools.
+    // SCADSTUDIO_TEST_EDIT (main/index.ts) used to script edits through this
+    // (`__testEditor.setValue(...)`), but that relied on
+    // onDidChangeModelContent to carry the change into React state — now
+    // guarded against isFlush (2026-09-20 double-render fix), which broke
+    // it; see App.tsx's window.__testSetSource for the harness's real path.
     (window as unknown as { __testEditor?: typeof editor }).__testEditor = editor;
 
-    const changeSub = editor.onDidChangeModelContent(() => {
+    // Real bug found 2026-09-20: every programmatic edit in the app (gizmo
+    // commits, toolbar inserts, booleans, modifiers, sketch finish/extrude —
+    // anything that flows a new `value` down into this component) calls
+    // App.tsx's runRender directly *and* triggers this handler a second
+    // time, since the `model.setValue()` below fires onDidChangeModelContent
+    // indistinguishably from real typing — App.tsx's onChange (this app's
+    // handleSourceChange) then schedules a second, redundant debounced
+    // render ~400ms later for the exact same content. Every programmatic
+    // edit has been double-rendering since M2/M4; this only became visible
+    // now because the M7 bare-2D retry path logs a WASM error per attempt,
+    // making the duplicate obvious in the console. `isFlush` is Monaco's own
+    // flag for "this change came from setValue()," the exact content-change
+    // analog of the ContentFlush guard already below for cursor resets.
+    const changeSub = editor.onDidChangeModelContent((e) => {
+      if (e.isFlush) return;
       onChangeRef.current(editor.getValue());
     });
 

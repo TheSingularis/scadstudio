@@ -62,8 +62,13 @@ function createWindow(): void {
         }
 
         if (process.env['SCADSTUDIO_TEST_EDIT']) {
+          // window.__testSetSource (App.tsx), not window.__testEditor.setValue
+          // — the latter went through Monaco's onDidChangeModelContent, which
+          // is now guarded against isFlush (2026-09-20 double-render fix) and
+          // can no longer tell "test harness bypass" from "the programmatic
+          // edit this guard exists to skip" apart.
           await win.webContents.executeJavaScript(
-            `window.__testEditor.setValue(${JSON.stringify(process.env['SCADSTUDIO_TEST_EDIT'])})`,
+            `window.__testSetSource(${JSON.stringify(process.env['SCADSTUDIO_TEST_EDIT'])})`,
           );
           await new Promise((r) => setTimeout(r, 2500));
         }

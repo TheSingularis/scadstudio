@@ -22,11 +22,13 @@ import {
   primitiveArgs,
   patchArgument,
   wrapInBoolean,
+  wrapInExtrude,
   readModifier,
   patchModifier,
   IDENTITY_TRANSFORM,
   type NodeTransform,
   type BooleanOp,
+  type ExtrudeOp,
   type Modifier,
 } from './targetedPatch';
 import { appendPrimitive, appendSketchPolygon, type PrimitiveKind } from './primitives';
@@ -44,7 +46,7 @@ const PRIMITIVE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
 // profile) via the same append path as the primitives above — separated into
 // their own labelled toolbar group only for clarity, since they're a distinct
 // operation category (a 2D→3D feature, not a bare primitive).
-const EXTRUDE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
+const EXTRUDE_BUTTONS: { kind: ExtrudeOp; label: string }[] = [
   { kind: 'linear_extrude', label: 'Linear Extrude' },
   { kind: 'rotate_extrude', label: 'Rotate Extrude' },
 ];
@@ -277,6 +279,24 @@ export function App() {
 
   useEffect(() => {
     runRender(source);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Manual verification hook: SCADSTUDIO_TEST_EDIT (main/index.ts) used to
+  // inject content via window.__testEditor.setValue(...) (Editor.tsx),
+  // relying on Monaco's onDidChangeModelContent to carry it into React state
+  // the same way real typing does. That event is now guarded against
+  // isFlush (see Editor.tsx's 2026-09-20 fix for the double-render bug this
+  // uncovered), which made the test harness's own injection silently no-op
+  // too — same event, no way to tell "test harness bypass" from "the
+  // programmatic edit this guard exists to skip" apart. Dedicated test-only
+  // path instead: sets React state and renders directly, bypassing Monaco's
+  // event system entirely rather than relying on it.
+  useEffect(() => {
+    (window as unknown as { __testSetSource?: (value: string) => void }).__testSetSource = (value: string) => {
+      setSource(value);
+      runRender(value);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -535,6 +555,28 @@ export function App() {
     [runRender],
   );
 
+  // M7.5: Linear/Rotate Extrude wraps the *selected* node (e.g. a just-drawn
+  // sketch) in place when something is selected — falls back to inserting
+  // an unrelated fresh default shape only when nothing is, same as before.
+  // Wrapping in place doesn't change the node's own top-level index, so the
+  // existing selection-preserving logic in runRender keeps it selected with
+  // no extra bookkeeping needed here.
+  const handleExtrude = useCallback(
+    (op: ExtrudeOp) => {
+      const tree = treeRef.current;
+      const node = primarySelectedIndex !== null ? sceneNodesRef.current.find((n) => n.index === primarySelectedIndex) : undefined;
+      if (!tree || !node) {
+        handleInsertPrimitive(op);
+        return;
+      }
+      const next = wrapInExtrude(sourceRef.current, node, op);
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(next);
+      runRender(next);
+    },
+    [primarySelectedIndex, runRender, handleInsertPrimitive],
+  );
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'sans-serif' }}>
       <div
@@ -579,9 +621,9 @@ export function App() {
           ))}
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          Extrude:
+          Extrude{primarySelectedIndex !== null ? ' (selected)' : ''}:
           {EXTRUDE_BUTTONS.map(({ kind, label }) => (
-            <button key={kind} onClick={() => handleInsertPrimitive(kind)}>
+            <button key={kind} onClick={() => handleExtrude(kind)}>
               {label}
             </button>
           ))}
