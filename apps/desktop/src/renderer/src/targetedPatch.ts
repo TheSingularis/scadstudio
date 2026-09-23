@@ -249,14 +249,18 @@ export function patchModifier(source: string, tree: Tree, node: SceneNode, modif
   return source.slice(0, top.startIndex) + modifier + source.slice(top.startIndex);
 }
 
-// Isolated-render source for a node: just the base primitive (context +
-// verbatim primitive text), with translate/rotate/scale stripped — placement
-// is applied as a real three.js transform on the pivot group instead (see
-// Viewport.tsx), not baked into the rendered geometry.
-export function primitiveSource(root: Node, node: SceneNode, fullSource: string, context: string): string {
+// Isolated-render source for a node: just the base primitive's own verbatim
+// text, with translate/rotate/scale stripped — placement is applied as a
+// real three.js transform on the pivot group instead (see Viewport.tsx),
+// not baked into the rendered geometry. Context (module/function defs,
+// assignments, use/include) is deliberately NOT included here — App.tsx
+// prepends it separately, and wrapAsThinExtrude below needs the primitive
+// and context kept apart rather than pre-joined (see its own comment for
+// the real bug that came from joining them too early).
+export function primitiveOnlySlice(root: Node, node: SceneNode, fullSource: string): string {
   const decomposed = decomposeNode(root, node);
   const start = decomposed ? decomposed.primitiveStart : node.startIndex;
-  return `${context}\n${fullSource.slice(start, node.endIndex)}`;
+  return fullSource.slice(start, node.endIndex);
 }
 
 // M7: real OpenSCAD can't export pure-2D geometry (square/circle/polygon,
@@ -267,12 +271,22 @@ export function primitiveSource(root: Node, node: SceneNode, fullSource: string,
 // instead of a separate client-side 2D geometry path, so every real
 // OpenSCAD 2D semantic ($fn, center, d vs r, 2D booleans, text()'s font
 // caveat aside) is handled by actually running OpenSCAD, not reimplemented.
-// A block child (not a direct call) so this also works when `src` is
-// several statements (context assignments + the primitive) — non-geometry
-// statements inside a block are valid and simply produce no geometry of
-// their own.
-export function wrapAsThinExtrude(src: string): string {
-  return `linear_extrude(height=0.01) {\n${src}\n}`;
+//
+// Real bug found 2026-09-21: this used to take one already-joined
+// `${context}\n${primitive}` string and wrap all of it in the block, on the
+// theory that non-geometry statements inside a block are harmless. They're
+// not always — a file with a module/function definition ahead of a bare 2D
+// node (the M6 demo scene's `module bracket(...)`, or any real-world file
+// with helper modules) made *every* bare-2D node in that file fail both the
+// normal attempt *and* this retry, since the definition ended up nested
+// inside a linear_extrude block it was never written inside — "Rendered
+// N-1/N nodes" with no indication which node or why. Takes context and the
+// primitive as separate parameters now and keeps context *outside* the
+// synthetic block, exactly like every other isolated render in this app —
+// the wrapper's only job is giving the primitive itself real 3D geometry to
+// export, not restructuring what surrounds it.
+export function wrapAsThinExtrude(context: string, primitive: string): string {
+  return `${context}\nlinear_extrude(height=0.01) {\n${primitive}\n}`;
 }
 
 const MIRROR_AXIS_VECTORS: [number, number, number][] = [
@@ -444,8 +458,25 @@ const EXTRUDE_DEFAULT_ARGS: Record<ExtrudeOp, string> = {
 // multi-node. This is what actually lets a drawn sketch (or any other
 // existing 2D shape) get extruded, as opposed to the toolbar's Insert-style
 // buttons which always append an unrelated new default shape.
-export function wrapInExtrude(source: string, node: SceneNode, op: ExtrudeOp): string {
-  const body = indent(source.slice(node.startIndex, node.endIndex).trim(), '    ');
-  const block = `${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n}`;
-  return source.slice(0, node.startIndex) + block + source.slice(node.endIndex);
+//
+// The node's own translate/rotate/scale wrap (if any) must stay *outside*
+// the new linear_extrude/rotate_extrude, not get carried inside it: a
+// linear_extrude only accepts a 2D child living in the XY plane, and a
+// face-picked sketch plane's rotate() is exactly what tilts the polygon out
+// of that plane. Nesting it inside the extrude rotates the 2D profile
+// before extrusion instead of the finished 3D solid after, which OpenSCAD
+// can't represent (2026-09-22 bug: silently empty geometry — "Scaling a 2D
+// object with 0 - removing object" — reachable via pick-face sketch →
+// Finish Sketch → Extrude, since that's the one path that produces a
+// non-Z-axis rotate() wrap ahead of a 2D primitive). So this decomposes the
+// node the same way patchTransform does, and re-emits the wrap prefix
+// ahead of the extrude block instead of inside it.
+export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: ExtrudeOp): string {
+  const decomposed = decomposeNode(root, node);
+  const wrapStart = decomposed ? decomposed.wrapStart : node.startIndex;
+  const primitiveStart = decomposed ? decomposed.primitiveStart : node.startIndex;
+  const prefix = decomposed ? formatTransformPrefix(decomposed.transform) : '';
+  const body = indent(source.slice(primitiveStart, node.endIndex).trim(), '    ');
+  const block = `${prefix}${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n}`;
+  return source.slice(0, wrapStart) + block + source.slice(node.endIndex);
 }

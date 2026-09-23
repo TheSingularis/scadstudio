@@ -31,16 +31,30 @@ export function appendPrimitive(source: string, kind: PrimitiveKind): string {
   return appendStatement(source, PRIMITIVE_DEFAULTS[kind]);
 }
 
-// M7.5 slice 2: the sketch→SCAD hand-off. `rotation` must be the exact same
-// SKETCH_PLANE_ROTATIONS value SketchPointsPreview used to render the live
+// M7.5: the sketch→SCAD hand-off. `origin`/`rotationDeg` must be the exact
+// same ActiveSketchPlane values SketchPointsPreview used to render the live
 // in-progress points (Viewport.tsx) — using one shared source of truth for
 // both is what guarantees the committed polygon lands exactly where the
-// preview showed it, not just approximately. Identity rotation (the XY
-// plane) omits the wrap entirely, matching how patchTransform/
-// formatTransformPrefix already skip identity components elsewhere.
-export function appendSketchPolygon(source: string, rotation: [number, number, number], points: [number, number][]): string {
+// preview showed it, not just approximately. Slice 3 generalized this from
+// rotation-only (global planes always pass through the origin) to also
+// carry a translate(), needed once a plane can come from a picked face
+// sitting anywhere in space. Identity components are omitted entirely,
+// matching how patchTransform/formatTransformPrefix already skip them
+// elsewhere — a global-plane sketch (origin always [0,0,0]) still emits a
+// bare rotate()-or-nothing wrap, unchanged from before this generalization.
+export function appendSketchPolygon(
+  source: string,
+  origin: [number, number, number],
+  rotationDeg: [number, number, number],
+  points: [number, number][],
+): string {
   const pointsText = points.map(([u, v]) => `[${formatNumber(u)}, ${formatNumber(v)}]`).join(', ');
-  const polygon = `polygon(points=[${pointsText}]);`;
-  const statement = rotation.some((v) => v !== 0) ? `rotate([${rotation.map(formatNumber).join(', ')}]) ${polygon}` : polygon;
+  let statement = `polygon(points=[${pointsText}]);`;
+  if (rotationDeg.some((v) => v !== 0)) {
+    statement = `rotate([${rotationDeg.map(formatNumber).join(', ')}]) ${statement}`;
+  }
+  if (origin.some((v) => v !== 0)) {
+    statement = `translate([${origin.map(formatNumber).join(', ')}]) ${statement}`;
+  }
   return appendStatement(source, statement);
 }

@@ -3,7 +3,7 @@ import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { Color, Vector3, type Group } from 'three';
+import { Color, Vector3, Quaternion, type Group } from 'three';
 
 const DEFAULT_MESH_COLOR = '#4a90d9';
 // A single selection (or the *first*-clicked shape in a multi-select) reads
@@ -74,11 +74,21 @@ interface ViewportProps {
   // parameter) don't yank the camera around. App.tsx changes it only when a
   // genuinely new file is opened or the user explicitly clicks "Reset View".
   fitToken: string;
-  // M7.5 slice 1: null outside sketch mode (free orbit, as today). Non-null
-  // drives the camera to that plane's canonical view (SketchController) and
-  // locks orbit rotation (pan/zoom still work) for the duration — see PLAN.md
-  // "Sketch mode (M7.5)".
-  sketchPlane: SketchPlane | null;
+  // M7.5: null outside sketch mode (free orbit, as today). Non-null drives
+  // the camera to that plane's canonical view (SketchController) and locks
+  // orbit rotation (pan/zoom still work) for the duration — see PLAN.md
+  // "Sketch mode (M7.5)". Generalized (slice 3) from a fixed XY/XZ/YZ enum
+  // to an arbitrary origin+rotation, so a plane derived from a picked face
+  // (kind: 'face') works through the exact same camera/drawing/codegen path
+  // as the three global planes, not a parallel one.
+  activeSketchPlane: ActiveSketchPlane | null;
+  // M7.5 slice 3: true only during the brief "waiting for a face click"
+  // window between clicking "Pick Face" and actually clicking one — camera
+  // stays free-orbit (need to look around to find the right face), and
+  // NodeModel's onClick computes a plane from the hit instead of selecting.
+  // Mutually exclusive with activeSketchPlane being non-null (never both).
+  pickingFace: boolean;
+  onPickFace: (origin: [number, number, number], rotationDeg: [number, number, number]) => void;
   // M7.5 slice 2: sketch-local (u,v) points placed so far this session —
   // App.tsx owns the array (cleared on entering/finishing/exiting a sketch),
   // Viewport just renders it (SketchPointsPreview) and appends to it
@@ -95,6 +105,8 @@ function NodeModel({
   onSelect,
   onGroupRef,
   sketchActive,
+  pickingFace,
+  onPickFace,
 }: {
   mesh: NodeMesh;
   role: SelectionRole;
@@ -107,6 +119,12 @@ function NodeModel({
   // selection are mutually exclusive modes, not competing for the same
   // click.
   sketchActive: boolean;
+  // M7.5 slice 3: while true, a click on this shape computes a sketch plane
+  // from the hit face instead of selecting the shape — raycasting stays
+  // enabled here (unlike sketchActive), since picking a face requires
+  // actually hitting real geometry.
+  pickingFace: boolean;
+  onPickFace: (origin: [number, number, number], rotationDeg: [number, number, number]) => void;
 }) {
   // openscad-wasm renders just the bare primitive now (translate/rotate/
   // scale are stripped before sending source to WASM — see App.tsx), so this
@@ -153,6 +171,18 @@ function NodeModel({
         onClick={(e: ThreeEvent<MouseEvent>) => {
           if (sketchActive) return;
           e.stopPropagation();
+          if (pickingFace) {
+            // e.face.normal is in the mesh's own local space — transformDirection
+            // via the mesh's actual world matrix (which already folds in the
+            // parent group's translate/rotate/scale) converts it to the world-
+            // space normal this plane actually needs. e.point is already a
+            // world-space hit, no transform needed.
+            if (!e.face) return;
+            const worldNormal = e.face.normal.clone().transformDirection(e.object.matrixWorld).normalize();
+            const rotation = new Quaternion().setFromUnitVectors(new Vector3(0, 0, 1), worldNormal);
+            onPickFace([e.point.x, e.point.y, e.point.z], quaternionToRotateDeg(rotation));
+            return;
+          }
           // metaKey covers Cmd on macOS, where ctrl-click is reserved for
           // the OS's own right-click emulation.
           onSelect(mesh.index, e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace');
@@ -193,33 +223,53 @@ function FitController({ fitToken, orbitControlsRef }: { fitToken: string; orbit
   return null;
 }
 
-// M7.5 slice 1: global sketch planes only (no face-picking yet — see PLAN.md
-// "Sketch mode (M7.5)"). Tuples are used directly as three.js vectors, same
-// as translate/rotate everywhere else in this app (see App.tsx/targetedPatch
-// — there's no OpenSCAD-Z-up-to-three.js-Y-up remap anywhere), so "XY plane"
-// here means the plane where the third (Z) component is 0, matching real
+// M7.5: a sketch plane is an arbitrary origin+rotation now (slice 3 —
+// generalized from the original fixed XY/XZ/YZ-only version to also support
+// a plane derived from a picked face; see PLAN.md "Sketch mode (M7.5)").
+// Tuples are used directly as three.js vectors, same as translate/rotate
+// everywhere else in this app (see App.tsx/targetedPatch — there's no
+// OpenSCAD-Z-up-to-three.js-Y-up remap anywhere), so a global "XY plane"
+// means the plane where the third (Z) component is 0, matching real
 // OpenSCAD's own XY/XZ/YZ naming, not three.js's default Y-up framing.
-export type SketchPlane = 'XY' | 'XZ' | 'YZ';
-const SKETCH_PLANE_VIEWS: Record<SketchPlane, { position: [number, number, number]; up: [number, number, number] }> = {
+export type SketchPlaneKind = 'XY' | 'XZ' | 'YZ' | 'face';
+export interface ActiveSketchPlane {
+  kind: SketchPlaneKind;
+  origin: [number, number, number];
+  // The rotate() that places a flat (z=0) sketch's local (u,v) points onto
+  // this plane in world space. Reused as-is by primitives.ts's
+  // `appendSketchPolygon` codegen for the final `translate([...])
+  // rotate([...]) polygon(...)` statement — using the exact same origin and
+  // rotation for the live in-progress preview (below) and the committed
+  // source is what guarantees they can never drift apart.
+  rotationDeg: [number, number, number];
+}
+
+// Hand-picked camera framing for the three global planes, preserved exactly
+// as slice 1 shipped and verified it (Z reads as "up" on screen for all
+// three) — kept separate from the general face-derived formula in
+// SketchController below rather than deriving these three from rotationDeg
+// too, since the derived "up" for YZ doesn't happen to match this
+// (documented where GLOBAL_SKETCH_PLANE_ROTATIONS is defined below); no reason to
+// risk already-verified behavior switching formulas to unify a cosmetic.
+const GLOBAL_SKETCH_PLANE_VIEWS: Record<'XY' | 'XZ' | 'YZ', { position: [number, number, number]; up: [number, number, number] }> = {
   XY: { position: [0, 0, 60], up: [0, 1, 0] },
   XZ: { position: [0, -60, 0], up: [0, 0, 1] },
   YZ: { position: [60, 0, 0], up: [0, 0, 1] },
 };
 
-// M7.5 slice 2: the rotate() that places a flat (z=0) sketch's local (u,v)
-// points onto each plane in world space. Exported and reused as-is by
-// primitives.ts's `appendSketchPolygon` codegen for the final `rotate([...])
-// polygon(...)` statement — using the exact same numbers for the live
-// in-progress preview (below) and the committed source is what guarantees
-// they can never drift apart; the actual world-space mapping this produces
-// per axis is a documented side effect of the rotation math, not something
-// independently chosen to match the SKETCH_PLANE_VIEWS camera "up" above
-// (getting both to agree is a cosmetic nice-to-have, not attempted here).
-export const SKETCH_PLANE_ROTATIONS: Record<SketchPlane, [number, number, number]> = {
+// The actual world-space mapping each rotation produces per axis is a
+// documented side effect of the rotation math, not something independently
+// chosen to match GLOBAL_SKETCH_PLANE_VIEWS's camera "up" above (getting
+// both to agree is a cosmetic nice-to-have, not attempted here).
+const GLOBAL_SKETCH_PLANE_ROTATIONS: Record<'XY' | 'XZ' | 'YZ', [number, number, number]> = {
   XY: [0, 0, 0],
   XZ: [90, 0, 0],
   YZ: [0, 90, 0],
 };
+
+export function buildGlobalSketchPlane(kind: 'XY' | 'XZ' | 'YZ'): ActiveSketchPlane {
+  return { kind, origin: [0, 0, 0], rotationDeg: GLOBAL_SKETCH_PLANE_ROTATIONS[kind] };
+}
 
 // Sibling to FitController, same "lives inside <Bounds> for useBounds, fires
 // on prop change only" shape — but calls the lower-level moveTo/lookAt
@@ -228,13 +278,28 @@ export const SKETCH_PLANE_ROTATIONS: Record<SketchPlane, [number, number, number
 // state. This is the "animate camera to a target orientation" primitive the
 // nav-cube (PLAN.md M7.5 point 5) will want too — reuse this rather than
 // building a second animation path when the nav-cube is built.
-function SketchController({ sketchPlane }: { sketchPlane: SketchPlane | null }) {
+function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSketchPlane | null }) {
   const bounds = useBounds();
   useEffect(() => {
-    if (!sketchPlane) return;
-    const { position, up } = SKETCH_PLANE_VIEWS[sketchPlane];
-    bounds.refresh().moveTo(position).lookAt({ target: [0, 0, 0], up });
-  }, [sketchPlane, bounds]);
+    if (!activeSketchPlane) return;
+    const { kind, origin, rotationDeg } = activeSketchPlane;
+    if (kind !== 'face') {
+      const { position, up } = GLOBAL_SKETCH_PLANE_VIEWS[kind];
+      bounds.refresh().moveTo(position).lookAt({ target: [0, 0, 0], up });
+      return;
+    }
+    // Face-derived plane: no hand-picked view to preserve, so the camera
+    // position/up are derived directly from the plane's own rotation —
+    // look from `distance` back along the plane's local +Z (its normal),
+    // with the plane's local +Y as screen-up, centered on the picked point
+    // rather than the world origin.
+    const distance = 60;
+    const rotation = transformToQuaternion(rotationDeg);
+    const originVec = new Vector3(...origin);
+    const cameraPos = originVec.clone().addScaledVector(new Vector3(0, 0, 1).applyQuaternion(rotation), distance);
+    const up = new Vector3(0, 1, 0).applyQuaternion(rotation);
+    bounds.refresh().moveTo([cameraPos.x, cameraPos.y, cameraPos.z]).lookAt({ target: origin, up: [up.x, up.y, up.z] });
+  }, [activeSketchPlane, bounds]);
   return null;
 }
 
@@ -247,18 +312,27 @@ function SketchController({ sketchPlane }: { sketchPlane: SketchPlane | null }) 
 // it from the camera's angle. Lives outside <Bounds> (same reasoning as the
 // gizmo below) — its generous 1000x1000 size would badly skew any
 // fit-to-content bounding box if it were counted.
-function SketchDrawingPlane({ sketchPlane, onAddPoint }: { sketchPlane: SketchPlane; onAddPoint: (u: number, v: number) => void }) {
-  const quaternion = useMemo(() => transformToQuaternion(SKETCH_PLANE_ROTATIONS[sketchPlane]), [sketchPlane]);
+function SketchDrawingPlane({
+  activeSketchPlane,
+  onAddPoint,
+}: {
+  activeSketchPlane: ActiveSketchPlane;
+  onAddPoint: (u: number, v: number) => void;
+}) {
+  const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const inverseQuaternion = useMemo(() => quaternion.clone().invert(), [quaternion]);
   return (
     <mesh
+      position={activeSketchPlane.origin}
       quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
       onClick={(e: ThreeEvent<MouseEvent>) => {
         e.stopPropagation();
-        // e.point is the world-space hit — inverse-rotating it back through
-        // the same rotation that places the plane recovers the sketch-local
-        // (u,v) the click landed on (local z comes out ~0, discarded).
-        const local = e.point.clone().applyQuaternion(inverseQuaternion);
+        // e.point is the world-space hit — subtracting the plane's own
+        // origin then inverse-rotating back through the same rotation that
+        // places the plane recovers the sketch-local (u,v) the click landed
+        // on (local z comes out ~0, discarded). Identity for global planes
+        // (origin always [0,0,0] there), load-bearing for a face-derived one.
+        const local = e.point.clone().sub(new Vector3(...activeSketchPlane.origin)).applyQuaternion(inverseQuaternion);
         onAddPoint(local.x, local.y);
       }}
     >
@@ -276,11 +350,12 @@ function SketchDrawingPlane({ sketchPlane, onAddPoint }: { sketchPlane: SketchPl
 // polyline (not yet closed into the final polygon(), which only happens on
 // "Finish Sketch"). Same outside-<Bounds> reasoning as the drawing plane:
 // this is drawing-session UI, not modeled content.
-function SketchPointsPreview({ sketchPlane, points }: { sketchPlane: SketchPlane; points: [number, number][] }) {
-  const quaternion = useMemo(() => transformToQuaternion(SKETCH_PLANE_ROTATIONS[sketchPlane]), [sketchPlane]);
+function SketchPointsPreview({ activeSketchPlane, points }: { activeSketchPlane: ActiveSketchPlane; points: [number, number][] }) {
+  const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
+  const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
   const worldPoints = useMemo(
-    () => points.map(([u, v]) => new Vector3(u, v, 0).applyQuaternion(quaternion)),
-    [points, quaternion],
+    () => points.map(([u, v]) => new Vector3(u, v, 0).applyQuaternion(quaternion).add(origin)),
+    [points, quaternion, origin],
   );
   if (worldPoints.length === 0) return null;
   return (
@@ -310,7 +385,9 @@ export function Viewport({
   rotateSpace,
   onTransformCommit,
   fitToken,
-  sketchPlane,
+  activeSketchPlane,
+  pickingFace,
+  onPickFace,
   sketchPoints,
   onAddSketchPoint,
 }: ViewportProps) {
@@ -358,14 +435,16 @@ export function Viewport({
     setTransformTarget(primaryIndex !== null ? (groupsByIndex.current.get(primaryIndex) ?? null) : null);
   }, [primaryIndex]);
 
-  // M7.5 slice 1: lock rotation while sketching (pan/zoom still allowed) so
+  // M7.5: lock rotation while actively sketching (pan/zoom still allowed) so
   // the plane view SketchController just animated to doesn't get orbited
   // away from immediately after — the whole point of a sketch-plane view is
-  // that it stays straight-on while you work.
+  // that it stays straight-on while you work. Deliberately NOT locked during
+  // pickingFace (slice 3) — you need to freely orbit to find the face you
+  // want to click.
   useEffect(() => {
     const controls = orbitControlsRef.current;
-    if (controls) controls.enableRotate = sketchPlane === null;
-  }, [sketchPlane]);
+    if (controls) controls.enableRotate = activeSketchPlane === null;
+  }, [activeSketchPlane]);
 
   return (
     <Canvas
@@ -395,7 +474,7 @@ export function Viewport({
       }
       <Bounds margin={1.2}>
         <FitController fitToken={fitToken} orbitControlsRef={orbitControlsRef} />
-        <SketchController sketchPlane={sketchPlane} />
+        <SketchController activeSketchPlane={activeSketchPlane} />
         <Center>
           {visibleMeshes.map((mesh) => {
             const selPos = selectedIndices.indexOf(mesh.index);
@@ -407,15 +486,17 @@ export function Viewport({
                 role={role}
                 onSelect={onSelect}
                 onGroupRef={handleGroupRef}
-                sketchActive={sketchPlane !== null}
+                sketchActive={activeSketchPlane !== null}
+                pickingFace={pickingFace}
+                onPickFace={onPickFace}
               />
             );
           })}
         </Center>
       </Bounds>
-      {sketchPlane && <SketchDrawingPlane sketchPlane={sketchPlane} onAddPoint={onAddSketchPoint} />}
-      {sketchPlane && <SketchPointsPreview sketchPlane={sketchPlane} points={sketchPoints} />}
-      {transformTarget && !sketchPlane && (
+      {activeSketchPlane && <SketchDrawingPlane activeSketchPlane={activeSketchPlane} onAddPoint={onAddSketchPoint} />}
+      {activeSketchPlane && <SketchPointsPreview activeSketchPlane={activeSketchPlane} points={sketchPoints} />}
+      {transformTarget && !activeSketchPlane && (
         <TransformControls
           object={transformTarget}
           mode={gizmoMode}

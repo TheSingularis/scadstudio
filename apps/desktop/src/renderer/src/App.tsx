@@ -7,16 +7,17 @@ import {
   type NodeMesh,
   type RotateSpace,
   type SelectMode,
-  type SketchPlane,
+  type SketchPlaneKind,
+  type ActiveSketchPlane,
   SELECTED_MESH_COLOR,
   OPERAND_MESH_COLOR,
-  SKETCH_PLANE_ROTATIONS,
+  buildGlobalSketchPlane,
 } from './components/Viewport';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import {
   patchTransform,
-  primitiveSource,
+  primitiveOnlySlice,
   wrapAsThinExtrude,
   decomposeNode,
   primitiveArgs,
@@ -51,12 +52,18 @@ const EXTRUDE_BUTTONS: { kind: ExtrudeOp; label: string }[] = [
   { kind: 'rotate_extrude', label: 'Rotate Extrude' },
 ];
 
-// M7.5 slice 1: global planes only — no face-picking yet (see PLAN.md).
-const SKETCH_PLANE_BUTTONS: { plane: SketchPlane; label: string }[] = [
+// M7.5: global plane shortcuts. "Pick Face" (slice 3) is a distinct
+// interaction (click a face rather than pick from a fixed list), handled
+// separately in the toolbar JSX below, not part of this button set.
+const SKETCH_PLANE_BUTTONS: { plane: 'XY' | 'XZ' | 'YZ'; label: string }[] = [
   { plane: 'XY', label: 'XY' },
   { plane: 'XZ', label: 'XZ' },
   { plane: 'YZ', label: 'YZ' },
 ];
+
+function sketchPlaneLabel(kind: SketchPlaneKind): string {
+  return kind === 'face' ? 'Sketching on picked face' : `Sketching on ${kind} plane`;
+}
 
 const GIZMO_MODE_BUTTONS: { mode: GizmoMode; label: string }[] = [
   { mode: 'translate', label: 'Move' },
@@ -151,10 +158,15 @@ export function App() {
   // Viewport's fitToken, so the camera re-fits on an explicit request too,
   // not just on opening a new file.
   const [resetViewToken, setResetViewToken] = useState(0);
-  // M7.5 slice 1: null outside sketch mode. See Viewport.tsx's SketchPlane/
+  // M7.5: null outside sketch mode. See Viewport.tsx's ActiveSketchPlane/
   // SketchController for the camera-lock/animate-to-plane behavior this
-  // drives.
-  const [sketchPlane, setSketchPlane] = useState<SketchPlane | null>(null);
+  // drives. Generalized (slice 3) from a fixed XY/XZ/YZ enum to an arbitrary
+  // origin+rotation so a picked face works through the same state as the
+  // three global-plane shortcuts.
+  const [activeSketchPlane, setActiveSketchPlane] = useState<ActiveSketchPlane | null>(null);
+  // M7.5 slice 3: true only during the brief "waiting for a face click"
+  // window between clicking "Pick Face" and actually clicking one.
+  const [pickingFace, setPickingFace] = useState(false);
   // M7.5 slice 2: sketch-local (u,v) points placed so far — cleared whenever
   // a sketch starts, finishes, or is exited/cancelled, never partially
   // carried over between sessions.
@@ -230,7 +242,8 @@ export function App() {
               disabledCount++;
               continue;
             }
-            const source = primitiveSource(parsedTree.rootNode, node, src, graph.context);
+            const primitiveText = primitiveOnlySlice(parsedTree.rootNode, node, src);
+            const source = `${graph.context}\n${primitiveText}`;
             try {
               // Only the bare primitive goes to WASM — translate/rotate/
               // scale are applied as a real three.js transform on the pivot
@@ -245,9 +258,11 @@ export function App() {
               // STL-export 2D geometry. Retry once wrapped in a hairline
               // linear_extrude (see wrapAsThinExtrude) before giving up, so
               // 2D shapes are at least visible/selectable instead of
-              // silently missing from the viewport.
+              // silently missing from the viewport. Context stays outside
+              // the wrapper (passed separately) — see wrapAsThinExtrude's
+              // 2026-09-21 comment for the real bug this fixed.
               try {
-                const bytes = await window.scadstudio.renderScad(wrapAsThinExtrude(source));
+                const bytes = await window.scadstudio.renderScad(wrapAsThinExtrude(graph.context, primitiveText));
                 const transform = decomposeNode(parsedTree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
                 meshes.push({ index: node.index, bytes, transform, modifier });
               } catch (err2) {
@@ -325,9 +340,20 @@ export function App() {
   // M7.5 slice 2: also doubles as "cancel" — any in-progress, unfinished
   // points are discarded, never silently carried into a later session.
   const handleExitSketch = useCallback(() => {
-    setSketchPlane(null);
+    setActiveSketchPlane(null);
+    setPickingFace(false);
     setSketchPoints([]);
     setResetViewToken((t) => t + 1);
+  }, []);
+
+  // M7.5 slice 3: "Pick Face" click → enters the picking-a-face window (free
+  // orbit still on, per Viewport's rotate-lock effect); a face click there
+  // calls this with the derived plane, which starts the actual sketch
+  // session exactly like a global-plane button would.
+  const handlePickFace = useCallback((origin: [number, number, number], rotationDeg: [number, number, number]) => {
+    setActiveSketchPlane({ kind: 'face', origin, rotationDeg });
+    setPickingFace(false);
+    setSketchPoints([]);
   }, []);
 
   // M7.5 slice 2: click-to-add-point handler wired to Viewport's
@@ -342,22 +368,23 @@ export function App() {
   }, []);
 
   // Commits the drawn points as a real polygon() statement (wrapped in the
-  // plane's rotate(), if non-identity) via the same append+select+render
-  // path every other toolbar insertion uses, then leaves sketch mode the
-  // same way Exit Sketch does — one sketch session produces one profile,
-  // consistent with keeping this slice's interaction model simple to reason
-  // about (multi-profile sessions can be a later refinement).
+  // plane's translate()/rotate(), each omitted when identity) via the same
+  // append+select+render path every other toolbar insertion uses, then
+  // leaves sketch mode the same way Exit Sketch does — one sketch session
+  // produces one profile, consistent with keeping this slice's interaction
+  // model simple to reason about (multi-profile sessions can be a later
+  // refinement).
   const handleFinishSketch = useCallback(() => {
-    if (!sketchPlane || sketchPoints.length < 3) return;
-    const next = appendSketchPolygon(sourceRef.current, SKETCH_PLANE_ROTATIONS[sketchPlane], sketchPoints);
+    if (!activeSketchPlane || sketchPoints.length < 3) return;
+    const next = appendSketchPolygon(sourceRef.current, activeSketchPlane.origin, activeSketchPlane.rotationDeg, sketchPoints);
     pendingSelectLast.current = true;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setSource(next);
     runRender(next);
-    setSketchPlane(null);
+    setActiveSketchPlane(null);
     setSketchPoints([]);
     setResetViewToken((t) => t + 1);
-  }, [sketchPlane, sketchPoints, runRender]);
+  }, [activeSketchPlane, sketchPoints, runRender]);
 
   // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
   // pipeline as a text edit (one derivation path, not two — see PLAN.md
@@ -569,7 +596,7 @@ export function App() {
         handleInsertPrimitive(op);
         return;
       }
-      const next = wrapInExtrude(sourceRef.current, node, op);
+      const next = wrapInExtrude(sourceRef.current, tree.rootNode, node, op);
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(next);
       runRender(next);
@@ -629,25 +656,31 @@ export function App() {
           ))}
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          {sketchPlane === null ? (
+          {pickingFace ? (
+            <>
+              <span style={{ opacity: 0.7 }}>Click a face of an existing shape to sketch on it…</span>
+              <button onClick={() => setPickingFace(false)}>Cancel</button>
+            </>
+          ) : activeSketchPlane === null ? (
             <>
               Sketch:
               {SKETCH_PLANE_BUTTONS.map(({ plane, label }) => (
                 <button
                   key={plane}
                   onClick={() => {
-                    setSketchPlane(plane);
+                    setActiveSketchPlane(buildGlobalSketchPlane(plane));
                     setSketchPoints([]);
                   }}
                 >
                   {label}
                 </button>
               ))}
+              <button onClick={() => setPickingFace(true)}>Pick Face</button>
             </>
           ) : (
             <>
               <span style={{ opacity: 0.7 }}>
-                Sketching on {sketchPlane} plane — click to place points ({sketchPoints.length})
+                {sketchPlaneLabel(activeSketchPlane.kind)} — click to place points ({sketchPoints.length})
               </span>
               <button onClick={handleUndoSketchPoint} disabled={sketchPoints.length === 0}>
                 Undo Point
@@ -820,7 +853,9 @@ export function App() {
             rotateSpace={rotateSpace}
             onTransformCommit={handleTransformCommit}
             fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
-            sketchPlane={sketchPlane}
+            activeSketchPlane={activeSketchPlane}
+            pickingFace={pickingFace}
+            onPickFace={handlePickFace}
             sketchPoints={sketchPoints}
             onAddSketchPoint={handleAddSketchPoint}
           />
