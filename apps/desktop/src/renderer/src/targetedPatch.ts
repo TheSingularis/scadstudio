@@ -480,3 +480,101 @@ export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: E
   const block = `${prefix}${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n}`;
   return source.slice(0, wrapStart) + block + source.slice(node.endIndex);
 }
+
+// M7.5 on-plane editing: everything needed to re-open an already-committed
+// sketch for editing — the plane it was drawn on (its translate()/rotate()
+// wrap, which is exactly what appendSketchPolygon emitted from the original
+// ActiveSketchPlane) plus its polygon's points and the byte range of the
+// points vector, so saving the edit rewrites just that one vector in place.
+export interface SketchProfile {
+  origin: [number, number, number];
+  rotationDeg: [number, number, number];
+  points: [number, number][];
+  pointsStart: number;
+  pointsEnd: number;
+}
+
+function polygonPointsArg(call: Node): Node | null {
+  const argsNode = call.childForFieldName('arguments')?.namedChild(0);
+  for (let i = 0; i < (argsNode?.namedChildCount ?? 0); i++) {
+    const argument = argsNode!.namedChild(i);
+    const name = argument?.childForFieldName('name')?.text ?? null;
+    // `points` is polygon()'s first parameter, so a positional first
+    // argument is the points vector too (`polygon([[0,0], ...])`).
+    if (name === 'points' || (name === null && i === 0)) {
+      return argument?.childForFieldName('value') ?? argument?.child(0) ?? null;
+    }
+  }
+  return null;
+}
+
+// The single 2D child of a `linear_extrude(...) { child; }` or
+// `linear_extrude(...) child;` — null for zero or several children, since
+// "edit the extruded sketch" only has one honest meaning when there's
+// exactly one profile underneath.
+function soleChildCall(call: Node): Node | null {
+  const last = call.child(call.childCount - 1);
+  if (!last) return null;
+  let stmt: Node | null = last;
+  if (last.type === 'block') {
+    const stmts = last.namedChildren.filter((c): c is Node => c !== null && c.type === 'statement');
+    if (stmts.length !== 1) return null;
+    stmt = stmts[0];
+  }
+  if (stmt?.type !== 'statement') return null;
+  const child = stmt.child(0);
+  return child?.type === 'module_instantiation' ? child : null;
+}
+
+// Recognizes the two shapes sketch mode itself produces: a bare
+// `[translate(...)] [rotate(...)] polygon(points=[...]);` (Finish Sketch) and
+// the same with a linear_extrude between the wrap and the polygon (Finish
+// Sketch → Linear Extrude, see wrapInExtrude). Deliberately strict —
+// anything this can't round-trip exactly returns null, and the toolbar
+// simply doesn't offer "Edit Sketch" for that node:
+// - points must be literal numbers (a vector built from variables or
+//   expressions has no single position to drag; rewriting it as literals
+//   would silently destroy the parametric intent),
+// - no scale()/mirror() wrap (handles live in the plane's unscaled frame;
+//   a scaled sketch would need the scale folded into every dragged point),
+// - rotate_extrude isn't accepted: its profile's XY plane gets revolved
+//   into XZ, so the on-plane handles wouldn't line up with the solid.
+export function readSketchProfile(root: Node, node: SceneNode): SketchProfile | null {
+  const decomposed = decomposeNode(root, node);
+  if (!decomposed) return null;
+  const { transform } = decomposed;
+  if (transform.scale.some((v) => v !== 1)) return null;
+  let call: Node | null = decomposed.primitiveNode;
+  if (call.childForFieldName('name')?.text === 'linear_extrude') call = soleChildCall(call);
+  if (!call || call.childForFieldName('name')?.text !== 'polygon') return null;
+  const vec = polygonPointsArg(call);
+  if (!vec || vec.type !== 'vector_expression') return null;
+  const points: [number, number][] = [];
+  for (const pointNode of vec.namedChildren) {
+    if (!pointNode || pointNode.type !== 'vector_expression' || pointNode.namedChildCount !== 2) return null;
+    const u = readNumber(pointNode.namedChild(0));
+    const v = readNumber(pointNode.namedChild(1));
+    if (u === null || v === null) return null;
+    points.push([u, v]);
+  }
+  if (points.length < 3) return null;
+  return {
+    origin: transform.translate,
+    rotationDeg: transform.rotateDeg,
+    points,
+    pointsStart: vec.startIndex,
+    pointsEnd: vec.endIndex,
+  };
+}
+
+export function formatSketchPoints(points: [number, number][]): string {
+  return `[${points.map(([u, v]) => `[${formatNumber(u)}, ${formatNumber(v)}]`).join(', ')}]`;
+}
+
+// Saving an edited sketch: only the points vector's own bytes change — the
+// plane wrap, any extrude around it, paths=, modifiers, color, comments and
+// formatting all stay exactly as they were (same minimal-diff rule as
+// patchArgument).
+export function patchSketchPoints(source: string, profile: SketchProfile, points: [number, number][]): string {
+  return source.slice(0, profile.pointsStart) + formatSketchPoints(points) + source.slice(profile.pointsEnd);
+}
