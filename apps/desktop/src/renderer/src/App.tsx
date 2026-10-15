@@ -12,7 +12,9 @@ import {
   SELECTED_MESH_COLOR,
   OPERAND_MESH_COLOR,
   buildGlobalSketchPlane,
+  buildFaceSketchPlane,
 } from './components/Viewport';
+import { DEFAULT_SNAP_SETTINGS, type SnapSettings } from './sketchSnap';
 import { parseScad } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import {
@@ -60,6 +62,9 @@ const SKETCH_PLANE_BUTTONS: { plane: 'XY' | 'XZ' | 'YZ'; label: string }[] = [
   { plane: 'XZ', label: 'XZ' },
   { plane: 'YZ', label: 'YZ' },
 ];
+
+// Grid snap spacings offered in the sketch toolbar, in model units.
+const SNAP_GRID_SIZES = [0.5, 1, 2, 5, 10];
 
 function sketchPlaneLabel(kind: SketchPlaneKind): string {
   return kind === 'face' ? 'Sketching on picked face' : `Sketching on ${kind} plane`;
@@ -171,6 +176,10 @@ export function App() {
   // a sketch starts, finishes, or is exited/cancelled, never partially
   // carried over between sessions.
   const [sketchPoints, setSketchPoints] = useState<[number, number][]>([]);
+  // M7.5 snap-while-drawing toggles. Deliberately kept across sketch
+  // sessions (unlike sketchPoints) — a chosen grid spacing is a working
+  // preference, not part of any one sketch.
+  const [snapSettings, setSnapSettings] = useState<SnapSettings>(DEFAULT_SNAP_SETTINGS);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
   // See Viewport.tsx's SelectMode/ViewportProps.selectedIndices comments for
@@ -350,15 +359,18 @@ export function App() {
   // orbit still on, per Viewport's rotate-lock effect); a face click there
   // calls this with the derived plane, which starts the actual sketch
   // session exactly like a global-plane button would.
-  const handlePickFace = useCallback((origin: [number, number, number], rotationDeg: [number, number, number]) => {
-    setActiveSketchPlane({ kind: 'face', origin, rotationDeg });
-    setPickingFace(false);
-    setSketchPoints([]);
-  }, []);
+  const handlePickFace = useCallback(
+    (point: [number, number, number], rotationDeg: [number, number, number], normal: [number, number, number]) => {
+      setActiveSketchPlane(buildFaceSketchPlane(point, rotationDeg, normal));
+      setPickingFace(false);
+      setSketchPoints([]);
+    },
+    [],
+  );
 
   // M7.5 slice 2: click-to-add-point handler wired to Viewport's
-  // SketchDrawingPlane. Plain append — no snapping yet (the "cheap
-  // constraints" tier from PLAN.md is still ahead of this slice).
+  // SketchSession. Points arrive already snapped (grid / existing geometry /
+  // alignment — see sketchSnap.ts), so this stays a plain append.
   const handleAddSketchPoint = useCallback((u: number, v: number) => {
     setSketchPoints((prev) => [...prev, [u, v]]);
   }, []);
@@ -689,6 +701,36 @@ export function App() {
                 Finish Sketch
               </button>
               <button onClick={handleExitSketch}>Exit Sketch</button>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 6 }} title="Hold Alt while clicking to place a point without snapping">
+                Snap:
+                <label style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                  <input
+                    type="checkbox"
+                    checked={snapSettings.grid}
+                    onChange={(e) => setSnapSettings((s) => ({ ...s, grid: e.target.checked }))}
+                  />
+                  Grid
+                </label>
+                <select
+                  value={snapSettings.gridSize}
+                  disabled={!snapSettings.grid}
+                  onChange={(e) => setSnapSettings((s) => ({ ...s, gridSize: Number(e.target.value) }))}
+                >
+                  {SNAP_GRID_SIZES.map((size) => (
+                    <option key={size} value={size}>
+                      {size}
+                    </option>
+                  ))}
+                </select>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                  <input
+                    type="checkbox"
+                    checked={snapSettings.geometry}
+                    onChange={(e) => setSnapSettings((s) => ({ ...s, geometry: e.target.checked }))}
+                  />
+                  Points/edges
+                </label>
+              </span>
             </>
           )}
         </span>
@@ -858,6 +900,8 @@ export function App() {
             onPickFace={handlePickFace}
             sketchPoints={sketchPoints}
             onAddSketchPoint={handleAddSketchPoint}
+            snapSettings={snapSettings}
+            onCloseSketch={handleFinishSketch}
           />
         </div>
       </div>
