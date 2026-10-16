@@ -23,6 +23,14 @@ export const HIGHLIGHT_MESH_COLOR = '#a855f7';
 // top-level statements independently (no single merged CSG output to
 // exclude from), so the translucency is the whole of what's reproduced here.
 const GHOST_OPACITY = 0.35;
+// M7.5 on-plane editing: the sketch being edited stays visible as a faint
+// "before" reference behind its live handles.
+const EDITING_REFERENCE_OPACITY = 0.2;
+// Handle colors while sketching — idle points keep the existing sketch
+// preview amber; the hovered/dragged one turns white so it's obvious which
+// point a drag will move.
+const SKETCH_HANDLE_ACTIVE_COLOR = '#ffffff';
+const SKETCH_OVERLAY_RENDER_ORDER = 999;
 import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform, type Modifier } from '../targetedPatch';
 import { NavCube, NAMED_VIEWS, NAV_CUBE_MARGIN_PX, type CameraView, type Vec3 } from './NavCube';
 
@@ -112,6 +120,19 @@ interface ViewportProps {
   // (SketchDrawingPlane's onAddPoint, wired to onAddSketchPoint below).
   sketchPoints: [number, number][];
   onAddSketchPoint: (u: number, v: number) => void;
+  // M7.5 on-plane editing. Every placed point is a draggable handle while
+  // sketching (drawing a new profile or editing a committed one): a drag
+  // calls onSketchDragStart once on its first movement (App.tsx snapshots
+  // the points for Undo there) and onMoveSketchPoint on every move after,
+  // with the new sketch-local (u, v). Double-clicking a handle deletes it.
+  onMoveSketchPoint: (index: number, u: number, v: number) => void;
+  onSketchDragStart: () => void;
+  onDeleteSketchPoint: (index: number) => void;
+  // Non-null while editing an already-committed sketch ("Edit Sketch"): that
+  // node's mesh is drawn as a translucent, unclickable reference of its
+  // pre-edit shape, and the preview draws the profile as a closed loop (it's
+  // a finished polygon, not an in-progress polyline).
+  editingNodeIndex: number | null;
 }
 
 type SelectionRole = 'none' | 'base' | 'operand';
@@ -124,6 +145,7 @@ function NodeModel({
   sketchActive,
   pickingFace,
   onPickFace,
+  editing,
   shading,
 }: {
   mesh: NodeMesh;
@@ -144,6 +166,10 @@ function NodeModel({
   // actually hitting real geometry.
   pickingFace: boolean;
   onPickFace: (origin: [number, number, number], rotationDeg: [number, number, number]) => void;
+  // M7.5 on-plane editing: this is the sketch currently being edited — shown
+  // ghosted as a reference of its pre-edit shape while the live handles
+  // (SketchPointsPreview) show the shape it's becoming.
+  editing: boolean;
 }) {
   // openscad-wasm renders just the bare primitive now (translate/rotate/
   // scale are stripped before sending source to WASM — see App.tsx), so this
@@ -172,7 +198,7 @@ function NodeModel({
   // `%` stays translucent regardless of selection/highlight — it's a
   // persistent "ghost reference" state, not something selecting the node
   // should visually override.
-  const isGhost = mesh.modifier === '%';
+  const isGhost = mesh.modifier === '%' || editing;
 
   return (
     <group
@@ -211,7 +237,8 @@ function NodeModel({
           color={materialColor}
           side={2}
           transparent={isGhost}
-          opacity={isGhost ? GHOST_OPACITY : 1}
+          opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : 1}
+          depthWrite={!editing}
           // Hidden surface still raycasts (only drawing is skipped, same
           // split as SketchDrawingPlane's material) — shapes stay clickable
           // in wireframe mode.
@@ -326,6 +353,23 @@ const GLOBAL_SKETCH_PLANE_ROTATIONS: Record<'XY' | 'XZ' | 'YZ', [number, number,
 
 export function buildGlobalSketchPlane(kind: 'XY' | 'XZ' | 'YZ'): ActiveSketchPlane {
   return { kind, origin: [0, 0, 0], rotationDeg: GLOBAL_SKETCH_PLANE_ROTATIONS[kind] };
+}
+
+// M7.5 on-plane editing: rebuilds the plane a committed sketch was drawn on
+// from its own translate()/rotate() wrap — the inverse of what
+// appendSketchPolygon emitted. A wrap that matches one of the three global
+// planes exactly (origin at 0, same rotation) maps back to that plane, so
+// re-editing an XY/XZ/YZ sketch gets the same hand-picked camera framing it
+// was drawn with; anything else (a picked face, or a sketch the gizmo has
+// since moved/rotated) goes through the general face-derived camera path,
+// which frames any origin+rotation correctly.
+export function sketchPlaneFromTransform(origin: [number, number, number], rotationDeg: [number, number, number]): ActiveSketchPlane {
+  if (origin.every((v) => v === 0)) {
+    for (const kind of ['XY', 'XZ', 'YZ'] as const) {
+      if (GLOBAL_SKETCH_PLANE_ROTATIONS[kind].every((v, i) => v === rotationDeg[i])) return buildGlobalSketchPlane(kind);
+    }
+  }
+  return { kind: 'face', origin, rotationDeg };
 }
 
 // The one "animate the camera to a given orientation" primitive (PLAN.md
@@ -488,25 +532,43 @@ const overlayButtonStyle = {
 function SketchDrawingPlane({
   activeSketchPlane,
   onAddPoint,
+  onPointerMoveLocal,
+  suppressClickRef,
 }: {
   activeSketchPlane: ActiveSketchPlane;
   onAddPoint: (u: number, v: number) => void;
+  // M7.5 on-plane editing: every pointer move over the plane, already
+  // converted to sketch-local (u,v) — Viewport uses it to drive a handle
+  // drag. The plane (not the handle itself) is the move target on purpose:
+  // the 0.8-unit handle sphere falls out from under a fast-moving cursor
+  // immediately, the 1000x1000 plane never does.
+  onPointerMoveLocal: (u: number, v: number) => void;
+  // True for the one native 'click' that follows the mouseup ending a
+  // handle drag — that release shouldn't also add a point wherever the
+  // drag happened to end.
+  suppressClickRef: RefObject<boolean>;
 }) {
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const inverseQuaternion = useMemo(() => quaternion.clone().invert(), [quaternion]);
+  // e.point is the world-space hit — subtracting the plane's own origin then
+  // inverse-rotating back through the same rotation that places the plane
+  // recovers the sketch-local (u,v) the pointer is over (local z comes out
+  // ~0, discarded). Identity for global planes (origin always [0,0,0]
+  // there), load-bearing for a face-derived one.
+  const toLocal = (point: Vector3) => point.clone().sub(new Vector3(...activeSketchPlane.origin)).applyQuaternion(inverseQuaternion);
   return (
     <mesh
       position={activeSketchPlane.origin}
       quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
       onClick={(e: ThreeEvent<MouseEvent>) => {
         e.stopPropagation();
-        // e.point is the world-space hit — subtracting the plane's own
-        // origin then inverse-rotating back through the same rotation that
-        // places the plane recovers the sketch-local (u,v) the click landed
-        // on (local z comes out ~0, discarded). Identity for global planes
-        // (origin always [0,0,0] there), load-bearing for a face-derived one.
-        const local = e.point.clone().sub(new Vector3(...activeSketchPlane.origin)).applyQuaternion(inverseQuaternion);
+        if (suppressClickRef.current) return;
+        const local = toLocal(e.point);
         onAddPoint(local.x, local.y);
+      }}
+      onPointerMove={(e: ThreeEvent<PointerEvent>) => {
+        const local = toLocal(e.point);
+        onPointerMoveLocal(local.x, local.y);
       }}
     >
       <planeGeometry args={[1000, 1000]} />
@@ -523,7 +585,26 @@ function SketchDrawingPlane({
 // polyline (not yet closed into the final polygon(), which only happens on
 // "Finish Sketch"). Same outside-<Bounds> reasoning as the drawing plane:
 // this is drawing-session UI, not modeled content.
-function SketchPointsPreview({ activeSketchPlane, points }: { activeSketchPlane: ActiveSketchPlane; points: [number, number][] }) {
+function SketchPointsPreview({
+  activeSketchPlane,
+  points,
+  closed,
+  activeIndex,
+  onHandleDown,
+  onHandleHover,
+  onHandleDelete,
+}: {
+  activeSketchPlane: ActiveSketchPlane;
+  points: [number, number][];
+  // Editing a committed polygon draws the closing edge too; drawing a new
+  // one doesn't (it isn't closed until Finish Sketch).
+  closed: boolean;
+  // Hovered or currently-dragged handle, highlighted.
+  activeIndex: number | null;
+  onHandleDown: (index: number) => void;
+  onHandleHover: (index: number | null) => void;
+  onHandleDelete: (index: number) => void;
+}) {
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
   const worldPoints = useMemo(
@@ -531,13 +612,45 @@ function SketchPointsPreview({ activeSketchPlane, points }: { activeSketchPlane:
     [points, quaternion, origin],
   );
   if (worldPoints.length === 0) return null;
+  const linePoints = closed && worldPoints.length > 2 ? [...worldPoints, worldPoints[0]] : worldPoints;
   return (
     <>
-      {worldPoints.length > 1 && <Line points={worldPoints} color={SELECTED_MESH_COLOR} lineWidth={2} />}
+      {/* depthTest off + a late renderOrder: the sketch overlay always draws on
+          top, so a handle sitting behind other geometry from the camera's
+          angle (very common for a face-picked plane — neighboring solids
+          stick out toward the camera) stays visible and grabbable. Hit-
+          testing already ignores those solids while sketching (sketchActive). */}
+      {linePoints.length > 1 && (
+        <Line points={linePoints} color={SELECTED_MESH_COLOR} lineWidth={2} depthTest={false} renderOrder={SKETCH_OVERLAY_RENDER_ORDER} />
+      )}
       {worldPoints.map((p, i) => (
-        <mesh key={i} position={p}>
-          <sphereGeometry args={[0.8, 12, 12]} />
-          <meshBasicMaterial color={SELECTED_MESH_COLOR} />
+        <mesh
+          key={i}
+          position={p}
+          renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+          onPointerDown={(e: ThreeEvent<PointerEvent>) => {
+            if (e.button !== 0) return;
+            e.stopPropagation();
+            onHandleDown(i);
+          }}
+          // No stopPropagation here, unlike the other handlers: r3f
+          // remembers a stopped pointerover and keeps stopping every later
+          // pointermove while the cursor stays over this handle — which
+          // starves the drawing plane behind it of exactly the moves that
+          // drive a drag (the handle follows the cursor, so the cursor is
+          // over it for most of the drag).
+          onPointerOver={() => onHandleHover(i)}
+          onPointerOut={() => onHandleHover(null)}
+          // A plain click on a handle (press + release, no drag) must not
+          // fall through to the drawing plane behind it and add a point.
+          onClick={(e: ThreeEvent<MouseEvent>) => e.stopPropagation()}
+          onDoubleClick={(e: ThreeEvent<MouseEvent>) => {
+            e.stopPropagation();
+            onHandleDelete(i);
+          }}
+        >
+          <sphereGeometry args={[activeIndex === i ? 1.1 : 0.8, 12, 12]} />
+          <meshBasicMaterial color={activeIndex === i ? SKETCH_HANDLE_ACTIVE_COLOR : SELECTED_MESH_COLOR} depthTest={false} />
         </mesh>
       ))}
     </>
@@ -563,6 +676,10 @@ export function Viewport({
   onPickFace,
   sketchPoints,
   onAddSketchPoint,
+  onMoveSketchPoint,
+  onSketchDragStart,
+  onDeleteSketchPoint,
+  editingNodeIndex,
 }: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
   // render entirely when any statement is marked. Nothing stops marking more
@@ -623,6 +740,65 @@ export function Viewport({
     if (controls) controls.enableRotate = activeSketchPlane === null;
   }, [activeSketchPlane]);
 
+  // M7.5 on-plane editing: handle drag state. The ref is what the move/up
+  // handlers read (always current, no stale closure mid-drag); the state
+  // copy only exists to re-render the highlight.
+  const draggingIndexRef = useRef<number | null>(null);
+  const dragMovedRef = useRef(false);
+  const suppressSketchClickRef = useRef(false);
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [hoveredHandle, setHoveredHandle] = useState<number | null>(null);
+
+  const handleHandleDown = useCallback((index: number) => {
+    draggingIndexRef.current = index;
+    dragMovedRef.current = false;
+    setDraggingIndex(index);
+    // Pan/zoom stay off for the drag's duration so the view can't shift
+    // under the point being placed.
+    if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
+  }, []);
+
+  const handlePlanePointerMove = useCallback(
+    (u: number, v: number) => {
+      const index = draggingIndexRef.current;
+      if (index === null) return;
+      if (!dragMovedRef.current) {
+        dragMovedRef.current = true;
+        onSketchDragStart();
+      }
+      onMoveSketchPoint(index, u, v);
+    },
+    [onMoveSketchPoint, onSketchDragStart],
+  );
+
+  // Released on window, not on the handle/plane: the cursor can be anywhere
+  // (off the handle, outside the canvas) by the time the button comes up.
+  useEffect(() => {
+    const onPointerUp = () => {
+      if (draggingIndexRef.current === null) return;
+      draggingIndexRef.current = null;
+      setDraggingIndex(null);
+      if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
+      if (dragMovedRef.current) {
+        // Same deferred-flag trick as isTransformingRef above: the native
+        // 'click' that follows this mouseup dispatches before the timeout
+        // fires, so it sees the flag and is ignored.
+        suppressSketchClickRef.current = true;
+        setTimeout(() => {
+          suppressSketchClickRef.current = false;
+        }, 0);
+      }
+    };
+    window.addEventListener('pointerup', onPointerUp);
+    return () => window.removeEventListener('pointerup', onPointerUp);
+  }, []);
+
+  // Leaving sketch mode mid-hover would otherwise leave a stale highlight
+  // index around for the next session.
+  useEffect(() => {
+    if (!activeSketchPlane) setHoveredHandle(null);
+  }, [activeSketchPlane]);
+
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <Canvas
@@ -669,13 +845,31 @@ export function Viewport({
                   pickingFace={pickingFace}
                   onPickFace={onPickFace}
                   shading={shading}
+                  editing={mesh.index === editingNodeIndex}
                 />
               );
             })}
           </Center>
         </Bounds>
-        {activeSketchPlane && <SketchDrawingPlane activeSketchPlane={activeSketchPlane} onAddPoint={onAddSketchPoint} />}
-        {activeSketchPlane && <SketchPointsPreview activeSketchPlane={activeSketchPlane} points={sketchPoints} />}
+        {activeSketchPlane && (
+          <SketchDrawingPlane
+            activeSketchPlane={activeSketchPlane}
+            onAddPoint={onAddSketchPoint}
+            onPointerMoveLocal={handlePlanePointerMove}
+            suppressClickRef={suppressSketchClickRef}
+          />
+        )}
+        {activeSketchPlane && (
+          <SketchPointsPreview
+            activeSketchPlane={activeSketchPlane}
+            points={sketchPoints}
+            closed={editingNodeIndex !== null}
+            activeIndex={draggingIndex ?? hoveredHandle}
+            onHandleDown={handleHandleDown}
+            onHandleHover={setHoveredHandle}
+            onHandleDelete={onDeleteSketchPoint}
+          />
+        )}
         {transformTarget && !activeSketchPlane && (
           <TransformControls
             object={transformTarget}
