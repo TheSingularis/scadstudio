@@ -78,6 +78,9 @@ export function snapSketchPoint(
   geometry: PlaneSnapGeometry,
   settings: SnapSettings,
   tolerance: number,
+  // Closing is only meaningful while drawing a new, still-open profile —
+  // not while dragging a point or editing an already-closed one.
+  allowClose = true,
 ): SnapResult {
   if (settings.geometry) {
     const targets: { point: Vec2; kind: SnapKind }[] = [];
@@ -85,7 +88,7 @@ export function snapSketchPoint(
     // points for a real polygon: clicking it closes the loop. Every other
     // already-placed point is deliberately not a target — landing exactly
     // on one would just add a duplicate/self-touching vertex.
-    if (sketchPoints.length >= 3) targets.push({ point: sketchPoints[0], kind: 'close' });
+    if (allowClose && sketchPoints.length >= 3) targets.push({ point: sketchPoints[0], kind: 'close' });
     for (const p of geometry.points) targets.push({ point: p, kind: 'endpoint' });
     for (const s of geometry.segments) {
       targets.push({ point: [(s.a[0] + s.b[0]) / 2, (s.a[1] + s.b[1]) / 2], kind: 'midpoint' });

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Html } from '@react-three/drei';
+import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges, Html } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
 import { Color, Mesh, Vector3, Quaternion, PerspectiveCamera, type BufferGeometry, type Group } from 'three';
@@ -23,6 +23,14 @@ export const HIGHLIGHT_MESH_COLOR = '#a855f7';
 // top-level statements independently (no single merged CSG output to
 // exclude from), so the translucency is the whole of what's reproduced here.
 const GHOST_OPACITY = 0.35;
+// M7.5 on-plane editing: the sketch being edited stays visible as a faint
+// "before" reference behind its live handles.
+const EDITING_REFERENCE_OPACITY = 0.2;
+// Handle colors while sketching — idle points keep the existing sketch
+// preview amber; the hovered/dragged one turns white so it's obvious which
+// point a drag will move.
+const SKETCH_HANDLE_ACTIVE_COLOR = '#ffffff';
+const SKETCH_OVERLAY_RENDER_ORDER = 999;
 import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform, type Modifier } from '../targetedPatch';
 import {
   snapSketchPoint,
@@ -34,6 +42,7 @@ import {
   type SnapSettings,
   type Vec2,
 } from '../sketchSnap';
+import { NavCube, NAMED_VIEWS, NAV_CUBE_MARGIN_PX, type CameraView, type Vec3 } from './NavCube';
 
 // Parsed once per STL buffer and shared between NodeModel (drawing it) and
 // sketch snapping (reading its edges) — keyed on the buffer itself, so a
@@ -49,6 +58,22 @@ function geometryFor(bytes: Uint8Array): BufferGeometry {
   }
   return geom;
 }
+
+// M7.5 point 5: how meshes draw. 'edges' overlays each mesh's facet edges
+// (EdgesGeometry, so coplanar triangle diagonals from the STL triangulation
+// are dropped and only real polygon boundaries show — the same facets real
+// OpenSCAD's "Show Edges" draws); 'wireframe' draws only those edges, with
+// the surface hidden but still clickable.
+export type ShadingMode = 'shaded' | 'edges' | 'wireframe';
+const SHADING_OPTIONS: { mode: ShadingMode; label: string }[] = [
+  { mode: 'shaded', label: 'Shaded' },
+  { mode: 'edges', label: 'Shaded + edges' },
+  { mode: 'wireframe', label: 'Wireframe' },
+];
+// Facets of a coplanar face differ by ~0°; adjacent facets of even a dense
+// curved surface (a $fn=64 cylinder: 5.6°) are well above this.
+const EDGE_THRESHOLD_DEG = 1;
+const EDGE_OVERLAY_COLOR = '#1b1b1b';
 
 // Derived from drei's own component rather than three's OrbitControls
 // directly — drei pins a slightly different three.js generic signature and
@@ -120,6 +145,19 @@ interface ViewportProps {
   // (SketchDrawingPlane's onAddPoint, wired to onAddSketchPoint below).
   sketchPoints: [number, number][];
   onAddSketchPoint: (u: number, v: number) => void;
+  // M7.5 on-plane editing. Every placed point is a draggable handle while
+  // sketching (drawing a new profile or editing a committed one): a drag
+  // calls onSketchDragStart once on its first movement (App.tsx snapshots
+  // the points for Undo there) and onMoveSketchPoint on every move after,
+  // with the new sketch-local (u, v). Double-clicking a handle deletes it.
+  onMoveSketchPoint: (index: number, u: number, v: number) => void;
+  onSketchDragStart: () => void;
+  onDeleteSketchPoint: (index: number) => void;
+  // Non-null while editing an already-committed sketch ("Edit Sketch"): that
+  // node's mesh is drawn as a translucent, unclickable reference of its
+  // pre-edit shape, and the preview draws the profile as a closed loop (it's
+  // a finished polygon, not an in-progress polyline).
+  editingNodeIndex: number | null;
   // M7.5 snap-while-drawing: which snap sources are on (App.tsx's sketch
   // toolbar owns them), and what clicking the first point once a loop is
   // possible does — the same thing as App.tsx's "Finish Sketch".
@@ -137,9 +175,12 @@ function NodeModel({
   sketchActive,
   pickingFace,
   onPickFace,
+  editing,
+  shading,
 }: {
   mesh: NodeMesh;
   role: SelectionRole;
+  shading: ShadingMode;
   onSelect: (index: number, mode: SelectMode) => void;
   onGroupRef: (index: number, group: Group | null) => void;
   // M7.5 slice 2: existing shapes stop intercepting clicks while sketching,
@@ -155,6 +196,10 @@ function NodeModel({
   // actually hitting real geometry.
   pickingFace: boolean;
   onPickFace: (point: [number, number, number], rotationDeg: [number, number, number], normal: [number, number, number]) => void;
+  // M7.5 on-plane editing: this is the sketch currently being edited — shown
+  // ghosted as a reference of its pre-edit shape while the live handles
+  // (SketchPointsPreview) show the shape it's becoming.
+  editing: boolean;
 }) {
   // openscad-wasm renders just the bare primitive now (translate/rotate/
   // scale are stripped before sending source to WASM — see App.tsx), so this
@@ -179,7 +224,7 @@ function NodeModel({
   // `%` stays translucent regardless of selection/highlight — it's a
   // persistent "ghost reference" state, not something selecting the node
   // should visually override.
-  const isGhost = mesh.modifier === '%';
+  const isGhost = mesh.modifier === '%' || editing;
 
   return (
     <group
@@ -219,15 +264,40 @@ function NodeModel({
           onSelect(mesh.index, e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace');
         }}
       >
-        <meshStandardMaterial color={materialColor} side={2} transparent={isGhost} opacity={isGhost ? GHOST_OPACITY : 1} />
+        <meshStandardMaterial
+          color={materialColor}
+          side={2}
+          transparent={isGhost}
+          opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : 1}
+          depthWrite={!editing}
+          // Hidden surface still raycasts (only drawing is skipped, same
+          // split as SketchDrawingPlane's material) — shapes stay clickable
+          // in wireframe mode.
+          visible={shading !== 'wireframe'}
+        />
+        {shading !== 'shaded' && (
+          <Edges
+            threshold={EDGE_THRESHOLD_DEG}
+            // Wireframe carries the selection/highlight color on the edges
+            // themselves, since there's no surface left to show it.
+            color={shading === 'wireframe' ? materialColor : EDGE_OVERLAY_COLOR}
+            lineWidth={shading === 'wireframe' ? 1.5 : 1}
+            transparent={isGhost}
+            opacity={isGhost ? GHOST_OPACITY : 1}
+          />
+        )}
       </mesh>
     </group>
   );
 }
 
 // Matches <Canvas camera={{ position: DEFAULT_CAMERA_POSITION, ... }}> below —
-// the one true "default angle" every fit should return to.
-const DEFAULT_CAMERA_POSITION: [number, number, number] = [50, 50, 50];
+// the one true "default angle" every fit should return to. Z-up, like
+// OpenSCAD itself (the viewport was three.js's default Y-up until the nav
+// cube made that visible — see PLAN.md M7.5 nav-cube notes), looking from
+// front-right-top: the FRONT/RIGHT/TOP faces of the nav cube face the user.
+const DEFAULT_CAMERA_POSITION: Vec3 = [50, -50, 50];
+const DEFAULT_CAMERA_UP: Vec3 = [0, 0, 1];
 
 // Lives inside <Bounds> (needs its context via useBounds) and fires whenever
 // fitToken changes. drei's own bounds.reset()/fit() fits distance along
@@ -240,16 +310,21 @@ function FitController({ fitToken, orbitControlsRef }: { fitToken: string; orbit
   const bounds = useBounds();
   const camera = useThree((state) => state.camera);
   useEffect(() => {
-    camera.position.set(...DEFAULT_CAMERA_POSITION);
-    // SketchController's lookAt leaves camera.up at the sketch plane's
-    // screen-up (Z for XZ/YZ), and reset() below frames along camera.up — so
-    // without this, exiting an XZ/YZ sketch "reset" to a Z-up view instead
-    // of the canonical one, and orbiting from there tumbled oddly (
-    // OrbitControls' own orbit frame stays the Y-up it was built with).
-    camera.up.set(0, 1, 0);
+    // Offset from the content's center, not the world origin: reset() keeps
+    // whatever direction the camera has *relative to that center*, so a
+    // position fixed relative to the origin came out skewed whenever the
+    // content isn't centered on it (e.g. Reset View on the default example
+    // landed noticeably off the front-right-top diagonal).
+    const { center } = bounds.refresh().getSize();
+    camera.position.set(...DEFAULT_CAMERA_POSITION).add(center);
+    // A nav-cube view or sketch-plane lock leaves camera.up at that view's
+    // screen-up (e.g. +Y after Top), which OrbitControls then orbits around —
+    // reset it too, or "Reset View" would return to the right position with
+    // the wrong orbit axis.
+    camera.up.set(...DEFAULT_CAMERA_UP);
     const controls = orbitControlsRef.current;
     if (controls) {
-      controls.target.set(0, 0, 0);
+      controls.target.copy(center);
       controls.update();
     }
     bounds.refresh().fit().clip();
@@ -293,11 +368,14 @@ export interface ActiveSketchPlane {
 // too, since the derived "up" for YZ doesn't happen to match this
 // (documented where GLOBAL_SKETCH_PLANE_ROTATIONS is defined below); no reason to
 // risk already-verified behavior switching formulas to unify a cosmetic.
-const GLOBAL_SKETCH_PLANE_VIEWS: Record<'XY' | 'XZ' | 'YZ', { position: [number, number, number]; up: [number, number, number] }> = {
-  XY: { position: [0, 0, 60], up: [0, 1, 0] },
-  XZ: { position: [0, -60, 0], up: [0, 0, 1] },
-  YZ: { position: [60, 0, 0], up: [0, 0, 1] },
+// These are exactly the nav cube's Top/Front/Right views (same
+// position-at-distance-60 and up as slice 1's original hand-picked tuples).
+const GLOBAL_SKETCH_PLANE_VIEWS: Record<'XY' | 'XZ' | 'YZ', CameraView> = {
+  XY: NAMED_VIEWS.top,
+  XZ: NAMED_VIEWS.front,
+  YZ: NAMED_VIEWS.right,
 };
+const SKETCH_CAMERA_DISTANCE = 60;
 
 // The actual world-space mapping each rotation produces per axis is a
 // documented side effect of the rotation math, not something independently
@@ -319,7 +397,7 @@ export function buildGlobalSketchPlane(kind: 'XY' | 'XZ' | 'YZ'): ActiveSketchPl
 // on a face land on the same round world coordinates as on a global plane
 // (for any axis-aligned face) instead of on a grid offset by wherever the
 // click happened to land — and it keeps the emitted translate() to the
-// face's real offset (e.g. [0, 0, 4]) rather than an arbitrary hit point.
+// face's real offset (e.g. [0, 15, 0]) rather than an arbitrary hit point.
 // The click still decides where the camera looks (focus).
 export function buildFaceSketchPlane(
   point: [number, number, number],
@@ -341,13 +419,36 @@ export function buildFaceSketchPlane(
   };
 }
 
+// M7.5 on-plane editing: rebuilds the plane a committed sketch was drawn on
+// from its own translate()/rotate() wrap — the inverse of what
+// appendSketchPolygon emitted. A wrap that matches one of the three global
+// planes exactly (origin at 0, same rotation) maps back to that plane, so
+// re-editing an XY/XZ/YZ sketch gets the same hand-picked camera framing it
+// was drawn with; anything else (a picked face, or a sketch the gizmo has
+// since moved/rotated) goes through the general face-derived camera path,
+// which frames any origin+rotation correctly.
+export function sketchPlaneFromTransform(origin: [number, number, number], rotationDeg: [number, number, number]): ActiveSketchPlane {
+  if (origin.every((v) => v === 0)) {
+    for (const kind of ['XY', 'XZ', 'YZ'] as const) {
+      if (GLOBAL_SKETCH_PLANE_ROTATIONS[kind].every((v, i) => v === rotationDeg[i])) return buildGlobalSketchPlane(kind);
+    }
+  }
+  return { kind: 'face', origin, rotationDeg };
+}
+
+// The one "animate the camera to a given orientation" primitive (PLAN.md
+// M7.5 point 5): sketch-mode's plane lock, nav-cube clicks, and the nav
+// cube's step arrows all go through this — no second animation path. Uses
+// Bounds' lower-level moveTo/lookAt rather than fit()/reset(), since each of
+// these is a fixed given orientation, not something derived from content.
+type BoundsApi = ReturnType<typeof useBounds>;
+function animateCameraTo(bounds: BoundsApi, target: Vec3, view: CameraView, distance: number) {
+  const position = new Vector3(...view.direction).normalize().multiplyScalar(distance).add(new Vector3(...target));
+  bounds.refresh().moveTo([position.x, position.y, position.z]).lookAt({ target, up: view.up });
+}
+
 // Sibling to FitController, same "lives inside <Bounds> for useBounds, fires
-// on prop change only" shape — but calls the lower-level moveTo/lookAt
-// directly instead of fit()/reset(), since a sketch plane view is a fixed
-// given orientation, not something derived from current content/camera
-// state. This is the "animate camera to a target orientation" primitive the
-// nav-cube (PLAN.md M7.5 point 5) will want too — reuse this rather than
-// building a second animation path when the nav-cube is built.
+// on prop change only" shape.
 function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSketchPlane | null }) {
   const bounds = useBounds();
   useEffect(() => {
@@ -355,36 +456,146 @@ function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSket
     const { kind, rotationDeg } = activeSketchPlane;
     const focus = activeSketchPlane.focus ?? activeSketchPlane.origin;
     if (kind !== 'face') {
-      const { position, up } = GLOBAL_SKETCH_PLANE_VIEWS[kind];
-      bounds.refresh().moveTo(position).lookAt({ target: [0, 0, 0], up });
+      animateCameraTo(bounds, [0, 0, 0], GLOBAL_SKETCH_PLANE_VIEWS[kind], SKETCH_CAMERA_DISTANCE);
       return;
     }
-    // Face-derived plane: no hand-picked view to preserve, so the camera
-    // position/up are derived directly from the plane's own rotation —
-    // look from `distance` back along the plane's local +Z (its normal),
-    // with the plane's local +Y as screen-up, centered on the picked point
-    // (focus) rather than the world origin.
-    const distance = 60;
+    // Face-derived plane: no hand-picked view to preserve, so the view is
+    // derived directly from the plane's own rotation — look back along the
+    // plane's local +Z (its normal), with the plane's local +Y as
+    // screen-up, centered on the picked point rather than the world origin.
     const rotation = transformToQuaternion(rotationDeg);
-    const focusVec = new Vector3(...focus);
-    const cameraPos = focusVec.clone().addScaledVector(new Vector3(0, 0, 1).applyQuaternion(rotation), distance);
+    const normal = new Vector3(0, 0, 1).applyQuaternion(rotation);
     const up = new Vector3(0, 1, 0).applyQuaternion(rotation);
-    bounds.refresh().moveTo([cameraPos.x, cameraPos.y, cameraPos.z]).lookAt({ target: focus, up: [up.x, up.y, up.z] });
+    animateCameraTo(
+      bounds,
+      focus,
+      { direction: [normal.x, normal.y, normal.z], up: [up.x, up.y, up.z] },
+      SKETCH_CAMERA_DISTANCE,
+    );
   }, [activeSketchPlane, bounds]);
   return null;
 }
 
+// 90° steps, named for which way the *model* turns on screen (the same way
+// it turns when orbit-dragging in that direction), plus a 90° roll.
+export type ViewStep = 'left' | 'right' | 'up' | 'down' | 'rollCw' | 'rollCcw';
+const VIEW_STEPS: { step: ViewStep; glyph: string; title: string; dx: number; dy: number }[] = [
+  { step: 'up', glyph: '▲', title: 'Rotate view up 90°', dx: 0, dy: -70 },
+  { step: 'down', glyph: '▼', title: 'Rotate view down 90°', dx: 0, dy: 70 },
+  { step: 'left', glyph: '◀', title: 'Rotate view left 90°', dx: -70, dy: 0 },
+  { step: 'right', glyph: '▶', title: 'Rotate view right 90°', dx: 70, dy: 0 },
+  { step: 'rollCcw', glyph: '↺', title: 'Roll view counter-clockwise 90°', dx: -58, dy: -58 },
+  { step: 'rollCw', glyph: '↻', title: 'Roll view clockwise 90°', dx: 58, dy: -58 },
+];
+
+interface ViewApi {
+  orient: (view: CameraView) => void;
+  step: (step: ViewStep) => void;
+}
+
+// Bounds' default animation length (its maxDuration prop, left unset below).
+const VIEW_ANIMATION_MS = 1000;
+
+// Lives inside <Bounds> like the two controllers above; exposes the camera
+// moves the nav cube (in its own HUD scene) and the HTML step arrows (outside
+// the Canvas entirely) trigger, via a ref instead of a prop-change trigger
+// since these are imperative one-shot clicks, not state.
+function ViewController({ apiRef }: { apiRef: RefObject<ViewApi | null> }) {
+  const bounds = useBounds();
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as OrbitControlsImpl | null;
+  useEffect(() => {
+    // The view most recently animated to. A step clicked while the previous
+    // one is still animating builds on that goal rather than the half-turned
+    // camera, so rapid clicks still land on exact 90° multiples. An orbit
+    // drag (which also cancels Bounds' animation) invalidates it.
+    let pending: { view: CameraView; target: Vec3; distance: number; at: number } | null = null;
+    const clearPending = () => {
+      pending = null;
+    };
+    controls?.addEventListener('start', clearPending);
+
+    const current = () => {
+      if (pending && performance.now() - pending.at < VIEW_ANIMATION_MS) return pending;
+      const target = controls ? controls.target.clone() : new Vector3();
+      const direction = camera.position.clone().sub(target).normalize();
+      // Screen-up from the camera's actual orientation, not camera.up, which
+      // only approximates it (OrbitControls treats it as an orbit axis).
+      const up = new Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+      return {
+        view: { direction: [direction.x, direction.y, direction.z] as Vec3, up: [up.x, up.y, up.z] as Vec3 },
+        target: [target.x, target.y, target.z] as Vec3,
+        distance: camera.position.distanceTo(target),
+      };
+    };
+    const go = (view: CameraView, target: Vec3, distance: number) => {
+      pending = { view, target, distance, at: performance.now() };
+      animateCameraTo(bounds, target, view, distance);
+    };
+
+    apiRef.current = {
+      // Keeps the current look-at target and zoom distance — only the
+      // orientation changes, same as Onshape/Fusion's view cubes.
+      orient: (view) => {
+        const { target, distance } = current();
+        go(view, target, distance);
+      },
+      step: (step) => {
+        const { view, target, distance } = current();
+        const direction = new Vector3(...view.direction);
+        const up = new Vector3(...view.up);
+        const right = up.clone().cross(direction).normalize();
+        const quarter = Math.PI / 2;
+        if (step === 'left' || step === 'right') {
+          // Model turns right ⇔ camera orbits left around screen-up.
+          direction.applyAxisAngle(up, step === 'right' ? -quarter : quarter);
+        } else if (step === 'up' || step === 'down') {
+          // Model tips up (front face rolls to the top) ⇔ camera drops below.
+          const angle = step === 'up' ? quarter : -quarter;
+          direction.applyAxisAngle(right, angle);
+          up.applyAxisAngle(right, angle);
+        } else {
+          // Model turns clockwise on screen ⇔ screen-up rotates the other way
+          // around the view axis.
+          up.applyAxisAngle(direction, step === 'rollCw' ? quarter : -quarter);
+        }
+        go({ direction: [direction.x, direction.y, direction.z], up: [up.x, up.y, up.z] }, target, distance);
+      },
+    };
+    return () => {
+      controls?.removeEventListener('start', clearPending);
+      apiRef.current = null;
+    };
+  }, [apiRef, bounds, camera, controls]);
+  return null;
+}
+
+const overlayButtonStyle = {
+  position: 'absolute',
+  width: 22,
+  height: 22,
+  padding: 0,
+  border: '1px solid #aaa',
+  borderRadius: 4,
+  background: 'rgba(255, 255, 255, 0.85)',
+  color: '#333',
+  fontSize: 12,
+  lineHeight: '20px',
+  textAlign: 'center',
+  cursor: 'pointer',
+} as const;
+
 // M7.5 snap-while-drawing: how close (in screen pixels) the cursor has to
 // get to a snap target for it to grab — converted to sketch-local units
-// per pointer event (see SketchSession's snapAt), so it feels the same at
-// any zoom level instead of being a fixed world distance.
+// per pointer event (see SketchDrawingPlane's snapAt), so it feels the same
+// at any zoom level instead of being a fixed world distance.
 const SNAP_RADIUS_PX = 10;
-// Preview-only geometry (grid, rubber band, markers) sits this far off the
-// sketch plane toward the camera (every plane's camera looks down its local
-// +Z — see SketchController), so it doesn't z-fight with an existing face
-// the sketch was picked from. Never applied to committed coordinates.
+// Preview-only geometry (grid, markers) sits this far off the sketch plane
+// toward the camera (every plane's camera looks down its local +Z — see
+// SketchController), so it doesn't z-fight with an existing face the sketch
+// was picked from. Never applied to committed coordinates.
 const PREVIEW_LIFT = 0.01;
-// Grid overlay half-extent is SKETCH_GRID_EXTENT / 2 around the plane origin.
+// Grid overlay is SKETCH_GRID_EXTENT units across, centered on the plane origin.
 const SKETCH_GRID_EXTENT = 200;
 const SNAP_POINT_COLOR = '#2da44e';
 const SNAP_MARKER_COLORS: Record<SnapKind, string> = {
@@ -407,7 +618,7 @@ const SNAP_LABELS: Record<SnapKind, string> = {
   grid: 'Grid',
   none: 'Free',
 };
-// Grid lines lie in GridHelper's own XZ plane; this turns them into the
+// GridHelper lies in its own XZ plane; this turns its lines into the
 // sketch's local XY (u, v) plane before the plane's own rotation applies.
 const GRID_TO_SKETCH_LOCAL = new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), Math.PI / 2);
 
@@ -415,53 +626,62 @@ function formatCoord(n: number): string {
   return String(Math.round(n * 1000) / 1000 + 0);
 }
 
-// Everything that exists only while a sketch session is open: the invisible
-// click target, the snap grid, the points placed so far, and the live
-// hover/snap preview. Lives outside <Bounds>, same as the gizmo below — none
-// of it is modeled content, and the 1000x1000 click plane would badly skew
-// any fit-to-content bounding box if it were counted.
-//
-// The click target is a large invisible mesh exactly at the active sketch
-// plane (M7.5 slice 2). Real r3f mesh + onClick/onPointerMove (not raw DOM
-// listeners) so it participates in the normal raycast/event system rather
-// than fighting it; existing shapes disable their own raycasting while
-// sketching (NodeModel's sketchActive prop), so this plane is always what
-// the pointer lands on regardless of what's visually in front of it.
-function SketchSession({
+// M7.5 slice 2: a large invisible mesh exactly at the active sketch plane —
+// the actual click target for placing points. Real r3f mesh + onClick
+// (not a raw DOM listener) so it participates in the normal raycast/event
+// system rather than fighting it; existing shapes disable their own
+// raycasting while sketching (NodeModel's sketchActive prop), so this plane
+// is always what a click lands on regardless of what's visually in front of
+// it from the camera's angle. Lives outside <Bounds> (same reasoning as the
+// gizmo below) — its generous 1000x1000 size would badly skew any
+// fit-to-content bounding box if it were counted.
+function SketchDrawingPlane({
   activeSketchPlane,
-  points,
-  snapGeometry,
-  snapSettings,
   onAddPoint,
+  onPointerMoveLocal,
+  suppressClickRef,
+  snapSettings,
+  snapGeometry,
+  getSnapContext,
   onCloseSketch,
+  onHover,
 }: {
   activeSketchPlane: ActiveSketchPlane;
-  points: Vec2[];
-  snapGeometry: PlaneSnapGeometry;
-  snapSettings: SnapSettings;
   onAddPoint: (u: number, v: number) => void;
+  // M7.5 on-plane editing: every pointer move over the plane, already
+  // converted to sketch-local (u,v) — Viewport uses it to drive a handle
+  // drag. The plane (not the handle itself) is the move target on purpose:
+  // the 0.8-unit handle sphere falls out from under a fast-moving cursor
+  // immediately, the 1000x1000 plane never does.
+  onPointerMoveLocal: (u: number, v: number) => void;
+  // True for the one native 'click' that follows the mouseup ending a
+  // handle drag — that release shouldn't also add a point wherever the
+  // drag happened to end.
+  suppressClickRef: RefObject<boolean>;
+  // M7.5 snap-while-drawing (sketchSnap.ts). Points handed to onAddPoint /
+  // onPointerMoveLocal are already snapped; the raw cursor is never exposed.
+  snapSettings: SnapSettings;
+  snapGeometry: PlaneSnapGeometry;
+  // The points to snap against right now, and whether clicking the first one
+  // closes the loop: while dragging, the dragged point itself is excluded
+  // (it would snap to its own old position); while editing a closed profile
+  // there is no loop left to close.
+  getSnapContext: () => { points: Vec2[]; allowClose: boolean };
   onCloseSketch: () => void;
+  onHover: (snap: SnapResult | null) => void;
 }) {
   const camera = useThree((state) => state.camera);
   const viewportHeightPx = useThree((state) => state.size.height);
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const inverseQuaternion = useMemo(() => quaternion.clone().invert(), [quaternion]);
-  const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
-  const gridQuaternion = useMemo(() => quaternion.clone().multiply(GRID_TO_SKETCH_LOCAL), [quaternion]);
-  const [hover, setHover] = useState<SnapResult | null>(null);
-
-  // Sketch-local (u, v) <-> world. Subtracting the plane's origin then
-  // inverse-rotating through the same rotation that places the plane
-  // recovers the (u, v) a world point sits at (local z comes out ~0 for a
-  // hit on the plane, discarded). Identity for XY; load-bearing for every
-  // other plane kind.
-  const toWorld = useCallback(
-    ([u, v]: Vec2, lift = PREVIEW_LIFT) => new Vector3(u, v, lift).applyQuaternion(quaternion).add(origin),
-    [quaternion, origin],
-  );
-
+  // e.point is the world-space hit — subtracting the plane's own origin then
+  // inverse-rotating back through the same rotation that places the plane
+  // recovers the sketch-local (u,v) the pointer is over (local z comes out
+  // ~0, discarded). Identity for global planes (origin always [0,0,0]
+  // there), load-bearing for a face-derived one.
+  const toLocal = (point: Vector3) => point.clone().sub(new Vector3(...activeSketchPlane.origin)).applyQuaternion(inverseQuaternion);
   const snapAt = (e: ThreeEvent<PointerEvent> | ThreeEvent<MouseEvent>): SnapResult => {
-    const local = e.point.clone().sub(origin).applyQuaternion(inverseQuaternion);
+    const local = toLocal(e.point);
     const raw: Vec2 = [local.x, local.y];
     // Alt is the usual CAD "don't snap this one" modifier.
     if (e.nativeEvent.altKey) return { point: raw, kind: 'none', alignedU: null, alignedV: null };
@@ -470,73 +690,115 @@ function SketchSession({
     const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
     const depth = camera.position.distanceTo(e.point);
     const unitsPerPx = (2 * depth * Math.tan((fov * Math.PI) / 360)) / (camera.zoom * viewportHeightPx);
-    return snapSketchPoint(raw, points, snapGeometry, snapSettings, SNAP_RADIUS_PX * unitsPerPx);
+    const { points, allowClose } = getSnapContext();
+    return snapSketchPoint(raw, points, snapGeometry, snapSettings, SNAP_RADIUS_PX * unitsPerPx, allowClose);
   };
+  return (
+    <mesh
+      position={activeSketchPlane.origin}
+      quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
+      onClick={(e: ThreeEvent<MouseEvent>) => {
+        e.stopPropagation();
+        if (suppressClickRef.current) return;
+        // Recomputed from the click itself rather than reusing the last
+        // hover result, so a click always commits exactly what the snap
+        // rules say about where it actually landed.
+        const snap = snapAt(e);
+        if (snap.kind === 'close') {
+          onCloseSketch();
+          return;
+        }
+        onAddPoint(snap.point[0], snap.point[1]);
+      }}
+      onPointerMove={(e: ThreeEvent<PointerEvent>) => {
+        const snap = snapAt(e);
+        onHover(snap);
+        onPointerMoveLocal(snap.point[0], snap.point[1]);
+      }}
+      onPointerOut={() => onHover(null)}
+    >
+      <planeGeometry args={[1000, 1000]} />
+      {/* Invisible material, not an invisible mesh — Object3D.visible=false
+          would also disable raycasting; material.visible=false only skips
+          drawing it, which is exactly the "clickable but unseen" split
+          this needs. */}
+      <meshBasicMaterial visible={false} />
+    </mesh>
+  );
+}
 
-  const worldPoints = useMemo(() => points.map((p) => toWorld(p)), [points, toWorld]);
-  const last = points.length > 0 ? points[points.length - 1] : null;
-
+// The snap grid, rubber band from the last placed point, alignment guides
+// and the labelled marker for whatever the cursor is currently snapping to.
+// Preview-only: none of it ever reaches the committed source.
+function SketchSnapOverlay({
+  activeSketchPlane,
+  snapSettings,
+  hover,
+  lastPoint,
+  drawing,
+}: {
+  activeSketchPlane: ActiveSketchPlane;
+  snapSettings: SnapSettings;
+  hover: SnapResult | null;
+  lastPoint: Vec2 | null;
+  // The rubber band only makes sense while appending to an open profile.
+  drawing: boolean;
+}) {
+  const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
+  const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
+  const gridQuaternion = useMemo(() => quaternion.clone().multiply(GRID_TO_SKETCH_LOCAL), [quaternion]);
+  const toWorld = useCallback(
+    ([u, v]: Vec2) => new Vector3(u, v, PREVIEW_LIFT).applyQuaternion(quaternion).add(origin),
+    [quaternion, origin],
+  );
+  const gridPosition = useMemo(() => toWorld([0, 0]), [toWorld]);
   return (
     <>
-      <mesh
-        position={activeSketchPlane.origin}
-        quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
-        onPointerMove={(e: ThreeEvent<PointerEvent>) => setHover(snapAt(e))}
-        onPointerOut={() => setHover(null)}
-        onClick={(e: ThreeEvent<MouseEvent>) => {
-          e.stopPropagation();
-          // Recomputed from the click itself rather than reusing the last
-          // hover result, so a click always commits exactly what the snap
-          // rules say about where it actually landed.
-          const snap = snapAt(e);
-          if (snap.kind === 'close') {
-            onCloseSketch();
-            return;
-          }
-          // A second click on the same snapped spot (easy to do with grid
-          // snapping on) would only add a zero-length edge.
-          if (last && last[0] === snap.point[0] && last[1] === snap.point[1]) return;
-          onAddPoint(snap.point[0], snap.point[1]);
-        }}
-      >
-        <planeGeometry args={[1000, 1000]} />
-        {/* Invisible material, not an invisible mesh — Object3D.visible=false
-            would also disable raycasting; material.visible=false only skips
-            drawing it, which is exactly the "clickable but unseen" split
-            this needs. */}
-        <meshBasicMaterial visible={false} />
-      </mesh>
       {snapSettings.grid && snapSettings.gridSize > 0 && (
         <gridHelper
           // Keyed on spacing: GridHelper bakes its lines in at construction,
           // so a new spacing needs a new instance, not a prop update.
           key={snapSettings.gridSize}
           args={[SKETCH_GRID_EXTENT, Math.round(SKETCH_GRID_EXTENT / snapSettings.gridSize), '#8a8a8a', '#d4d4d4']}
-          position={toWorld([0, 0])}
+          position={gridPosition}
           quaternion={[gridQuaternion.x, gridQuaternion.y, gridQuaternion.z, gridQuaternion.w]}
         />
       )}
-      {worldPoints.length > 1 && <Line points={worldPoints} color={SELECTED_MESH_COLOR} lineWidth={2} />}
-      {worldPoints.map((p, i) => (
-        <mesh key={i} position={p}>
-          <sphereGeometry args={[0.8, 12, 12]} />
-          <meshBasicMaterial color={SELECTED_MESH_COLOR} />
-        </mesh>
-      ))}
       {hover && (
         <>
-          {last && <Line points={[toWorld(last), toWorld(hover.point)]} color={SELECTED_MESH_COLOR} lineWidth={1} dashed dashSize={1} gapSize={0.6} />}
-          {hover.alignedU && (
-            <Line points={[toWorld(hover.alignedU), toWorld(hover.point)]} color={SNAP_MARKER_COLORS.align} lineWidth={1} dashed dashSize={0.5} gapSize={0.5} />
+          {drawing && lastPoint && (
+            <Line
+              points={[toWorld(lastPoint), toWorld(hover.point)]}
+              color={SELECTED_MESH_COLOR}
+              lineWidth={1}
+              dashed
+              dashSize={1}
+              gapSize={0.6}
+              depthTest={false}
+              renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+            />
           )}
-          {hover.alignedV && (
-            <Line points={[toWorld(hover.alignedV), toWorld(hover.point)]} color={SNAP_MARKER_COLORS.align} lineWidth={1} dashed dashSize={0.5} gapSize={0.5} />
+          {[hover.alignedU, hover.alignedV].map(
+            (ref, i) =>
+              ref && (
+                <Line
+                  key={i}
+                  points={[toWorld(ref), toWorld(hover.point)]}
+                  color={SNAP_MARKER_COLORS.align}
+                  lineWidth={1}
+                  dashed
+                  dashSize={0.5}
+                  gapSize={0.5}
+                  depthTest={false}
+                  renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+                />
+              ),
           )}
-          <mesh position={toWorld(hover.point)}>
+          <mesh position={toWorld(hover.point)} renderOrder={SKETCH_OVERLAY_RENDER_ORDER}>
             <sphereGeometry args={[hover.kind === 'close' ? 1.2 : 0.6, 12, 12]} />
-            <meshBasicMaterial color={SNAP_MARKER_COLORS[hover.kind]} />
+            <meshBasicMaterial color={SNAP_MARKER_COLORS[hover.kind]} depthTest={false} />
           </mesh>
-          <Html position={toWorld(hover.point)} pointerEvents="none" style={{ pointerEvents: 'none' }}>
+          <Html position={toWorld(hover.point)} style={{ pointerEvents: 'none' }}>
             <div
               data-testid="sketch-snap-label"
               style={{
@@ -555,6 +817,91 @@ function SketchSession({
           </Html>
         </>
       )}
+    </>
+  );
+}
+
+// In-progress sketch points/edges, rendered live as they're placed — an open
+// polyline (not yet closed into the final polygon(), which only happens on
+// "Finish Sketch"). Same outside-<Bounds> reasoning as the drawing plane:
+// this is drawing-session UI, not modeled content.
+function SketchPointsPreview({
+  activeSketchPlane,
+  points,
+  closed,
+  activeIndex,
+  onHandleDown,
+  onHandleHover,
+  onHandleDelete,
+  onFirstHandleClick,
+}: {
+  activeSketchPlane: ActiveSketchPlane;
+  points: [number, number][];
+  // Editing a committed polygon draws the closing edge too; drawing a new
+  // one doesn't (it isn't closed until Finish Sketch).
+  closed: boolean;
+  // Hovered or currently-dragged handle, highlighted.
+  activeIndex: number | null;
+  onHandleDown: (index: number) => void;
+  onHandleHover: (index: number | null) => void;
+  onHandleDelete: (index: number) => void;
+  // Set only while a new profile has 3+ points: a plain click (no drag) on
+  // the first handle closes the loop. The handle sits on top of the drawing
+  // plane and swallows clicks, so the plane's own close-the-loop snap never
+  // sees a click that lands on it — it has to be handled here.
+  onFirstHandleClick?: () => void;
+}) {
+  const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
+  const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
+  const worldPoints = useMemo(
+    () => points.map(([u, v]) => new Vector3(u, v, 0).applyQuaternion(quaternion).add(origin)),
+    [points, quaternion, origin],
+  );
+  if (worldPoints.length === 0) return null;
+  const linePoints = closed && worldPoints.length > 2 ? [...worldPoints, worldPoints[0]] : worldPoints;
+  return (
+    <>
+      {/* depthTest off + a late renderOrder: the sketch overlay always draws on
+          top, so a handle sitting behind other geometry from the camera's
+          angle (very common for a face-picked plane — neighboring solids
+          stick out toward the camera) stays visible and grabbable. Hit-
+          testing already ignores those solids while sketching (sketchActive). */}
+      {linePoints.length > 1 && (
+        <Line points={linePoints} color={SELECTED_MESH_COLOR} lineWidth={2} depthTest={false} renderOrder={SKETCH_OVERLAY_RENDER_ORDER} />
+      )}
+      {worldPoints.map((p, i) => (
+        <mesh
+          key={i}
+          position={p}
+          renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+          onPointerDown={(e: ThreeEvent<PointerEvent>) => {
+            if (e.button !== 0) return;
+            e.stopPropagation();
+            onHandleDown(i);
+          }}
+          // No stopPropagation here, unlike the other handlers: r3f
+          // remembers a stopped pointerover and keeps stopping every later
+          // pointermove while the cursor stays over this handle — which
+          // starves the drawing plane behind it of exactly the moves that
+          // drive a drag (the handle follows the cursor, so the cursor is
+          // over it for most of the drag).
+          onPointerOver={() => onHandleHover(i)}
+          onPointerOut={() => onHandleHover(null)}
+          // A plain click on a handle (press + release, no drag) must not
+          // fall through to the drawing plane behind it and add a point.
+          onClick={(e: ThreeEvent<MouseEvent>) => {
+            e.stopPropagation();
+            if (i === 0) onFirstHandleClick?.();
+          }}
+          onDoubleClick={(e: ThreeEvent<MouseEvent>) => {
+            e.stopPropagation();
+            onHandleDelete(i);
+          }}
+        >
+          <sphereGeometry args={[activeIndex === i ? 1.1 : 0.8, 12, 12]} />
+          <meshBasicMaterial color={activeIndex === i ? SKETCH_HANDLE_ACTIVE_COLOR : SELECTED_MESH_COLOR} depthTest={false} />
+        </mesh>
+      ))}
     </>
   );
 }
@@ -578,6 +925,10 @@ export function Viewport({
   onPickFace,
   sketchPoints,
   onAddSketchPoint,
+  onMoveSketchPoint,
+  onSketchDragStart,
+  onDeleteSketchPoint,
+  editingNodeIndex,
   snapSettings,
   onCloseSketch,
 }: ViewportProps) {
@@ -592,15 +943,19 @@ export function Viewport({
   );
   // On-plane edges/vertices of what's currently visible, in the active
   // sketch plane's local (u, v) — recomputed only when the plane, the
-  // rendered shapes, or the geometry-snap toggle change, not per pointer
-  // move.
+  // rendered shapes or the geometry-snap toggle change, not per pointer
+  // move. The sketch being edited is left out: it's the thing being moved,
+  // so snapping a point to its own pre-edit outline would be a trap.
   const snapGeometry = useMemo(() => {
     if (!activeSketchPlane || !snapSettings.geometry) return EMPTY_PLANE_SNAP_GEOMETRY;
     return extractOnPlaneGeometry(
-      visibleMeshes.map((m) => ({ geometry: geometryFor(m.bytes), transform: m.transform })),
+      visibleMeshes
+        .filter((m) => m.index !== editingNodeIndex)
+        .map((m) => ({ geometry: geometryFor(m.bytes), transform: m.transform })),
       activeSketchPlane,
     );
-  }, [activeSketchPlane, snapSettings.geometry, visibleMeshes]);
+  }, [activeSketchPlane, snapSettings.geometry, visibleMeshes, editingNodeIndex]);
+  const [snapHover, setSnapHover] = useState<SnapResult | null>(null);
   // The gizmo only ever targets one object — the most recently selected one.
   const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
@@ -622,6 +977,10 @@ export function Viewport({
   // with the real geometry — nesting it caused the camera to zoom out to fit
   // that plane instead of the actual shapes the first time this was wired up.
   const [transformTarget, setTransformTarget] = useState<Group | null>(null);
+  const viewApiRef = useRef<ViewApi | null>(null);
+  // View-only preference, not part of the document — lives here rather than
+  // App.tsx since nothing outside the viewport reads it.
+  const [shading, setShading] = useState<ShadingMode>('shaded');
 
   const handleGroupRef = useCallback(
     (index: number, group: Group | null) => {
@@ -647,133 +1006,271 @@ export function Viewport({
     if (controls) controls.enableRotate = activeSketchPlane === null;
   }, [activeSketchPlane]);
 
-  return (
-    <Canvas
-      camera={{ position: DEFAULT_CAMERA_POSITION, fov: 45 }}
-      onPointerMissed={() => {
-        if (!isTransformingRef.current) onSelect(null, 'replace');
-      }}
-    >
-      <ambientLight intensity={0.6} />
-      <directionalLight position={[10, 20, 10]} intensity={0.8} />
-      {
-        // Unconditional now (previously gated on visibleMeshes.length > 0):
-        // that gate meant FitController/SketchController never mounted on an
-        // empty scene, so "Reset View" and entering sketch mode silently did
-        // nothing until at least one shape existed — a real bug for the
-        // "start sketching on a blank file" case, found while testing M7.5
-        // slice 1. Bounds' own refresh() already falls back gracefully on an
-        // empty box (see its source), and <Center> with zero children is a
-        // no-op, so there's no real reason for the gate to exist.
-        //
-        // No `fit`/`clip`/`observe` here: those re-fit/re-center the camera
-        // on every geometry change, which was yanking the camera around on
-        // routine edits (a gizmo drag, a parameter tweak) — not just on
-        // load. FitController below is the sole trigger instead, firing only
-        // when App.tsx's fitToken changes: a new file opened, or an explicit
-        // "Reset View" click — never as a side effect of editing.
+  // M7.5 on-plane editing: handle drag state. The ref is what the move/up
+  // handlers read (always current, no stale closure mid-drag); the state
+  // copy only exists to re-render the highlight.
+  const draggingIndexRef = useRef<number | null>(null);
+  const dragMovedRef = useRef(false);
+  const suppressSketchClickRef = useRef(false);
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [hoveredHandle, setHoveredHandle] = useState<number | null>(null);
+
+  const handleHandleDown = useCallback((index: number) => {
+    draggingIndexRef.current = index;
+    dragMovedRef.current = false;
+    setDraggingIndex(index);
+    // Pan/zoom stay off for the drag's duration so the view can't shift
+    // under the point being placed.
+    if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
+  }, []);
+
+  const handlePlanePointerMove = useCallback(
+    (u: number, v: number) => {
+      const index = draggingIndexRef.current;
+      if (index === null) return;
+      if (!dragMovedRef.current) {
+        dragMovedRef.current = true;
+        onSketchDragStart();
       }
-      <Bounds margin={1.2}>
-        <FitController fitToken={fitToken} orbitControlsRef={orbitControlsRef} />
-        <SketchController activeSketchPlane={activeSketchPlane} />
-        <Center>
-          {visibleMeshes.map((mesh) => {
-            const selPos = selectedIndices.indexOf(mesh.index);
-            const role: SelectionRole = selPos === -1 ? 'none' : selPos === 0 ? 'base' : 'operand';
-            return (
-              <NodeModel
-                key={mesh.index}
-                mesh={mesh}
-                role={role}
-                onSelect={onSelect}
-                onGroupRef={handleGroupRef}
-                sketchActive={activeSketchPlane !== null}
-                pickingFace={pickingFace}
-                onPickFace={onPickFace}
-              />
-            );
-          })}
-        </Center>
-      </Bounds>
-      {activeSketchPlane && (
-        <SketchSession
-          activeSketchPlane={activeSketchPlane}
-          points={sketchPoints}
-          snapGeometry={snapGeometry}
-          snapSettings={snapSettings}
-          onAddPoint={onAddSketchPoint}
-          onCloseSketch={onCloseSketch}
-        />
-      )}
-      {transformTarget && !activeSketchPlane && (
-        <TransformControls
-          object={transformTarget}
-          mode={gizmoMode}
-          // Translate stays world-space (moving "up" should mean world-up
-          // even for a rotated object — the usual 3D-tool convention).
-          // Scale stays local-only: OpenSCAD's scale() is always a plain
-          // per-axis stretch in whatever frame it's placed in, and there's
-          // no way to express "stretch along a world axis that doesn't line
-          // up with the object's own axes" without a shear-capable
-          // multmatrix() call, which isn't supported here — a "global scale"
-          // toggle could only ever be honest for unrotated shapes. Rotate is
-          // the one mode where both are meaningful and both round-trip
-          // cleanly (see onMouseUp below — space only changes how a drag
-          // *feels*, not how the result is read back), so it's user-toggled
-          // via rotateSpace.
-          space={gizmoMode === 'translate' ? 'world' : gizmoMode === 'rotate' ? rotateSpace : 'local'}
-          onMouseDown={() => {
-            isTransformingRef.current = true;
-            if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
-            dragStart.current = {
-              position: transformTarget.position.clone(),
-              quaternion: transformTarget.quaternion.toArray() as [number, number, number, number],
-              scale: transformTarget.scale.clone(),
-            };
-          }}
-          onMouseUp={() => {
-            if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
-            // Deferred a tick past the native 'click' that follows this
-            // 'mouseup' — see isTransformingRef's declaration above.
-            setTimeout(() => {
-              isTransformingRef.current = false;
-            }, 0);
-            const start = dragStart.current;
-            dragStart.current = null;
-            if (!start || primaryIndex === null) return;
+      onMoveSketchPoint(index, u, v);
+    },
+    [onMoveSketchPoint, onSketchDragStart],
+  );
 
-            const q = transformTarget.quaternion;
-            const changed =
-              !start.position.equals(transformTarget.position) ||
-              !start.scale.equals(transformTarget.scale) ||
-              start.quaternion[0] !== q.x ||
-              start.quaternion[1] !== q.y ||
-              start.quaternion[2] !== q.z ||
-              start.quaternion[3] !== q.w;
-            if (!changed) return;
+  // Released on window, not on the handle/plane: the cursor can be anywhere
+  // (off the handle, outside the canvas) by the time the button comes up.
+  useEffect(() => {
+    const onPointerUp = () => {
+      if (draggingIndexRef.current === null) return;
+      draggingIndexRef.current = null;
+      setDraggingIndex(null);
+      if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
+      if (dragMovedRef.current) {
+        // Same deferred-flag trick as isTransformingRef above: the native
+        // 'click' that follows this mouseup dispatches before the timeout
+        // fires, so it sees the flag and is ignored.
+        suppressSketchClickRef.current = true;
+        setTimeout(() => {
+          suppressSketchClickRef.current = false;
+        }, 0);
+      }
+    };
+    window.addEventListener('pointerup', onPointerUp);
+    return () => window.removeEventListener('pointerup', onPointerUp);
+  }, []);
 
-            // The group's current absolute position/quaternion/scale *is*
-            // the node's new transform — no delta/ratio/composition math
-            // needed, since (unlike the pre-refactor baked-geometry model)
-            // there's no separate "existing" value living in the source to
-            // combine with; this object's transform is the single source of
-            // truth for placement. color isn't part of the gizmo drag at
-            // all, so it's carried forward unchanged from the node's last
-            // known transform rather than dropped.
-            const p = transformTarget.position;
-            const s = transformTarget.scale;
-            const transform: NodeTransform = {
-              translate: [p.x, p.y, p.z],
-              rotateDeg: quaternionToRotateDeg(q),
-              color: meshes.find((m) => m.index === primaryIndex)?.transform.color ?? null,
-              scale: [s.x, s.y, s.z],
-            };
-            onTransformCommit(primaryIndex, transform);
-          }}
-        />
-      )}
-      <OrbitControls ref={orbitControlsRef} makeDefault />
-      <gridHelper args={[200, 20]} />
-    </Canvas>
+  // Leaving sketch mode mid-hover would otherwise leave a stale highlight
+  // index around for the next session.
+  useEffect(() => {
+    if (!activeSketchPlane) {
+      setHoveredHandle(null);
+      setSnapHover(null);
+    }
+  }, [activeSketchPlane]);
+
+  // What the plane snaps against right now — see SketchDrawingPlane's
+  // getSnapContext. Read through refs/latest props at call time, so it's
+  // always current mid-drag.
+  const getSnapContext = useCallback(() => {
+    const dragged = draggingIndexRef.current;
+    return {
+      points: dragged === null ? sketchPoints : sketchPoints.filter((_, i) => i !== dragged),
+      allowClose: dragged === null && editingNodeIndex === null,
+    };
+  }, [sketchPoints, editingNodeIndex]);
+
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <Canvas
+        camera={{ position: DEFAULT_CAMERA_POSITION, up: DEFAULT_CAMERA_UP, fov: 45 }}
+        onPointerMissed={() => {
+          if (!isTransformingRef.current) onSelect(null, 'replace');
+        }}
+      >
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[10, 20, 10]} intensity={0.8} />
+        {
+          // Unconditional now (previously gated on visibleMeshes.length > 0):
+          // that gate meant FitController/SketchController never mounted on an
+          // empty scene, so "Reset View" and entering sketch mode silently did
+          // nothing until at least one shape existed — a real bug for the
+          // "start sketching on a blank file" case, found while testing M7.5
+          // slice 1. Bounds' own refresh() already falls back gracefully on an
+          // empty box (see its source), and <Center> with zero children is a
+          // no-op, so there's no real reason for the gate to exist.
+          //
+          // No `fit`/`clip`/`observe` here: those re-fit/re-center the camera
+          // on every geometry change, which was yanking the camera around on
+          // routine edits (a gizmo drag, a parameter tweak) — not just on
+          // load. FitController below is the sole trigger instead, firing only
+          // when App.tsx's fitToken changes: a new file opened, or an explicit
+          // "Reset View" click — never as a side effect of editing.
+        }
+        <Bounds margin={1.2}>
+          <FitController fitToken={fitToken} orbitControlsRef={orbitControlsRef} />
+          <SketchController activeSketchPlane={activeSketchPlane} />
+          <ViewController apiRef={viewApiRef} />
+          <Center>
+            {visibleMeshes.map((mesh) => {
+              const selPos = selectedIndices.indexOf(mesh.index);
+              const role: SelectionRole = selPos === -1 ? 'none' : selPos === 0 ? 'base' : 'operand';
+              return (
+                <NodeModel
+                  key={mesh.index}
+                  mesh={mesh}
+                  role={role}
+                  onSelect={onSelect}
+                  onGroupRef={handleGroupRef}
+                  sketchActive={activeSketchPlane !== null}
+                  pickingFace={pickingFace}
+                  onPickFace={onPickFace}
+                  shading={shading}
+                  editing={mesh.index === editingNodeIndex}
+                />
+              );
+            })}
+          </Center>
+        </Bounds>
+        {activeSketchPlane && (
+          <SketchDrawingPlane
+            activeSketchPlane={activeSketchPlane}
+            onAddPoint={onAddSketchPoint}
+            onPointerMoveLocal={handlePlanePointerMove}
+            suppressClickRef={suppressSketchClickRef}
+            snapSettings={snapSettings}
+            snapGeometry={snapGeometry}
+            getSnapContext={getSnapContext}
+            onCloseSketch={onCloseSketch}
+            onHover={setSnapHover}
+          />
+        )}
+        {activeSketchPlane && (
+          <SketchSnapOverlay
+            activeSketchPlane={activeSketchPlane}
+            snapSettings={snapSettings}
+            hover={snapHover}
+            lastPoint={sketchPoints.length > 0 ? sketchPoints[sketchPoints.length - 1] : null}
+            drawing={editingNodeIndex === null && draggingIndex === null}
+          />
+        )}
+        {activeSketchPlane && (
+          <SketchPointsPreview
+            activeSketchPlane={activeSketchPlane}
+            points={sketchPoints}
+            closed={editingNodeIndex !== null}
+            activeIndex={draggingIndex ?? hoveredHandle}
+            onHandleDown={handleHandleDown}
+            onHandleHover={setHoveredHandle}
+            onHandleDelete={onDeleteSketchPoint}
+            onFirstHandleClick={
+              editingNodeIndex === null && sketchPoints.length >= 3
+                ? () => {
+                    // The click ending a handle drag isn't a close request.
+                    if (!suppressSketchClickRef.current) onCloseSketch();
+                  }
+                : undefined
+            }
+          />
+        )}
+        {transformTarget && !activeSketchPlane && (
+          <TransformControls
+            object={transformTarget}
+            mode={gizmoMode}
+            // Translate stays world-space (moving "up" should mean world-up
+            // even for a rotated object — the usual 3D-tool convention).
+            // Scale stays local-only: OpenSCAD's scale() is always a plain
+            // per-axis stretch in whatever frame it's placed in, and there's
+            // no way to express "stretch along a world axis that doesn't line
+            // up with the object's own axes" without a shear-capable
+            // multmatrix() call, which isn't supported here — a "global scale"
+            // toggle could only ever be honest for unrotated shapes. Rotate is
+            // the one mode where both are meaningful and both round-trip
+            // cleanly (see onMouseUp below — space only changes how a drag
+            // *feels*, not how the result is read back), so it's user-toggled
+            // via rotateSpace.
+            space={gizmoMode === 'translate' ? 'world' : gizmoMode === 'rotate' ? rotateSpace : 'local'}
+            onMouseDown={() => {
+              isTransformingRef.current = true;
+              if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
+              dragStart.current = {
+                position: transformTarget.position.clone(),
+                quaternion: transformTarget.quaternion.toArray() as [number, number, number, number],
+                scale: transformTarget.scale.clone(),
+              };
+            }}
+            onMouseUp={() => {
+              if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
+              // Deferred a tick past the native 'click' that follows this
+              // 'mouseup' — see isTransformingRef's declaration above.
+              setTimeout(() => {
+                isTransformingRef.current = false;
+              }, 0);
+              const start = dragStart.current;
+              dragStart.current = null;
+              if (!start || primaryIndex === null) return;
+
+              const q = transformTarget.quaternion;
+              const changed =
+                !start.position.equals(transformTarget.position) ||
+                !start.scale.equals(transformTarget.scale) ||
+                start.quaternion[0] !== q.x ||
+                start.quaternion[1] !== q.y ||
+                start.quaternion[2] !== q.z ||
+                start.quaternion[3] !== q.w;
+              if (!changed) return;
+
+              // The group's current absolute position/quaternion/scale *is*
+              // the node's new transform — no delta/ratio/composition math
+              // needed, since (unlike the pre-refactor baked-geometry model)
+              // there's no separate "existing" value living in the source to
+              // combine with; this object's transform is the single source of
+              // truth for placement. color isn't part of the gizmo drag at
+              // all, so it's carried forward unchanged from the node's last
+              // known transform rather than dropped.
+              const p = transformTarget.position;
+              const s = transformTarget.scale;
+              const transform: NodeTransform = {
+                translate: [p.x, p.y, p.z],
+                rotateDeg: quaternionToRotateDeg(q),
+                color: meshes.find((m) => m.index === primaryIndex)?.transform.color ?? null,
+                scale: [s.x, s.y, s.z],
+              };
+              onTransformCommit(primaryIndex, transform);
+            }}
+          />
+        )}
+        <OrbitControls ref={orbitControlsRef} makeDefault />
+        {/* gridHelper is built in three.js's XZ plane; rotated onto OpenSCAD's
+            XY ground plane to match the Z-up camera. */}
+        <gridHelper args={[200, 20]} rotation={[Math.PI / 2, 0, 0]} />
+        {/* Clicks are ignored while sketching, same as orbit rotation (see the
+            rotate-lock effect above): the plane view must stay straight-on. */}
+        <NavCube onPick={(view) => viewApiRef.current?.orient(view)} disabled={activeSketchPlane !== null} />
+      </Canvas>
+      {activeSketchPlane === null &&
+        VIEW_STEPS.map(({ step, glyph, title, dx, dy }) => (
+          <button
+            key={step}
+            title={title}
+            aria-label={title}
+            onClick={() => viewApiRef.current?.step(step)}
+            style={{ ...overlayButtonStyle, right: NAV_CUBE_MARGIN_PX - dx, top: NAV_CUBE_MARGIN_PX + dy, transform: 'translate(50%, -50%)' }}
+          >
+            {glyph}
+          </button>
+        ))}
+      <select
+        aria-label="Shading mode"
+        value={shading}
+        onChange={(e) => setShading(e.target.value as ShadingMode)}
+        style={{ position: 'absolute', right: 12, top: NAV_CUBE_MARGIN_PX * 2 + 8, fontSize: 12 }}
+      >
+        {SHADING_OPTIONS.map(({ mode, label }) => (
+          <option key={mode} value={mode}>
+            {label}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }

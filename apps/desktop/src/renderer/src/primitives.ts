@@ -1,4 +1,4 @@
-import { formatNumber } from './targetedPatch';
+import { formatNumber, formatSketchPoints } from './targetedPatch';
 
 // M5 toolbar primitive insertion. Deliberately minimal codegen: append a new
 // statement with sensible defaults at the end of the document. Insertion at
@@ -48,8 +48,7 @@ export function appendSketchPolygon(
   rotationDeg: [number, number, number],
   points: [number, number][],
 ): string {
-  const pointsText = points.map(([u, v]) => `[${formatNumber(u)}, ${formatNumber(v)}]`).join(', ');
-  let statement = `polygon(points=[${pointsText}]);`;
+  let statement = `polygon(points=${formatSketchPoints(points)});`;
   if (rotationDeg.some((v) => v !== 0)) {
     statement = `rotate([${rotationDeg.map(formatNumber).join(', ')}]) ${statement}`;
   }
