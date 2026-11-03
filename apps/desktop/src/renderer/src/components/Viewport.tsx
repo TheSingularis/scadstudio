@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges } from '@react-three/drei';
+import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges, Html } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { Color, Vector3, Quaternion, type Group } from 'three';
+import { Color, Mesh, Vector3, Quaternion, PerspectiveCamera, type BufferGeometry, type Group } from 'three';
 
 const DEFAULT_MESH_COLOR = '#4a90d9';
 // A single selection (or the *first*-clicked shape in a multi-select) reads
@@ -32,7 +32,32 @@ const EDITING_REFERENCE_OPACITY = 0.2;
 const SKETCH_HANDLE_ACTIVE_COLOR = '#ffffff';
 const SKETCH_OVERLAY_RENDER_ORDER = 999;
 import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform, type Modifier } from '../targetedPatch';
+import {
+  snapSketchPoint,
+  extractOnPlaneGeometry,
+  EMPTY_PLANE_SNAP_GEOMETRY,
+  type PlaneSnapGeometry,
+  type SnapKind,
+  type SnapResult,
+  type SnapSettings,
+  type Vec2,
+} from '../sketchSnap';
 import { NavCube, NAMED_VIEWS, NAV_CUBE_MARGIN_PX, type CameraView, type Vec3 } from './NavCube';
+
+// Parsed once per STL buffer and shared between NodeModel (drawing it) and
+// sketch snapping (reading its edges) — keyed on the buffer itself, so a
+// re-render that produces a new buffer naturally gets a fresh entry and the
+// old one is collected along with it.
+const geometryCache = new WeakMap<Uint8Array, BufferGeometry>();
+function geometryFor(bytes: Uint8Array): BufferGeometry {
+  let geom = geometryCache.get(bytes);
+  if (!geom) {
+    geom = new STLLoader().parse(bytes.buffer as ArrayBuffer);
+    geom.computeVertexNormals();
+    geometryCache.set(bytes, geom);
+  }
+  return geom;
+}
 
 // M7.5 point 5: how meshes draw. 'edges' overlays each mesh's facet edges
 // (EdgesGeometry, so coplanar triangle diagonals from the STL triangulation
@@ -113,7 +138,7 @@ interface ViewportProps {
   // NodeModel's onClick computes a plane from the hit instead of selecting.
   // Mutually exclusive with activeSketchPlane being non-null (never both).
   pickingFace: boolean;
-  onPickFace: (origin: [number, number, number], rotationDeg: [number, number, number]) => void;
+  onPickFace: (point: [number, number, number], rotationDeg: [number, number, number], normal: [number, number, number]) => void;
   // M7.5 slice 2: sketch-local (u,v) points placed so far this session —
   // App.tsx owns the array (cleared on entering/finishing/exiting a sketch),
   // Viewport just renders it (SketchPointsPreview) and appends to it
@@ -133,6 +158,11 @@ interface ViewportProps {
   // pre-edit shape, and the preview draws the profile as a closed loop (it's
   // a finished polygon, not an in-progress polyline).
   editingNodeIndex: number | null;
+  // M7.5 snap-while-drawing: which snap sources are on (App.tsx's sketch
+  // toolbar owns them), and what clicking the first point once a loop is
+  // possible does — the same thing as App.tsx's "Finish Sketch".
+  snapSettings: SnapSettings;
+  onCloseSketch: () => void;
 }
 
 type SelectionRole = 'none' | 'base' | 'operand';
@@ -165,7 +195,7 @@ function NodeModel({
   // enabled here (unlike sketchActive), since picking a face requires
   // actually hitting real geometry.
   pickingFace: boolean;
-  onPickFace: (origin: [number, number, number], rotationDeg: [number, number, number]) => void;
+  onPickFace: (point: [number, number, number], rotationDeg: [number, number, number], normal: [number, number, number]) => void;
   // M7.5 on-plane editing: this is the sketch currently being edited — shown
   // ghosted as a reference of its pre-edit shape while the live handles
   // (SketchPointsPreview) show the shape it's becoming.
@@ -180,11 +210,7 @@ function NodeModel({
   // manual pivot/bounding-box math and no reset-on-render hack are needed:
   // these props are always driven fresh from the parsed source, exactly like
   // a normal declarative React prop.
-  const geometry = useMemo(() => {
-    const geom = new STLLoader().parse(mesh.bytes.buffer as ArrayBuffer);
-    geom.computeVertexNormals();
-    return geom;
-  }, [mesh.bytes]);
+  const geometry = useMemo(() => geometryFor(mesh.bytes), [mesh.bytes]);
 
   const quaternion = useMemo(() => transformToQuaternion(mesh.transform.rotateDeg), [mesh.transform.rotateDeg]);
   // OpenSCAD's color() takes 0-1 floats, which is exactly what three.js's
@@ -212,7 +238,12 @@ function NodeModel({
         // Disables raycasting for this mesh entirely while sketching (three.js
         // calls this instead of its default Mesh.raycast; doing nothing means
         // no hit is ever recorded) — see the sketchActive prop's doc comment.
-        raycast={sketchActive ? () => null : undefined}
+        // Switching back must pass Mesh.prototype.raycast explicitly, not
+        // `undefined`: r3f doesn't restore a function prop's default when it
+        // goes undefined, so the no-op stuck around after the first sketch
+        // session and every shape stayed unclickable (no selection, no Pick
+        // Face) until the app was restarted.
+        raycast={sketchActive ? () => null : Mesh.prototype.raycast}
         onClick={(e: ThreeEvent<MouseEvent>) => {
           if (sketchActive) return;
           e.stopPropagation();
@@ -225,7 +256,7 @@ function NodeModel({
             if (!e.face) return;
             const worldNormal = e.face.normal.clone().transformDirection(e.object.matrixWorld).normalize();
             const rotation = new Quaternion().setFromUnitVectors(new Vector3(0, 0, 1), worldNormal);
-            onPickFace([e.point.x, e.point.y, e.point.z], quaternionToRotateDeg(rotation));
+            onPickFace([e.point.x, e.point.y, e.point.z], quaternionToRotateDeg(rotation), [worldNormal.x, worldNormal.y, worldNormal.z]);
             return;
           }
           // metaKey covers Cmd on macOS, where ctrl-click is reserved for
@@ -323,6 +354,11 @@ export interface ActiveSketchPlane {
   // rotation for the live in-progress preview (below) and the committed
   // source is what guarantees they can never drift apart.
   rotationDeg: [number, number, number];
+  // Where the locked sketch camera centers. Defaults to `origin`; a
+  // face-picked plane sets it to the clicked point, since its origin is
+  // moved off the click to the world origin's projection onto the face (see
+  // buildFaceSketchPlane) and may sit well away from the face itself.
+  focus?: [number, number, number];
 }
 
 // Hand-picked camera framing for the three global planes, preserved exactly
@@ -353,6 +389,34 @@ const GLOBAL_SKETCH_PLANE_ROTATIONS: Record<'XY' | 'XZ' | 'YZ', [number, number,
 
 export function buildGlobalSketchPlane(kind: 'XY' | 'XZ' | 'YZ'): ActiveSketchPlane {
   return { kind, origin: [0, 0, 0], rotationDeg: GLOBAL_SKETCH_PLANE_ROTATIONS[kind] };
+}
+
+// The plane's origin is the world origin's projection onto the face
+// (normal * (normal . point)), not the clicked point itself: sketch-local
+// (u, v) is measured from the origin, so this is what makes grid snapping
+// on a face land on the same round world coordinates as on a global plane
+// (for any axis-aligned face) instead of on a grid offset by wherever the
+// click happened to land — and it keeps the emitted translate() to the
+// face's real offset (e.g. [0, 15, 0]) rather than an arbitrary hit point.
+// The click still decides where the camera looks (focus).
+export function buildFaceSketchPlane(
+  point: [number, number, number],
+  rotationDeg: [number, number, number],
+  normal: [number, number, number],
+): ActiveSketchPlane {
+  const n = new Vector3(...normal).normalize();
+  const offset = n.dot(new Vector3(...point));
+  // Rounded so float noise from the raycast doesn't leak into the source as
+  // e.g. translate([0, 0, 3.9999999]) — formatNumber rounds to 3 decimals on
+  // output anyway, so rounding here keeps the live plane identical to the
+  // committed one.
+  const clean = (v: number) => Math.round(v * 1000) / 1000 + 0;
+  return {
+    kind: 'face',
+    origin: [clean(n.x * offset), clean(n.y * offset), clean(n.z * offset)],
+    rotationDeg: [clean(rotationDeg[0]), clean(rotationDeg[1]), clean(rotationDeg[2])],
+    focus: point,
+  };
 }
 
 // M7.5 on-plane editing: rebuilds the plane a committed sketch was drawn on
@@ -389,7 +453,8 @@ function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSket
   const bounds = useBounds();
   useEffect(() => {
     if (!activeSketchPlane) return;
-    const { kind, origin, rotationDeg } = activeSketchPlane;
+    const { kind, rotationDeg } = activeSketchPlane;
+    const focus = activeSketchPlane.focus ?? activeSketchPlane.origin;
     if (kind !== 'face') {
       animateCameraTo(bounds, [0, 0, 0], GLOBAL_SKETCH_PLANE_VIEWS[kind], SKETCH_CAMERA_DISTANCE);
       return;
@@ -403,7 +468,7 @@ function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSket
     const up = new Vector3(0, 1, 0).applyQuaternion(rotation);
     animateCameraTo(
       bounds,
-      origin,
+      focus,
       { direction: [normal.x, normal.y, normal.z], up: [up.x, up.y, up.z] },
       SKETCH_CAMERA_DISTANCE,
     );
@@ -520,6 +585,47 @@ const overlayButtonStyle = {
   cursor: 'pointer',
 } as const;
 
+// M7.5 snap-while-drawing: how close (in screen pixels) the cursor has to
+// get to a snap target for it to grab — converted to sketch-local units
+// per pointer event (see SketchDrawingPlane's snapAt), so it feels the same
+// at any zoom level instead of being a fixed world distance.
+const SNAP_RADIUS_PX = 10;
+// Preview-only geometry (grid, markers) sits this far off the sketch plane
+// toward the camera (every plane's camera looks down its local +Z — see
+// SketchController), so it doesn't z-fight with an existing face the sketch
+// was picked from. Never applied to committed coordinates.
+const PREVIEW_LIFT = 0.01;
+// Grid overlay is SKETCH_GRID_EXTENT units across, centered on the plane origin.
+const SKETCH_GRID_EXTENT = 200;
+const SNAP_POINT_COLOR = '#2da44e';
+const SNAP_MARKER_COLORS: Record<SnapKind, string> = {
+  close: SNAP_POINT_COLOR,
+  endpoint: SNAP_POINT_COLOR,
+  midpoint: SNAP_POINT_COLOR,
+  origin: SNAP_POINT_COLOR,
+  edge: '#1f9fb4',
+  align: '#a855f7',
+  grid: '#555555',
+  none: SELECTED_MESH_COLOR,
+};
+const SNAP_LABELS: Record<SnapKind, string> = {
+  close: 'Close loop',
+  endpoint: 'Endpoint',
+  midpoint: 'Midpoint',
+  origin: 'Origin',
+  edge: 'On edge',
+  align: 'Aligned',
+  grid: 'Grid',
+  none: 'Free',
+};
+// GridHelper lies in its own XZ plane; this turns its lines into the
+// sketch's local XY (u, v) plane before the plane's own rotation applies.
+const GRID_TO_SKETCH_LOCAL = new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), Math.PI / 2);
+
+function formatCoord(n: number): string {
+  return String(Math.round(n * 1000) / 1000 + 0);
+}
+
 // M7.5 slice 2: a large invisible mesh exactly at the active sketch plane —
 // the actual click target for placing points. Real r3f mesh + onClick
 // (not a raw DOM listener) so it participates in the normal raycast/event
@@ -534,6 +640,11 @@ function SketchDrawingPlane({
   onAddPoint,
   onPointerMoveLocal,
   suppressClickRef,
+  snapSettings,
+  snapGeometry,
+  getSnapContext,
+  onCloseSketch,
+  onHover,
 }: {
   activeSketchPlane: ActiveSketchPlane;
   onAddPoint: (u: number, v: number) => void;
@@ -547,7 +658,20 @@ function SketchDrawingPlane({
   // handle drag — that release shouldn't also add a point wherever the
   // drag happened to end.
   suppressClickRef: RefObject<boolean>;
+  // M7.5 snap-while-drawing (sketchSnap.ts). Points handed to onAddPoint /
+  // onPointerMoveLocal are already snapped; the raw cursor is never exposed.
+  snapSettings: SnapSettings;
+  snapGeometry: PlaneSnapGeometry;
+  // The points to snap against right now, and whether clicking the first one
+  // closes the loop: while dragging, the dragged point itself is excluded
+  // (it would snap to its own old position); while editing a closed profile
+  // there is no loop left to close.
+  getSnapContext: () => { points: Vec2[]; allowClose: boolean };
+  onCloseSketch: () => void;
+  onHover: (snap: SnapResult | null) => void;
 }) {
+  const camera = useThree((state) => state.camera);
+  const viewportHeightPx = useThree((state) => state.size.height);
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const inverseQuaternion = useMemo(() => quaternion.clone().invert(), [quaternion]);
   // e.point is the world-space hit — subtracting the plane's own origin then
@@ -556,6 +680,19 @@ function SketchDrawingPlane({
   // ~0, discarded). Identity for global planes (origin always [0,0,0]
   // there), load-bearing for a face-derived one.
   const toLocal = (point: Vector3) => point.clone().sub(new Vector3(...activeSketchPlane.origin)).applyQuaternion(inverseQuaternion);
+  const snapAt = (e: ThreeEvent<PointerEvent> | ThreeEvent<MouseEvent>): SnapResult => {
+    const local = toLocal(e.point);
+    const raw: Vec2 = [local.x, local.y];
+    // Alt is the usual CAD "don't snap this one" modifier.
+    if (e.nativeEvent.altKey) return { point: raw, kind: 'none', alignedU: null, alignedV: null };
+    // World units covered by one screen pixel at the hit's depth — the
+    // canvas camera is always perspective (see <Canvas camera> below).
+    const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
+    const depth = camera.position.distanceTo(e.point);
+    const unitsPerPx = (2 * depth * Math.tan((fov * Math.PI) / 360)) / (camera.zoom * viewportHeightPx);
+    const { points, allowClose } = getSnapContext();
+    return snapSketchPoint(raw, points, snapGeometry, snapSettings, SNAP_RADIUS_PX * unitsPerPx, allowClose);
+  };
   return (
     <mesh
       position={activeSketchPlane.origin}
@@ -563,13 +700,22 @@ function SketchDrawingPlane({
       onClick={(e: ThreeEvent<MouseEvent>) => {
         e.stopPropagation();
         if (suppressClickRef.current) return;
-        const local = toLocal(e.point);
-        onAddPoint(local.x, local.y);
+        // Recomputed from the click itself rather than reusing the last
+        // hover result, so a click always commits exactly what the snap
+        // rules say about where it actually landed.
+        const snap = snapAt(e);
+        if (snap.kind === 'close') {
+          onCloseSketch();
+          return;
+        }
+        onAddPoint(snap.point[0], snap.point[1]);
       }}
       onPointerMove={(e: ThreeEvent<PointerEvent>) => {
-        const local = toLocal(e.point);
-        onPointerMoveLocal(local.x, local.y);
+        const snap = snapAt(e);
+        onHover(snap);
+        onPointerMoveLocal(snap.point[0], snap.point[1]);
       }}
+      onPointerOut={() => onHover(null)}
     >
       <planeGeometry args={[1000, 1000]} />
       {/* Invisible material, not an invisible mesh — Object3D.visible=false
@@ -578,6 +724,100 @@ function SketchDrawingPlane({
           this needs. */}
       <meshBasicMaterial visible={false} />
     </mesh>
+  );
+}
+
+// The snap grid, rubber band from the last placed point, alignment guides
+// and the labelled marker for whatever the cursor is currently snapping to.
+// Preview-only: none of it ever reaches the committed source.
+function SketchSnapOverlay({
+  activeSketchPlane,
+  snapSettings,
+  hover,
+  lastPoint,
+  drawing,
+}: {
+  activeSketchPlane: ActiveSketchPlane;
+  snapSettings: SnapSettings;
+  hover: SnapResult | null;
+  lastPoint: Vec2 | null;
+  // The rubber band only makes sense while appending to an open profile.
+  drawing: boolean;
+}) {
+  const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
+  const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
+  const gridQuaternion = useMemo(() => quaternion.clone().multiply(GRID_TO_SKETCH_LOCAL), [quaternion]);
+  const toWorld = useCallback(
+    ([u, v]: Vec2) => new Vector3(u, v, PREVIEW_LIFT).applyQuaternion(quaternion).add(origin),
+    [quaternion, origin],
+  );
+  const gridPosition = useMemo(() => toWorld([0, 0]), [toWorld]);
+  return (
+    <>
+      {snapSettings.grid && snapSettings.gridSize > 0 && (
+        <gridHelper
+          // Keyed on spacing: GridHelper bakes its lines in at construction,
+          // so a new spacing needs a new instance, not a prop update.
+          key={snapSettings.gridSize}
+          args={[SKETCH_GRID_EXTENT, Math.round(SKETCH_GRID_EXTENT / snapSettings.gridSize), '#8a8a8a', '#d4d4d4']}
+          position={gridPosition}
+          quaternion={[gridQuaternion.x, gridQuaternion.y, gridQuaternion.z, gridQuaternion.w]}
+        />
+      )}
+      {hover && (
+        <>
+          {drawing && lastPoint && (
+            <Line
+              points={[toWorld(lastPoint), toWorld(hover.point)]}
+              color={SELECTED_MESH_COLOR}
+              lineWidth={1}
+              dashed
+              dashSize={1}
+              gapSize={0.6}
+              depthTest={false}
+              renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+            />
+          )}
+          {[hover.alignedU, hover.alignedV].map(
+            (ref, i) =>
+              ref && (
+                <Line
+                  key={i}
+                  points={[toWorld(ref), toWorld(hover.point)]}
+                  color={SNAP_MARKER_COLORS.align}
+                  lineWidth={1}
+                  dashed
+                  dashSize={0.5}
+                  gapSize={0.5}
+                  depthTest={false}
+                  renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+                />
+              ),
+          )}
+          <mesh position={toWorld(hover.point)} renderOrder={SKETCH_OVERLAY_RENDER_ORDER}>
+            <sphereGeometry args={[hover.kind === 'close' ? 1.2 : 0.6, 12, 12]} />
+            <meshBasicMaterial color={SNAP_MARKER_COLORS[hover.kind]} depthTest={false} />
+          </mesh>
+          <Html position={toWorld(hover.point)} style={{ pointerEvents: 'none' }}>
+            <div
+              data-testid="sketch-snap-label"
+              style={{
+                transform: 'translate(12px, 8px)',
+                whiteSpace: 'nowrap',
+                fontFamily: 'sans-serif',
+                fontSize: 11,
+                padding: '2px 6px',
+                borderRadius: 3,
+                color: '#fff',
+                background: SNAP_MARKER_COLORS[hover.kind],
+              }}
+            >
+              {SNAP_LABELS[hover.kind]} ({formatCoord(hover.point[0])}, {formatCoord(hover.point[1])})
+            </div>
+          </Html>
+        </>
+      )}
+    </>
   );
 }
 
@@ -593,6 +833,7 @@ function SketchPointsPreview({
   onHandleDown,
   onHandleHover,
   onHandleDelete,
+  onFirstHandleClick,
 }: {
   activeSketchPlane: ActiveSketchPlane;
   points: [number, number][];
@@ -604,6 +845,11 @@ function SketchPointsPreview({
   onHandleDown: (index: number) => void;
   onHandleHover: (index: number | null) => void;
   onHandleDelete: (index: number) => void;
+  // Set only while a new profile has 3+ points: a plain click (no drag) on
+  // the first handle closes the loop. The handle sits on top of the drawing
+  // plane and swallows clicks, so the plane's own close-the-loop snap never
+  // sees a click that lands on it — it has to be handled here.
+  onFirstHandleClick?: () => void;
 }) {
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
@@ -643,7 +889,10 @@ function SketchPointsPreview({
           onPointerOut={() => onHandleHover(null)}
           // A plain click on a handle (press + release, no drag) must not
           // fall through to the drawing plane behind it and add a point.
-          onClick={(e: ThreeEvent<MouseEvent>) => e.stopPropagation()}
+          onClick={(e: ThreeEvent<MouseEvent>) => {
+            e.stopPropagation();
+            if (i === 0) onFirstHandleClick?.();
+          }}
           onDoubleClick={(e: ThreeEvent<MouseEvent>) => {
             e.stopPropagation();
             onHandleDelete(i);
@@ -680,6 +929,8 @@ export function Viewport({
   onSketchDragStart,
   onDeleteSketchPoint,
   editingNodeIndex,
+  snapSettings,
+  onCloseSketch,
 }: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
   // render entirely when any statement is marked. Nothing stops marking more
@@ -690,6 +941,21 @@ export function Viewport({
     () => (hasRootModifier ? meshes.filter((m) => m.modifier === '!') : meshes),
     [meshes, hasRootModifier],
   );
+  // On-plane edges/vertices of what's currently visible, in the active
+  // sketch plane's local (u, v) — recomputed only when the plane, the
+  // rendered shapes or the geometry-snap toggle change, not per pointer
+  // move. The sketch being edited is left out: it's the thing being moved,
+  // so snapping a point to its own pre-edit outline would be a trap.
+  const snapGeometry = useMemo(() => {
+    if (!activeSketchPlane || !snapSettings.geometry) return EMPTY_PLANE_SNAP_GEOMETRY;
+    return extractOnPlaneGeometry(
+      visibleMeshes
+        .filter((m) => m.index !== editingNodeIndex)
+        .map((m) => ({ geometry: geometryFor(m.bytes), transform: m.transform })),
+      activeSketchPlane,
+    );
+  }, [activeSketchPlane, snapSettings.geometry, visibleMeshes, editingNodeIndex]);
+  const [snapHover, setSnapHover] = useState<SnapResult | null>(null);
   // The gizmo only ever targets one object — the most recently selected one.
   const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
@@ -796,8 +1062,22 @@ export function Viewport({
   // Leaving sketch mode mid-hover would otherwise leave a stale highlight
   // index around for the next session.
   useEffect(() => {
-    if (!activeSketchPlane) setHoveredHandle(null);
+    if (!activeSketchPlane) {
+      setHoveredHandle(null);
+      setSnapHover(null);
+    }
   }, [activeSketchPlane]);
+
+  // What the plane snaps against right now — see SketchDrawingPlane's
+  // getSnapContext. Read through refs/latest props at call time, so it's
+  // always current mid-drag.
+  const getSnapContext = useCallback(() => {
+    const dragged = draggingIndexRef.current;
+    return {
+      points: dragged === null ? sketchPoints : sketchPoints.filter((_, i) => i !== dragged),
+      allowClose: dragged === null && editingNodeIndex === null,
+    };
+  }, [sketchPoints, editingNodeIndex]);
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
@@ -857,6 +1137,20 @@ export function Viewport({
             onAddPoint={onAddSketchPoint}
             onPointerMoveLocal={handlePlanePointerMove}
             suppressClickRef={suppressSketchClickRef}
+            snapSettings={snapSettings}
+            snapGeometry={snapGeometry}
+            getSnapContext={getSnapContext}
+            onCloseSketch={onCloseSketch}
+            onHover={setSnapHover}
+          />
+        )}
+        {activeSketchPlane && (
+          <SketchSnapOverlay
+            activeSketchPlane={activeSketchPlane}
+            snapSettings={snapSettings}
+            hover={snapHover}
+            lastPoint={sketchPoints.length > 0 ? sketchPoints[sketchPoints.length - 1] : null}
+            drawing={editingNodeIndex === null && draggingIndex === null}
           />
         )}
         {activeSketchPlane && (
@@ -868,6 +1162,14 @@ export function Viewport({
             onHandleDown={handleHandleDown}
             onHandleHover={setHoveredHandle}
             onHandleDelete={onDeleteSketchPoint}
+            onFirstHandleClick={
+              editingNodeIndex === null && sketchPoints.length >= 3
+                ? () => {
+                    // The click ending a handle drag isn't a close request.
+                    if (!suppressSketchClickRef.current) onCloseSketch();
+                  }
+                : undefined
+            }
           />
         )}
         {transformTarget && !activeSketchPlane && (
