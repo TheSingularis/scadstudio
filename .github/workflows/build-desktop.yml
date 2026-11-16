@@ -3,7 +3,7 @@ name: Build Desktop Apps
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v*', 'beta-v*']
   workflow_dispatch: {}
 
 permissions:
@@ -158,10 +158,11 @@ jobs:
   # (preinstalled on GitHub-hosted runners) + the auto-provisioned
   # GITHUB_TOKEN rather than a third-party action.
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-v')
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: scadstudio-appimage
@@ -174,8 +175,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Hand-written notes in release-notes/<tag>.md win; otherwise fall back
+          # to GitHub's generated notes. See RELEASING.md.
+          NOTES="release-notes/${{ github.ref_name }}.md"
+          if [ -f "$NOTES" ]; then
+            NOTES_ARGS=(--notes-file "$NOTES")
+          else
+            NOTES_ARGS=(--generate-notes)
+          fi
           gh release create "${{ github.ref_name }}" dist/*.AppImage dist/*.exe \
             --repo "${{ github.repository }}" \
             --title "scadstudio ${{ github.ref_name }}" \
             --prerelease \
-            --generate-notes
+            "${NOTES_ARGS[@]}"

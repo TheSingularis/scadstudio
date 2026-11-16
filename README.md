@@ -2,7 +2,7 @@
 
 A visual CAD editor (Onshape-style) that reads and writes real, valid OpenSCAD (`.scad`) source code — no proprietary save format.
 
-Status: M1 (static viewer) done. See [PLAN.md](./PLAN.md) for the full architecture and milestone breakdown.
+Status: beta-v0.1.0 (see [RELEASING.md](./RELEASING.md)); earlier betas were v0.1.0-beta.1 to .7. Includes nav cube, sketch editing and draw-time snapping. M0–M7 done, M7.5 (sketch mode) in progress; see progress-dashboard.html. See [PLAN.md](./PLAN.md) for the full architecture and milestone breakdown.
 
 ## Layout
 
