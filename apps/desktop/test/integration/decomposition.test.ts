@@ -66,19 +66,19 @@ describe('decomposed render + transform matches the full OpenSCAD render (M3-M5)
     expect(b.max.slice(0, 2)).toEqual([6, 3]);
   });
 
-  it.fails(audit('H2', 'translate(v) { ... } (block body) matches real OpenSCAD'), async () => {
+  it(audit('H2', 'translate(v) { ... } (block body) matches real OpenSCAD'), async () => {
     await expectDecompositionMatches('translate([30, 0, 0]) { cube([1, 2, 3]); }');
   });
 
-  it.fails(audit('H2', 'rotate(v) { ... } (block body) matches real OpenSCAD'), async () => {
+  it(audit('H2', 'rotate(v) { ... } (block body) matches real OpenSCAD'), async () => {
     await expectDecompositionMatches('rotate([0, 0, 90]) { cube([1, 2, 3]); }');
   });
 
-  it.fails(audit('M1', 'stacked translate() translate() matches real OpenSCAD'), async () => {
+  it(audit('M1', 'stacked translate() translate() matches real OpenSCAD'), async () => {
     await expectDecompositionMatches('translate([1, 0, 0]) translate([2, 0, 0]) cube([1, 2, 3]);');
   });
 
-  it.fails(audit('M1', 'non-canonical rotate() translate() order matches real OpenSCAD'), async () => {
+  it(audit('M1', 'non-canonical rotate() translate() order matches real OpenSCAD'), async () => {
     await expectDecompositionMatches('rotate([0, 0, 90]) translate([10, 0, 0]) cube([1, 2, 3]);');
   });
 });

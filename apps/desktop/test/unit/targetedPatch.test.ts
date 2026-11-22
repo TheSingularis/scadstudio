@@ -116,7 +116,7 @@ describe('decomposeNode (M4/M5)', () => {
     expect(d).toBeNull();
   });
 
-  it.fails(audit('H2', 'translate(v) { ... } is not double-applied (block body)'), async () => {
+  it(audit('H2', 'translate(v) { ... } is not double-applied (block body)'), async () => {
     // Either the wrap is consumed (and the primitive slice excludes it), or
     // it is left in the slice and not recorded in the transform. Today it is
     // both recorded *and* left in the slice, so it renders at 2v.
@@ -129,12 +129,28 @@ describe('decomposeNode (M4/M5)', () => {
     expect(translateInSlice && translateInTransform).toBe(false);
   });
 
-  it.fails(audit('M1', 'stacked same-kind wraps compose instead of overwriting'), async () => {
-    const d = await decompose('translate([1,0,0]) translate([2,0,0]) cube(1);');
-    expect(d?.transform.translate).toEqual([3, 0, 0]);
+  it(audit('M1', 'stacked same-kind wraps are not overwritten: the inner one stays in the rendered slice'), async () => {
+    // The audit allowed folding or falling back; the fix falls back, so the
+    // user's own text is never restructured. The outer translate is the
+    // editable slot and the inner one renders baked in, so the node still
+    // sits at x=3 (decomposition.test.ts checks that against real OpenSCAD).
+    const source = 'translate([1,0,0]) translate([2,0,0]) cube(1);';
+    const { tree, node } = await nodeAt(source);
+    const d = decomposeNode(tree.rootNode, node)!;
+    expect(d.transform.translate).toEqual([1, 0, 0]);
+    expect(primitiveOnlySlice(tree.rootNode, node, source)).toBe('translate([2,0,0]) cube(1);');
   });
 
-  it.fails(audit('M2', 'color([r,g,b,a]) keeps its alpha'), async () => {
+  it(audit('M1', 'a non-canonical rotate() translate() keeps the inner translate in the slice'), async () => {
+    const source = 'rotate([0,0,90]) translate([5,0,0]) cube(1);';
+    const { tree, node } = await nodeAt(source);
+    const d = decomposeNode(tree.rootNode, node)!;
+    expect(d.transform.rotateDeg).toEqual([0, 0, 90]);
+    expect(d.transform.translate).toEqual([0, 0, 0]);
+    expect(primitiveOnlySlice(tree.rootNode, node, source)).toBe('translate([5,0,0]) cube(1);');
+  });
+
+  it(audit('M2', 'color([r,g,b,a]) keeps its alpha'), async () => {
     const d = await decompose('color([1,0,0,0.5]) cube(3);');
     expect(d?.transform.color).toHaveLength(4);
   });
@@ -221,21 +237,22 @@ describe('patchTransform round-trip (M4 gizmo commit)', () => {
     expect(second.patched).toBe(first.patched);
   });
 
-  it.fails(audit('H2', 'gizmo commit on translate(v) { ... } does not nest a second translate'), async () => {
+  it(audit('H2', 'gizmo commit on translate(v) { ... } does not nest a second translate'), async () => {
     const { patched } = await patchAndReread('translate([30,0,0]) { cube(5); }', T({ translate: [40, 0, 0] }));
     expect(patched.match(/translate/g)).toHaveLength(1);
   });
 
-  it.fails(audit('M1', 'gizmo commit on stacked translates keeps the real position'), async () => {
+  it(audit('M1', 'gizmo commit on stacked translates keeps the real position'), async () => {
     // translate([1,0,0]) translate([2,0,0]) is at x=3; committing an
-    // unchanged transform must not move it.
+    // unchanged transform must not move it, and the inner translate stays.
     const source = 'translate([1,0,0]) translate([2,0,0]) cube(1);';
     const before = await decompose(source);
-    const { reread } = await patchAndReread(source, before!.transform);
-    expect(reread?.translate).toEqual([3, 0, 0]);
+    const { patched, reread } = await patchAndReread(source, before!.transform);
+    expect(reread?.translate).toEqual([1, 0, 0]);
+    expect(patched).toMatch(/translate\(\[1, 0, 0\]\)\s+translate\(\[2,0,0\]\) cube\(1\);/);
   });
 
-  it.fails(audit('M2', 'mirroring a color([r,g,b,a]) node keeps the alpha in the file'), async () => {
+  it(audit('M2', 'mirroring a color([r,g,b,a]) node keeps the alpha in the file'), async () => {
     const source = 'color([1,0,0,0.5]) cube(3);';
     const before = await decompose(source);
     const { patched } = await patchAndReread(source, { ...before!.transform, scale: [-1, 1, 1] });
@@ -296,7 +313,7 @@ describe('parameter panel (M5)', () => {
     expect(patchArgument(source, tree, node, 5, '2')).toBe(source);
   });
 
-  it.fails(audit('H2', 'parameter panel shows the primitive args, not the brace-body translate'), async () => {
+  it(audit('H2', 'parameter panel shows the primitive args, not the brace-body translate'), async () => {
     const { tree, node } = await nodeAt('translate([30,0,0]) { cube(5); }');
     expect(primitiveArgs(tree.rootNode, node)?.callName).toBe('cube');
   });
@@ -327,7 +344,7 @@ describe('wrapInBoolean (M6)', () => {
     expect(wrapInBoolean(source, [p.graph.nodes[0]], 'intersection')).toBe(source);
   });
 
-  it.fails(audit('L1', 'trailing same-line comments stay with their statement'), async () => {
+  it(audit('L1', 'trailing same-line comments stay with their statement'), async () => {
     const src = 'cube(5); // base\nsphere(3); // tool\n';
     const p = await parseWithGraph(src);
     const out = wrapInBoolean(src, p.graph.nodes, 'difference');
@@ -411,5 +428,34 @@ describe('sketch profiles (M7.5 on-plane editing)', () => {
 
   it('formatSketchPoints rounds like formatNumber', () => {
     expect(formatSketchPoints([[0.1 + 0.2, -1.00001]])).toBe('[[0.3, -1]]');
+  });
+});
+
+describe('brace-body wraps and color alpha (audit H2 / M2 follow-ups)', () => {
+  it(audit('H2', 'a gizmo commit back to identity leaves a valid bare block'), async () => {
+    const { patched } = await patchAndReread('translate([30,0,0]) { cube(5); }', T({}));
+    expect(patched).toBe('{ cube(5); }');
+  });
+
+  it(audit('H2', 'a bare top-level block can be moved again'), async () => {
+    const { patched, reread } = await patchAndReread('{ cube(5); }', T({ translate: [1, 2, 3] }));
+    expect(patched).toBe('translate([1, 2, 3]) { cube(5); }');
+    expect(reread?.translate).toEqual([1, 2, 3]);
+  });
+
+  it(audit('H2', 'a modifier on a brace body survives a commit to identity'), async () => {
+    const { patched } = await patchAndReread('#translate([3,0,0]) { cube(5); sphere(2); }', T({}));
+    expect(patched).toBe('#union() { cube(5); sphere(2); }');
+  });
+
+  it(audit('M2', 'a color() with four components outside other wraps is read'), async () => {
+    const d = await decompose('color([0,1,0,0.25]) translate([1,0,0]) cube(1);');
+    expect(d?.transform.color).toEqual([0, 1, 0, 0.25]);
+    expect(d?.transform.translate).toEqual([1, 0, 0]);
+  });
+
+  it('a five-component vector is not mistaken for a color', async () => {
+    const d = await decompose('color([1,0,0,0.5,9]) cube(1);');
+    expect(d?.transform.color).toBeNull();
   });
 });

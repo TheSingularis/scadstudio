@@ -22,7 +22,14 @@ export function registerScadLanguage(): void {
     symbols: /[=><!~?:&|+\-*/^%]+/,
     tokenizer: {
       root: [
-        [/[#%!*](?=\s*\S)/, 'annotation'],
+        // Comments first: `/` is also in @symbols below, and Monarch takes
+        // the first rule that matches, so with comments last they were
+        // tokenized as code (QC audit M5).
+        [/\/\/.*$/, 'comment'],
+        [/\/\*/, 'comment', '@comment'],
+        // A modifier (# % ! *) only ever prefixes a module call, so require
+        // `name(` after it. Plain `a * b` or `x % 2` stays an operator.
+        [/[#%!*](?=\s*[a-zA-Z_]\w*\s*\()/, 'annotation'],
         [/\$[a-zA-Z_]\w*/, 'variable.predefined'],
         [/[a-zA-Z_]\w*(?=\s*\()/, {
           cases: {
@@ -38,8 +45,6 @@ export function registerScadLanguage(): void {
         [/[{}()[\]]/, '@brackets'],
         [/[;,]/, 'delimiter'],
         [/@symbols/, { cases: { '@operators': 'operator', '@default': '' } }],
-        [/\/\/.*$/, 'comment'],
-        [/\/\*/, 'comment', '@comment'],
         [/\s+/, 'white'],
       ],
       comment: [

@@ -35,6 +35,9 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
       static getAllWindows() {
         return [];
       }
+      static fromWebContents() {
+        return null;
+      }
       webContents = new FakeWebContents();
       loadURL() {}
       loadFile() {}

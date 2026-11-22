@@ -28,7 +28,6 @@ const CONTEXT_TYPES = new Set([
   'function_definition',
   'use_statement',
   'include_statement',
-  'comment',
 ]);
 
 export function buildSceneGraph(tree: Tree, source: string): SceneGraph {
