@@ -12,7 +12,12 @@
     "start": "electron-vite preview",
     "typecheck": "tsc --build tsconfig.json",
     "package:linux": "electron-vite build && electron-builder --linux AppImage --publish never",
-    "package:win": "electron-vite build && electron-builder --win portable --publish never"
+    "package:win": "electron-vite build && electron-builder --win portable --publish never",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:watch": "vitest",
+    "typecheck:test": "tsc -p test/tsconfig.json"
   },
   "dependencies": {
     "@holistic-stack/tree-sitter-openscad": "^0.1.0",
@@ -34,6 +39,7 @@
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
     "typescript": "^5.9.3",
-    "vite": "^7.3.6"
+    "vite": "^7.3.6",
+    "vitest": "^3.2.7"
   }
 }
