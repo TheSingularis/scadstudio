@@ -2,3 +2,6 @@ node_modules/
 apps/*/out/
 apps/*/dist/
 .tsbuild/
+apps/desktop/test-results/
+apps/desktop/playwright-report/
+apps/desktop/test/corpus/.cache/
