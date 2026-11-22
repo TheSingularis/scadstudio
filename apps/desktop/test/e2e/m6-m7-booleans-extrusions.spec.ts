@@ -91,7 +91,6 @@ test.describe('M7 extrusions', () => {
   });
 
   test(audit('L2', 'Extrude on a 3D shape does not silently produce an empty render'), async ({ scad }) => {
-    test.fail();
     await scad.load('cube(5, center=true);\n');
     await scad.clickEditorLine(1);
     const status = await scad.rendersAfter(() => scad.button('Linear Extrude').click());

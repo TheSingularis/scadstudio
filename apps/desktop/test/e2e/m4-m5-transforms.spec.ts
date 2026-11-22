@@ -40,7 +40,6 @@ test.describe('M4 translate gizmo', () => {
   });
 
   test(audit('H2', 'a gizmo edit on translate(v) { ... } does not nest a duplicate translate'), async ({ scad }) => {
-    test.fail();
     await scad.load('translate([30, 0, 0]) { cube(5, center=true); }\n');
     await scad.clickEditorLine(1);
     const x = scad.positionInputs().first();
