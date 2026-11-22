@@ -120,7 +120,7 @@
 <body>
 
 <h1>scadstudio — Milestone Progress</h1>
-<div class="subtitle">Snapshot as of 2026-10-16 (M7 complete; M7.5 in progress — draw-time snapping (grid, existing points/edges, alignment, close-the-loop) shipped on all plane kinds; nav cube and shading modes shipped with the viewport now Z-up like OpenSCAD; on-plane editing of an already-placed sketch shipped via "Edit Sketch"). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section — M7.5 (sketch mode) sits between M7 and M8, kept as a ".5" rather than renumbering M8-M14 again. Progress bar counts M0-M11, M7.5, M13 and M15 (v1 scope as of 2026-10-16); M12 is post-v1 and M14 is a stretch goal, so neither is counted.</div>
+<div class="subtitle">Snapshot as of 2026-11-22 (M0–M7.5 complete. M7.5 finished with Rectangle/Circle/3-point Arc tools, several loops per sketch (inner loops become holes) and Offset; before that, draw-time snapping, the nav cube with shading modes and a Z-up viewport, and on-plane "Edit Sketch". Next: M8). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section — M7.5 (sketch mode) sits between M7 and M8, kept as a ".5" rather than renumbering M8-M14 again. Progress bar counts M0-M11, M7.5, M13 and M15 (v1 scope as of 2026-10-16); M12 is post-v1 and M14 is a stretch goal, so neither is counted.</div>
 
 <div class="legend">
   <div>
@@ -281,8 +281,8 @@
 <details class="phase">
   <summary class="phase-header">
     <span class="chevron">▶</span>
-    <span class="name">M7.5 — Sketch mode <span class="tag">plane picking, line/point sketching, on-plane editing, nav-cube camera</span></span>
-    <span class="badge in_progress">in progress</span>
+    <span class="name">M7.5 — Sketch mode <span class="tag">plane picking, line/arc/rectangle/circle sketching, multi-loop sketches, on-plane editing, nav-cube camera</span></span>
+    <span class="badge completed">completed</span>
   </summary>
   <div class="subtasks">
     <div class="subtask"><span class="name">Slice 1: global plane picker (XY/XZ/YZ) + camera mode that animates to a straight-on view and locks rotation (pan/zoom still work); "Exit Sketch" returns to normal free-orbit</span><span class="badge completed">completed</span></div>
@@ -310,7 +310,10 @@
     <div class="subtask"><span class="name">Face-picked planes now use the world origin's projection onto the face as their origin (emits e.g. translate([0, 15, 0]) instead of an arbitrary raycast hit point), so grid snapping on a face lands on the same round world coordinates as on a global plane</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Found + fixed: after any sketch session every shape stayed unclickable until restart (no selection, no Pick Face) — r3f doesn't restore a mesh's default raycast when the no-op override is cleared; now restores Mesh.prototype.raycast explicitly</span><span class="badge completed">completed</span></div>
     <div class="subtask"><span class="name">Verified end-to-end in the real Electron app on XY, XZ, YZ and a picked face: every snap kind reports the right coordinates, and the committed polygon() (and the face sketch's extrude) match the snapped points exactly</span><span class="badge completed">completed</span></div>
-    <div class="subtask"><span class="name">Orientation nav-cube + shading-mode dropdown (decoupled from the rest of M7.5 — works against the existing free-orbit camera, could ship standalone)</span><span class="badge pending">pending</span></div>
+    <div class="subtask"><span class="name">Richer sketch tools: tool row with Line, 3-point Arc, Rectangle, Circle (16/32/64 segments) and Edit Points; live dashed preview built by the same functions as the commit</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Several loops per sketch: closing a loop keeps the session open; Finish writes one polygon(points, paths), so inner loops become holes. Edit Sketch reads paths= back and can add loops; the session's closed loops are snap targets</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Offset: wraps a bare sketch in offset(r=1); the sketch stays editable under it (and under an extrude around it)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Verified in the real Electron app with real mouse input: rectangle + circle hole extruded, edit/drag/save byte-minimal, line + arc closed loop, Offset, XZ rectangle extrude, Undo of a pending click (11/11)</span><span class="badge completed">completed</span></div>
   </div>
 </details>
 
