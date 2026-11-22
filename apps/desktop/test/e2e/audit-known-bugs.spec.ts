@@ -96,12 +96,16 @@ test(audit('M3', 'a toolbar edit right after typing (inside the debounce) does n
   await scad.load('cube(10, center=true);\n');
   await scad.clickViewport();
   expect(await scad.selectedCall()).toBe('cube');
-  // Type at the very start (shifting every byte offset), then immediately
-  // use a toolbar action that patches the selected node by offset.
+  // Insert text at the very start (shifting every byte offset) as a single
+  // input event, then at once use a toolbar action that patches the
+  // selected node by offset, well inside the 400 ms re-parse debounce even
+  // on a slow CI runner.
   await scad.page.locator('.monaco-editor .view-lines').click();
   await scad.page.keyboard.press('Control+Home');
-  await scad.page.keyboard.type('a = 1;\n');
-  await scad.button('Mirror X').click();
+  const mirror = scad.button('Mirror X');
+  await mirror.waitFor();
+  await scad.page.keyboard.insertText('a = 1;\n');
+  await mirror.click({ noWaitAfter: true });
   await scad.page.waitForTimeout(1500);
   await expect.poll(() => scad.status()).toMatch(/Rendered/);
   expect(await scad.source()).toBe('a = 1;\nmirror([1, 0, 0])\n    cube(10, center=true);\n');
