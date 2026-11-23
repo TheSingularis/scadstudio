@@ -18,3 +18,7 @@ xvfb-run -a npx electron --no-sandbox apps/desktop/out/main/index.js
 ```
 
 Software WebGL (`--use-gl=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist`) is needed on top of that if there's no real GPU available to the container.
+
+## License
+
+ScadStudio is licensed under the GNU General Public License, version 3 or (at your option) any later version (GPL-3.0-or-later); see [LICENSE](LICENSE). The app bundles the OpenSCAD engine (openscad-wasm, GPL), whose WebAssembly build includes GPLv3+ components such as CGAL, so distributed builds are covered by GPLv3 terms.

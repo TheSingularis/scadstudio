@@ -254,7 +254,7 @@ Fixed by the 2026-11-22 QC fix PR, listed so the history is clear: renders now p
 4. **Structural-edit codegen correctness** — brace-insertion/indentation-inference for wrap-in-boolean and insert-at-selection is inherently more failure-prone than simple value replacement; needs solid property-based round-trip tests in `scad-codegen`.
 5. **Node-identity heuristic isn't provable** — pathological edits (duplicate/reordered identical statements) could cause a selection/gizmo to "jump" to the wrong node; mitigate with a visible confirm-flash on the still-selected node after any external text edit, rather than assuming the fingerprint heuristic is perfect.
 6. **`include`-sourced modules for the toolbar** — since `include` executes side effects, aggressively toolbar-ifying modules pulled in via `include` (vs. `use`) risks surfacing modules whose behavior implicitly depends on including-file state; document as a v1 limitation, recommend `use` for tool libraries.
-7. **GPL licensing** — OpenSCAD is GPLv2+, and its WASM build inherits that; bundling it inside the Electron app has real distribution/compliance implications that are a licensing/business decision, not a technical one — needs sign-off before shipping, independent of the technical plan.
+7. **GPL licensing** — OpenSCAD is GPLv2+, and its WASM build inherits that; bundling it inside the Electron app has real distribution/compliance implications that are a licensing/business decision, not a technical one — needs sign-off before shipping, independent of the technical plan. **Decided 2026-11-22: GPL-3.0-or-later** (LICENSE in the repo root). The WASM build includes GPLv3+ CGAL, so GPLv3 is the license that fits what ships.
 
 ## M0 spike results (2026-09-02)
 
