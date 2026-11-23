@@ -42,6 +42,8 @@ import {
   type SnapSettings,
   type Vec2,
 } from '../sketchSnap';
+import type { SketchHandle, SketchState } from '../sketchEditing';
+import { toolPreview, type SketchTool } from '../sketchShapes';
 import { NavCube, NAMED_VIEWS, NAV_CUBE_MARGIN_PX, type CameraView, type Vec3 } from './NavCube';
 
 // Parsed once per STL buffer and shared between NodeModel (drawing it) and
@@ -139,30 +141,43 @@ interface ViewportProps {
   // Mutually exclusive with activeSketchPlane being non-null (never both).
   pickingFace: boolean;
   onPickFace: (point: [number, number, number], rotationDeg: [number, number, number], normal: [number, number, number]) => void;
-  // M7.5 slice 2: sketch-local (u,v) points placed so far this session —
-  // App.tsx owns the array (cleared on entering/finishing/exiting a sketch),
-  // Viewport just renders it (SketchPointsPreview) and appends to it
-  // (SketchDrawingPlane's onAddPoint, wired to onAddSketchPoint below).
-  sketchPoints: [number, number][];
-  onAddSketchPoint: (u: number, v: number) => void;
+  // M7.5: the sketch session's loops and open polyline, in sketch-local
+  // (u,v) — App.tsx owns it (cleared on entering/finishing/exiting a
+  // sketch), Viewport renders it (SketchPointsPreview) and reports clicks on
+  // the plane (SketchDrawingPlane → onSketchClick), already snapped. What a
+  // click *does* depends on the active tool, which App.tsx decides; the
+  // snap kind is passed along so a 'close' snap can close the open loop.
+  sketch: SketchState;
+  onSketchClick: (u: number, v: number, kind: SnapKind) => void;
+  // M7.5 richer sketch tools: the active tool, the clicks it has collected
+  // so far (a rectangle's first corner, a circle's center, an arc's end
+  // point) and the segment count for circles/arcs — only for the live
+  // preview; the shapes are built in App.tsx from the same functions.
+  sketchTool: SketchTool;
+  toolAnchors: [number, number][];
+  curveSegments: number;
+  // A plain click (no drag) on a handle. The handle sits on top of the
+  // plane and swallows the click, so the plane never sees it; App.tsx
+  // treats it as a click exactly on that point (closing the loop when it's
+  // the open polyline's first point).
+  onHandleClick: (handle: SketchHandle) => void;
   // M7.5 on-plane editing. Every placed point is a draggable handle while
   // sketching (drawing a new profile or editing a committed one): a drag
   // calls onSketchDragStart once on its first movement (App.tsx snapshots
-  // the points for Undo there) and onMoveSketchPoint on every move after,
-  // with the new sketch-local (u, v). Double-clicking a handle deletes it.
-  onMoveSketchPoint: (index: number, u: number, v: number) => void;
+  // the sketch for Undo there) and onMoveSketchPoint on every move after,
+  // with the new sketch-local (u, v). Double-clicking a handle (with the
+  // Edit Points tool) deletes it; Shift+double-click deletes its whole loop.
+  onMoveSketchPoint: (handle: SketchHandle, u: number, v: number) => void;
   onSketchDragStart: () => void;
-  onDeleteSketchPoint: (index: number) => void;
+  onDeleteSketchPoint: (handle: SketchHandle, wholeLoop: boolean) => void;
   // Non-null while editing an already-committed sketch ("Edit Sketch"): that
   // node's mesh is drawn as a translucent, unclickable reference of its
   // pre-edit shape, and the preview draws the profile as a closed loop (it's
   // a finished polygon, not an in-progress polyline).
   editingNodeIndex: number | null;
   // M7.5 snap-while-drawing: which snap sources are on (App.tsx's sketch
-  // toolbar owns them), and what clicking the first point once a loop is
-  // possible does — the same thing as App.tsx's "Finish Sketch".
+  // toolbar owns them).
   snapSettings: SnapSettings;
-  onCloseSketch: () => void;
 }
 
 type SelectionRole = 'none' | 'base' | 'operand';
@@ -645,13 +660,11 @@ function SketchDrawingPlane({
   onPointerMoveLocal,
   suppressClickRef,
   snapSettings,
-  snapGeometry,
   getSnapContext,
-  onCloseSketch,
   onHover,
 }: {
   activeSketchPlane: ActiveSketchPlane;
-  onAddPoint: (u: number, v: number) => void;
+  onAddPoint: (u: number, v: number, kind: SnapKind) => void;
   // M7.5 on-plane editing: every pointer move over the plane, already
   // converted to sketch-local (u,v) — Viewport uses it to drive a handle
   // drag. The plane (not the handle itself) is the move target on purpose:
@@ -665,13 +678,13 @@ function SketchDrawingPlane({
   // M7.5 snap-while-drawing (sketchSnap.ts). Points handed to onAddPoint /
   // onPointerMoveLocal are already snapped; the raw cursor is never exposed.
   snapSettings: SnapSettings;
-  snapGeometry: PlaneSnapGeometry;
-  // The points to snap against right now, and whether clicking the first one
-  // closes the loop: while dragging, the dragged point itself is excluded
-  // (it would snap to its own old position); while editing a closed profile
-  // there is no loop left to close.
-  getSnapContext: () => { points: Vec2[]; allowClose: boolean };
-  onCloseSketch: () => void;
+  // What to snap against right now: the points used for alignment guides
+  // (the open polyline first, so its first point is the close target), the
+  // on-plane geometry (existing shapes plus this session's closed loops),
+  // and whether clicking the first point closes the loop. While dragging,
+  // the dragged point's own loop is left out of the geometry (it would snap
+  // to its own old position).
+  getSnapContext: () => { points: Vec2[]; geometry: PlaneSnapGeometry; allowClose: boolean };
   onHover: (snap: SnapResult | null) => void;
 }) {
   const camera = useThree((state) => state.camera);
@@ -694,8 +707,8 @@ function SketchDrawingPlane({
     const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
     const depth = camera.position.distanceTo(e.point);
     const unitsPerPx = (2 * depth * Math.tan((fov * Math.PI) / 360)) / (camera.zoom * viewportHeightPx);
-    const { points, allowClose } = getSnapContext();
-    return snapSketchPoint(raw, points, snapGeometry, snapSettings, SNAP_RADIUS_PX * unitsPerPx, allowClose);
+    const { points, geometry, allowClose } = getSnapContext();
+    return snapSketchPoint(raw, points, geometry, snapSettings, SNAP_RADIUS_PX * unitsPerPx, allowClose);
   };
   return (
     <mesh
@@ -708,11 +721,7 @@ function SketchDrawingPlane({
         // hover result, so a click always commits exactly what the snap
         // rules say about where it actually landed.
         const snap = snapAt(e);
-        if (snap.kind === 'close') {
-          onCloseSketch();
-          return;
-        }
-        onAddPoint(snap.point[0], snap.point[1]);
+        onAddPoint(snap.point[0], snap.point[1], snap.kind);
       }}
       onPointerMove={(e: ThreeEvent<PointerEvent>) => {
         const snap = snapAt(e);
@@ -740,13 +749,20 @@ function SketchSnapOverlay({
   hover,
   lastPoint,
   drawing,
+  tool,
+  anchors,
+  curveSegments,
 }: {
   activeSketchPlane: ActiveSketchPlane;
   snapSettings: SnapSettings;
   hover: SnapResult | null;
   lastPoint: Vec2 | null;
-  // The rubber band only makes sense while appending to an open profile.
+  // The straight rubber band only makes sense while the Line tool (or the
+  // Arc tool, before its end point) is appending to an open profile.
   drawing: boolean;
+  tool: SketchTool;
+  anchors: Vec2[];
+  curveSegments: number;
 }) {
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
@@ -756,6 +772,9 @@ function SketchSnapOverlay({
     [quaternion, origin],
   );
   const gridPosition = useMemo(() => toWorld([0, 0]), [toWorld]);
+  // What the active tool would add if the next click landed under the
+  // cursor — built by the same sketchShapes.ts functions the commit uses.
+  const preview = hover ? toolPreview(tool, anchors, lastPoint, hover.point, curveSegments) : null;
   return (
     <>
       {snapSettings.grid && snapSettings.gridSize > 0 && (
@@ -766,6 +785,24 @@ function SketchSnapOverlay({
           args={[SKETCH_GRID_EXTENT, Math.round(SKETCH_GRID_EXTENT / snapSettings.gridSize), '#8a8a8a', '#d4d4d4']}
           position={gridPosition}
           quaternion={[gridQuaternion.x, gridQuaternion.y, gridQuaternion.z, gridQuaternion.w]}
+        />
+      )}
+      {anchors.map((a, i) => (
+        <mesh key={`anchor-${i}`} position={toWorld(a)} renderOrder={SKETCH_OVERLAY_RENDER_ORDER}>
+          <sphereGeometry args={[0.6, 12, 12]} />
+          <meshBasicMaterial color={SELECTED_MESH_COLOR} depthTest={false} />
+        </mesh>
+      ))}
+      {preview && preview.points.length > 1 && (
+        <Line
+          points={(preview.closed ? [...preview.points, preview.points[0]] : preview.points).map(toWorld)}
+          color={SELECTED_MESH_COLOR}
+          lineWidth={1.5}
+          dashed
+          dashSize={1}
+          gapSize={0.6}
+          depthTest={false}
+          renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
         />
       )}
       {hover && (
@@ -825,87 +862,95 @@ function SketchSnapOverlay({
   );
 }
 
-// In-progress sketch points/edges, rendered live as they're placed — an open
-// polyline (not yet closed into the final polygon(), which only happens on
-// "Finish Sketch"). Same outside-<Bounds> reasoning as the drawing plane:
-// this is drawing-session UI, not modeled content.
+// The session's sketch geometry, rendered live: every closed loop, plus the
+// open polyline the Line/Arc tools are appending to (not closed until its
+// first point is clicked, or Finish/Save). Same outside-<Bounds> reasoning
+// as the drawing plane: this is drawing-session UI, not modeled content.
 function SketchPointsPreview({
   activeSketchPlane,
-  points,
-  closed,
-  activeIndex,
+  sketch,
+  activeHandle,
   onHandleDown,
   onHandleHover,
   onHandleDelete,
-  onFirstHandleClick,
+  onHandleClick,
 }: {
   activeSketchPlane: ActiveSketchPlane;
-  points: [number, number][];
-  // Editing a committed polygon draws the closing edge too; drawing a new
-  // one doesn't (it isn't closed until Finish Sketch).
-  closed: boolean;
+  sketch: SketchState;
   // Hovered or currently-dragged handle, highlighted.
-  activeIndex: number | null;
-  onHandleDown: (index: number) => void;
-  onHandleHover: (index: number | null) => void;
-  onHandleDelete: (index: number) => void;
-  // Set only while a new profile has 3+ points: a plain click (no drag) on
-  // the first handle closes the loop. The handle sits on top of the drawing
-  // plane and swallows clicks, so the plane's own close-the-loop snap never
-  // sees a click that lands on it — it has to be handled here.
-  onFirstHandleClick?: () => void;
+  activeHandle: SketchHandle | null;
+  onHandleDown: (handle: SketchHandle) => void;
+  onHandleHover: (handle: SketchHandle | null) => void;
+  onHandleDelete: (handle: SketchHandle, wholeLoop: boolean) => void;
+  // A plain click (no drag) on a handle — see ViewportProps.onHandleClick.
+  onHandleClick: (handle: SketchHandle) => void;
 }) {
   const quaternion = useMemo(() => transformToQuaternion(activeSketchPlane.rotationDeg), [activeSketchPlane.rotationDeg]);
   const origin = useMemo(() => new Vector3(...activeSketchPlane.origin), [activeSketchPlane.origin]);
-  const worldPoints = useMemo(
-    () => points.map(([u, v]) => new Vector3(u, v, 0).applyQuaternion(quaternion).add(origin)),
-    [points, quaternion, origin],
-  );
-  if (worldPoints.length === 0) return null;
-  const linePoints = closed && worldPoints.length > 2 ? [...worldPoints, worldPoints[0]] : worldPoints;
+  const loops = useMemo(() => {
+    const toWorld = ([u, v]: [number, number]) => new Vector3(u, v, 0).applyQuaternion(quaternion).add(origin);
+    return [
+      ...sketch.profiles.map((points, profile) => ({ profile, closed: true, world: points.map(toWorld) })),
+      { profile: -1, closed: false, world: sketch.open.map(toWorld) },
+    ];
+  }, [sketch, quaternion, origin]);
   return (
     <>
-      {/* depthTest off + a late renderOrder: the sketch overlay always draws on
-          top, so a handle sitting behind other geometry from the camera's
-          angle (very common for a face-picked plane — neighboring solids
-          stick out toward the camera) stays visible and grabbable. Hit-
-          testing already ignores those solids while sketching (sketchActive). */}
-      {linePoints.length > 1 && (
-        <Line points={linePoints} color={SELECTED_MESH_COLOR} lineWidth={2} depthTest={false} renderOrder={SKETCH_OVERLAY_RENDER_ORDER} />
-      )}
-      {worldPoints.map((p, i) => (
-        <mesh
-          key={i}
-          position={p}
-          renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
-          onPointerDown={(e: ThreeEvent<PointerEvent>) => {
-            if (e.button !== 0) return;
-            e.stopPropagation();
-            onHandleDown(i);
-          }}
-          // No stopPropagation here, unlike the other handlers: r3f
-          // remembers a stopped pointerover and keeps stopping every later
-          // pointermove while the cursor stays over this handle — which
-          // starves the drawing plane behind it of exactly the moves that
-          // drive a drag (the handle follows the cursor, so the cursor is
-          // over it for most of the drag).
-          onPointerOver={() => onHandleHover(i)}
-          onPointerOut={() => onHandleHover(null)}
-          // A plain click on a handle (press + release, no drag) must not
-          // fall through to the drawing plane behind it and add a point.
-          onClick={(e: ThreeEvent<MouseEvent>) => {
-            e.stopPropagation();
-            if (i === 0) onFirstHandleClick?.();
-          }}
-          onDoubleClick={(e: ThreeEvent<MouseEvent>) => {
-            e.stopPropagation();
-            onHandleDelete(i);
-          }}
-        >
-          <sphereGeometry args={[activeIndex === i ? 1.1 : 0.8, 12, 12]} />
-          <meshBasicMaterial color={activeIndex === i ? SKETCH_HANDLE_ACTIVE_COLOR : SELECTED_MESH_COLOR} depthTest={false} />
-        </mesh>
-      ))}
+      {loops.map(({ profile, closed, world }) => {
+        if (world.length === 0) return null;
+        const linePoints = closed && world.length > 2 ? [...world, world[0]] : world;
+        return (
+          <group key={profile}>
+            {/* depthTest off + a late renderOrder: the sketch overlay always draws on
+                top, so a handle sitting behind other geometry from the camera's
+                angle (very common for a face-picked plane — neighboring solids
+                stick out toward the camera) stays visible and grabbable. Hit-
+                testing already ignores those solids while sketching (sketchActive). */}
+            {linePoints.length > 1 && (
+              <Line points={linePoints} color={SELECTED_MESH_COLOR} lineWidth={2} depthTest={false} renderOrder={SKETCH_OVERLAY_RENDER_ORDER} />
+            )}
+            {world.map((p, i) => {
+              const handle: SketchHandle = { profile, point: i };
+              const active = activeHandle !== null && activeHandle.profile === profile && activeHandle.point === i;
+              return (
+                <mesh
+                  key={i}
+                  position={p}
+                  renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+                  onPointerDown={(e: ThreeEvent<PointerEvent>) => {
+                    if (e.button !== 0) return;
+                    e.stopPropagation();
+                    onHandleDown(handle);
+                  }}
+                  // No stopPropagation here, unlike the other handlers: r3f
+                  // remembers a stopped pointerover and keeps stopping every later
+                  // pointermove while the cursor stays over this handle — which
+                  // starves the drawing plane behind it of exactly the moves that
+                  // drive a drag (the handle follows the cursor, so the cursor is
+                  // over it for most of the drag).
+                  onPointerOver={() => onHandleHover(handle)}
+                  onPointerOut={() => onHandleHover(null)}
+                  // A plain click on a handle (press + release, no drag) must not
+                  // fall through to the drawing plane behind it and add a point.
+                  onClick={(e: ThreeEvent<MouseEvent>) => {
+                    e.stopPropagation();
+                    onHandleClick(handle);
+                  }}
+                  onDoubleClick={(e: ThreeEvent<MouseEvent>) => {
+                    e.stopPropagation();
+                    onHandleDelete(handle, e.nativeEvent.shiftKey);
+                  }}
+                >
+                  {/* Circles and arcs put many points close together; their
+                      handles are drawn smaller so the outline stays readable. */}
+                  <sphereGeometry args={[active ? 1.1 : world.length > 12 ? 0.5 : 0.8, 12, 12]} />
+                  <meshBasicMaterial color={active ? SKETCH_HANDLE_ACTIVE_COLOR : SELECTED_MESH_COLOR} depthTest={false} />
+                </mesh>
+              );
+            })}
+          </group>
+        );
+      })}
     </>
   );
 }
@@ -927,14 +972,17 @@ export function Viewport({
   activeSketchPlane,
   pickingFace,
   onPickFace,
-  sketchPoints,
-  onAddSketchPoint,
+  sketch,
+  onSketchClick,
+  sketchTool,
+  toolAnchors,
+  curveSegments,
+  onHandleClick,
   onMoveSketchPoint,
   onSketchDragStart,
   onDeleteSketchPoint,
   editingNodeIndex,
   snapSettings,
-  onCloseSketch,
 }: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
   // render entirely when any statement is marked. Nothing stops marking more
@@ -1013,16 +1061,16 @@ export function Viewport({
   // M7.5 on-plane editing: handle drag state. The ref is what the move/up
   // handlers read (always current, no stale closure mid-drag); the state
   // copy only exists to re-render the highlight.
-  const draggingIndexRef = useRef<number | null>(null);
+  const draggingHandleRef = useRef<SketchHandle | null>(null);
   const dragMovedRef = useRef(false);
   const suppressSketchClickRef = useRef(false);
-  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
-  const [hoveredHandle, setHoveredHandle] = useState<number | null>(null);
+  const [draggingHandle, setDraggingHandle] = useState<SketchHandle | null>(null);
+  const [hoveredHandle, setHoveredHandle] = useState<SketchHandle | null>(null);
 
-  const handleHandleDown = useCallback((index: number) => {
-    draggingIndexRef.current = index;
+  const handleHandleDown = useCallback((handle: SketchHandle) => {
+    draggingHandleRef.current = handle;
     dragMovedRef.current = false;
-    setDraggingIndex(index);
+    setDraggingHandle(handle);
     // Pan/zoom stay off for the drag's duration so the view can't shift
     // under the point being placed.
     if (orbitControlsRef.current) orbitControlsRef.current.enabled = false;
@@ -1030,13 +1078,13 @@ export function Viewport({
 
   const handlePlanePointerMove = useCallback(
     (u: number, v: number) => {
-      const index = draggingIndexRef.current;
-      if (index === null) return;
+      const handle = draggingHandleRef.current;
+      if (handle === null) return;
       if (!dragMovedRef.current) {
         dragMovedRef.current = true;
         onSketchDragStart();
       }
-      onMoveSketchPoint(index, u, v);
+      onMoveSketchPoint(handle, u, v);
     },
     [onMoveSketchPoint, onSketchDragStart],
   );
@@ -1045,9 +1093,9 @@ export function Viewport({
   // (off the handle, outside the canvas) by the time the button comes up.
   useEffect(() => {
     const onPointerUp = () => {
-      if (draggingIndexRef.current === null) return;
-      draggingIndexRef.current = null;
-      setDraggingIndex(null);
+      if (draggingHandleRef.current === null) return;
+      draggingHandleRef.current = null;
+      setDraggingHandle(null);
       if (orbitControlsRef.current) orbitControlsRef.current.enabled = true;
       if (dragMovedRef.current) {
         // Same deferred-flag trick as isTransformingRef above: the native
@@ -1075,13 +1123,40 @@ export function Viewport({
   // What the plane snaps against right now — see SketchDrawingPlane's
   // getSnapContext. Read through refs/latest props at call time, so it's
   // always current mid-drag.
+  //
+  // This session's closed loops snap like existing geometry (vertices,
+  // midpoints, edges), so a second profile can share a corner or an edge
+  // with the first. The open polyline's own points stay alignment-only, as
+  // before: landing exactly on one would just add a self-touching vertex.
+  const draggingProfile = draggingHandle?.profile ?? null;
+  const combinedSnapGeometry = useMemo((): PlaneSnapGeometry => {
+    if (!snapSettings.geometry) return EMPTY_PLANE_SNAP_GEOMETRY;
+    const points = [...snapGeometry.points];
+    const segments = [...snapGeometry.segments];
+    sketch.profiles.forEach((loop, li) => {
+      if (li === draggingProfile) return;
+      loop.forEach((p, i) => {
+        points.push(p);
+        segments.push({ a: p, b: loop[(i + 1) % loop.length] });
+      });
+    });
+    return { points, segments };
+  }, [snapGeometry, sketch.profiles, draggingProfile, snapSettings.geometry]);
   const getSnapContext = useCallback(() => {
-    const dragged = draggingIndexRef.current;
+    const dragged = draggingHandleRef.current;
+    if (dragged !== null) {
+      // The dragged point's own loop (minus the point itself) still gives
+      // alignment guides, so a rectangle corner can be dragged square.
+      const own = dragged.profile === -1 ? sketch.open : (sketch.profiles[dragged.profile] ?? []);
+      return { points: own.filter((_, i) => i !== dragged.point), geometry: combinedSnapGeometry, allowClose: false };
+    }
+    const lineLike = sketchTool === 'line' || (sketchTool === 'arc' && toolAnchors.length === 0);
     return {
-      points: dragged === null ? sketchPoints : sketchPoints.filter((_, i) => i !== dragged),
-      allowClose: dragged === null && editingNodeIndex === null,
+      points: [...sketch.open, ...toolAnchors],
+      geometry: combinedSnapGeometry,
+      allowClose: lineLike && toolAnchors.length === 0,
     };
-  }, [sketchPoints, editingNodeIndex]);
+  }, [sketch, combinedSnapGeometry, sketchTool, toolAnchors]);
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
@@ -1138,13 +1213,11 @@ export function Viewport({
         {activeSketchPlane && (
           <SketchDrawingPlane
             activeSketchPlane={activeSketchPlane}
-            onAddPoint={onAddSketchPoint}
+            onAddPoint={onSketchClick}
             onPointerMoveLocal={handlePlanePointerMove}
             suppressClickRef={suppressSketchClickRef}
             snapSettings={snapSettings}
-            snapGeometry={snapGeometry}
             getSnapContext={getSnapContext}
-            onCloseSketch={onCloseSketch}
             onHover={setSnapHover}
           />
         )}
@@ -1153,27 +1226,25 @@ export function Viewport({
             activeSketchPlane={activeSketchPlane}
             snapSettings={snapSettings}
             hover={snapHover}
-            lastPoint={sketchPoints.length > 0 ? sketchPoints[sketchPoints.length - 1] : null}
-            drawing={editingNodeIndex === null && draggingIndex === null}
+            lastPoint={sketch.open.length > 0 ? sketch.open[sketch.open.length - 1] : null}
+            drawing={draggingHandle === null && (sketchTool === 'line' || (sketchTool === 'arc' && toolAnchors.length === 0))}
+            tool={sketchTool}
+            anchors={toolAnchors}
+            curveSegments={curveSegments}
           />
         )}
         {activeSketchPlane && (
           <SketchPointsPreview
             activeSketchPlane={activeSketchPlane}
-            points={sketchPoints}
-            closed={editingNodeIndex !== null}
-            activeIndex={draggingIndex ?? hoveredHandle}
+            sketch={sketch}
+            activeHandle={draggingHandle ?? hoveredHandle}
             onHandleDown={handleHandleDown}
             onHandleHover={setHoveredHandle}
             onHandleDelete={onDeleteSketchPoint}
-            onFirstHandleClick={
-              editingNodeIndex === null && sketchPoints.length >= 3
-                ? () => {
-                    // The click ending a handle drag isn't a close request.
-                    if (!suppressSketchClickRef.current) onCloseSketch();
-                  }
-                : undefined
-            }
+            onHandleClick={(handle) => {
+              // The click ending a handle drag isn't a click on the point.
+              if (!suppressSketchClickRef.current) onHandleClick(handle);
+            }}
           />
         )}
         {transformTarget && !activeSketchPlane && (

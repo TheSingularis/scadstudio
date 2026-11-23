@@ -1,4 +1,5 @@
-import { formatNumber, formatSketchPoints } from './targetedPatch';
+import { formatNumber, formatSketchPolygonArgs } from './targetedPatch';
+import type { SketchPoint } from './sketchEditing';
 
 // M5 toolbar primitive insertion. Deliberately minimal codegen: append a new
 // statement with sensible defaults at the end of the document. Insertion at
@@ -46,9 +47,12 @@ export function appendSketchPolygon(
   source: string,
   origin: [number, number, number],
   rotationDeg: [number, number, number],
-  points: [number, number][],
+  loops: SketchPoint[][],
 ): string {
-  let statement = `polygon(points=${formatSketchPoints(points)});`;
+  // One loop writes the plain polygon(points=[...]) it always has; several
+  // add paths=, which OpenSCAD fills even-odd (a loop inside another is a
+  // hole). See profilesToPolygon.
+  let statement = `polygon(${formatSketchPolygonArgs(loops)});`;
   if (rotationDeg.some((v) => v !== 0)) {
     statement = `rotate([${rotationDeg.map(formatNumber).join(', ')}]) ${statement}`;
   }

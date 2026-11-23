@@ -40,7 +40,23 @@ import {
 } from './targetedPatch';
 import { appendPrimitive, appendSketchPolygon, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
-import { insertIntoNearestEdge, type SketchPoint } from './sketchEditing';
+import {
+  EMPTY_SKETCH,
+  addProfile,
+  allSketchPoints,
+  appendToOpen,
+  closeOpen,
+  committableProfiles,
+  deleteSketchPoint,
+  insertIntoNearestEdge,
+  moveSketchPoint,
+  sketchPointAt,
+  type SketchHandle,
+  type SketchPoint,
+  type SketchState,
+} from './sketchEditing';
+import { arcPoints, circlePoints, rectanglePoints, type SketchTool } from './sketchShapes';
+import type { SnapKind } from './sketchSnap';
 
 const PRIMITIVE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
   { kind: 'cube', label: 'Cube' },
@@ -70,6 +86,35 @@ const SKETCH_PLANE_BUTTONS: { plane: 'XY' | 'XZ' | 'YZ'; label: string }[] = [
 
 // Grid snap spacings offered in the sketch toolbar, in model units.
 const SNAP_GRID_SIZES = [0.5, 1, 2, 5, 10];
+
+// M7.5 richer sketch tools. The hint is shown next to the buttons and says
+// what the next click does, which changes as a tool collects its clicks.
+const SKETCH_TOOL_BUTTONS: { tool: SketchTool; label: string }[] = [
+  { tool: 'line', label: 'Line' },
+  { tool: 'arc', label: 'Arc' },
+  { tool: 'rect', label: 'Rectangle' },
+  { tool: 'circle', label: 'Circle' },
+  { tool: 'edit', label: 'Edit Points' },
+];
+
+// Segments for a full circle; an arc gets the same density for its sweep.
+const CURVE_SEGMENT_OPTIONS = [16, 32, 64];
+
+function sketchToolHint(tool: SketchTool, anchors: number, openPoints: number): string {
+  switch (tool) {
+    case 'line':
+      return openPoints >= 3 ? 'click to add a point, click the first point to close the loop' : 'click to add points';
+    case 'arc':
+      if (openPoints === 0) return 'click the arc start';
+      return anchors === 0 ? 'click the arc end' : 'click a point the arc passes through';
+    case 'rect':
+      return anchors === 0 ? 'click the first corner' : 'click the opposite corner';
+    case 'circle':
+      return anchors === 0 ? 'click the center' : 'click a point on the circle';
+    case 'edit':
+      return 'click near an edge to add a point, double-click a point to delete it (Shift: its whole loop)';
+  }
+}
 
 function sketchPlaneLabel(kind: SketchPlaneKind, editing: boolean): string {
   if (editing) return kind === 'face' ? 'Editing sketch on its own plane' : `Editing sketch on ${kind} plane`;
@@ -188,22 +233,31 @@ export function App() {
   // M7.5 slice 3: true only during the brief "waiting for a face click"
   // window between clicking "Pick Face" and actually clicking one.
   const [pickingFace, setPickingFace] = useState(false);
-  // M7.5 slice 2: sketch-local (u,v) points placed so far — cleared whenever
-  // a sketch starts, finishes, or is exited/cancelled, never partially
-  // carried over between sessions.
-  const [sketchPoints, setSketchPoints] = useState<SketchPoint[]>([]);
-  // M7.5 on-plane editing: synchronous mirror of sketchPoints, so a burst of
-  // drag moves landing between two renders each build on the latest points
-  // rather than a stale closure's copy. Only ever written through
-  // setSketchPointsTracked/resetSketch below, which keep the two in step.
+  // M7.5: the sketch session's closed loops and open polyline, sketch-local
+  // (u,v) — cleared whenever a sketch starts, finishes, or is exited/
+  // cancelled, never partially carried over between sessions.
+  const [sketch, setSketch] = useState<SketchState>(EMPTY_SKETCH);
+  // M7.5 richer sketch tools: the active tool and the clicks it has
+  // collected so far (a rectangle's first corner, a circle's center, an
+  // arc's end). Anchors are pending input, not sketch geometry, so they're
+  // outside the Undo history: Undo first drops a pending anchor.
+  const [sketchTool, setSketchTool] = useState<SketchTool>('line');
+  const [toolAnchors, setToolAnchors] = useState<SketchPoint[]>([]);
+  // Kept across sessions, like the snap settings.
+  const [curveSegments, setCurveSegments] = useState(32);
   // M7.5 snap-while-drawing toggles. Deliberately kept across sketch
-  // sessions (unlike sketchPoints) — a chosen grid spacing is a working
+  // sessions (unlike the sketch itself) — a chosen grid spacing is a working
   // preference, not part of any one sketch.
   const [snapSettings, setSnapSettings] = useState<SnapSettings>(DEFAULT_SNAP_SETTINGS);
-  const sketchPointsRef = useRef<SketchPoint[]>([]);
-  // Snapshots of sketchPoints before each edit this session (add, move,
-  // insert, delete) — Undo pops one. Reset whenever a session starts/ends.
-  const [sketchHistory, setSketchHistory] = useState<SketchPoint[][]>([]);
+  // M7.5 on-plane editing: synchronous mirror of `sketch`, so a burst of
+  // drag moves landing between two renders each build on the latest points
+  // rather than a stale closure's copy. Only ever written through
+  // setSketchTracked/resetSketch below, which keep the two in step.
+  const sketchRef = useRef<SketchState>(EMPTY_SKETCH);
+  // Snapshots of the sketch before each edit this session (add, move,
+  // insert, delete, a whole shape) — Undo pops one. Reset whenever a
+  // session starts/ends.
+  const [sketchHistory, setSketchHistory] = useState<SketchState[]>([]);
   // M7.5 on-plane editing: non-null while "Edit Sketch" has an already-
   // committed sketch open — the top-level node index being edited, so Save
   // patches that node's points in place instead of appending a new polygon.
@@ -460,23 +514,30 @@ export function App() {
     };
   }, []);
 
-  // M7.5 on-plane editing: the only two writers of sketchPoints, keeping
-  // sketchPointsRef in step. History snapshots are captured *before* the
-  // state updater is queued — updaters run lazily at the next render, by
-  // which point the ref may already hold a later drag position.
-  const resetSketch = useCallback((points: SketchPoint[] = []) => {
-    sketchPointsRef.current = points;
-    setSketchPoints(points);
+  // M7.5 on-plane editing: the only two writers of `sketch`, keeping
+  // sketchRef in step. History snapshots are captured *before* the state
+  // updater is queued — updaters run lazily at the next render, by which
+  // point the ref may already hold a later drag position.
+  const resetSketch = useCallback((next: SketchState = EMPTY_SKETCH, tool: SketchTool = 'line') => {
+    sketchRef.current = next;
+    setSketch(next);
     setSketchHistory([]);
+    setToolAnchors([]);
+    setSketchTool(tool);
   }, []);
 
-  const setSketchPointsTracked = useCallback((next: SketchPoint[], recordHistory: boolean) => {
+  const setSketchTracked = useCallback((next: SketchState, recordHistory: boolean) => {
     if (recordHistory) {
-      const before = sketchPointsRef.current;
+      const before = sketchRef.current;
       setSketchHistory((h) => [...h, before]);
     }
-    sketchPointsRef.current = next;
-    setSketchPoints(next);
+    sketchRef.current = next;
+    setSketch(next);
+  }, []);
+
+  const handleSelectSketchTool = useCallback((tool: SketchTool) => {
+    setSketchTool(tool);
+    setToolAnchors([]);
   }, []);
 
   // M7.5 slice 1: exiting sketch mode also bumps resetViewToken to trigger
@@ -507,69 +568,132 @@ export function App() {
     [resetSketch],
   );
 
-  // M7.5 slice 2: click-to-add-point handler wired to Viewport's
-  // SketchDrawingPlane. Points arrive already snapped (grid / existing
-  // geometry / alignment — see sketchSnap.ts). While editing a
-  // committed (closed) profile, the click instead inserts a vertex into the
-  // nearest edge — see insertIntoNearestEdge for why appending is wrong there.
-  const handleAddSketchPoint = useCallback(
-    (u: number, v: number) => {
-      const prev = sketchPointsRef.current;
-      const next: SketchPoint[] = editingSketchIndex !== null ? insertIntoNearestEdge(prev, [u, v]) : [...prev, [u, v]];
-      setSketchPointsTracked(next, true);
+  // A click on the sketch plane, already snapped (grid / existing geometry /
+  // alignment — see sketchSnap.ts). What it does depends on the tool:
+  // - Line: append to the open polyline; a 'close' snap (its first point)
+  //   closes it into a loop, and the session carries on for more loops.
+  // - Arc: the first click starts a polyline if there isn't one, then the
+  //   arc's end, then a point it passes through (3-point arc). Ending on the
+  //   polyline's first point closes the loop.
+  // - Rectangle: two opposite corners. Circle: center, then a rim point.
+  //   Each adds its own closed loop straight away.
+  // - Edit Points: insert a vertex into the nearest closed-loop edge — see
+  //   insertIntoNearestEdge for why appending is wrong there.
+  const handleSketchClick = useCallback(
+    (u: number, v: number, kind: SnapKind) => {
+      const p: SketchPoint = [u, v];
+      const cur = sketchRef.current;
+      switch (sketchTool) {
+        case 'line':
+          setSketchTracked(kind === 'close' ? closeOpen(cur) : appendToOpen(cur, [p]), true);
+          return;
+        case 'arc': {
+          const last = cur.open[cur.open.length - 1];
+          if (!last) {
+            setSketchTracked(appendToOpen(cur, [p]), true);
+          } else if (toolAnchors.length === 0) {
+            setToolAnchors([kind === 'close' ? cur.open[0] : p]);
+          } else if (kind !== 'close') {
+            setSketchTracked(appendToOpen(cur, arcPoints(last, toolAnchors[0], p, curveSegments)), true);
+            setToolAnchors([]);
+          }
+          return;
+        }
+        case 'rect':
+        case 'circle': {
+          if (toolAnchors.length === 0) {
+            setToolAnchors([p]);
+            return;
+          }
+          const loop = sketchTool === 'rect' ? rectanglePoints(toolAnchors[0], p) : circlePoints(toolAnchors[0], p, curveSegments);
+          // A zero-size shape is ignored, keeping the first click so the
+          // second one can be tried again.
+          if (!loop) return;
+          setSketchTracked(addProfile(cur, loop), true);
+          setToolAnchors([]);
+          return;
+        }
+        case 'edit': {
+          const next = insertIntoNearestEdge(cur, p);
+          if (next) setSketchTracked(next, true);
+          return;
+        }
+      }
     },
-    [editingSketchIndex, setSketchPointsTracked],
+    [sketchTool, toolAnchors, curveSegments, setSketchTracked],
+  );
+
+  // A plain click on a handle is a click exactly on that point: the open
+  // polyline's first point closes it; a closed loop's vertex is a corner the
+  // drawing tools can start from or end on (a rectangle sharing a corner).
+  // Other points of the open polyline are ignored — landing on one would
+  // only make it touch itself. Edit Points ignores handle clicks (inserting
+  // on top of an existing vertex adds nothing).
+  const handleSketchHandleClick = useCallback(
+    (handle: SketchHandle) => {
+      if (sketchTool === 'edit') return;
+      const cur = sketchRef.current;
+      const p = sketchPointAt(cur, handle);
+      if (!p) return;
+      if (handle.profile === -1) {
+        if (handle.point === 0 && cur.open.length >= 3) handleSketchClick(p[0], p[1], 'close');
+        return;
+      }
+      handleSketchClick(p[0], p[1], 'endpoint');
+    },
+    [sketchTool, handleSketchClick],
   );
 
   // M7.5 on-plane editing: a handle drag snapshots once, on its first
   // movement (so a whole drag is one Undo step, and a press-without-moving
   // records nothing), then streams untracked moves.
   const handleSketchDragStart = useCallback(() => {
-    const before = sketchPointsRef.current;
+    const before = sketchRef.current;
     setSketchHistory((h) => [...h, before]);
   }, []);
 
   const handleMoveSketchPoint = useCallback(
-    (index: number, u: number, v: number) => {
-      const next = sketchPointsRef.current.map((p, i): SketchPoint => (i === index ? [u, v] : p));
-      setSketchPointsTracked(next, false);
+    (handle: SketchHandle, u: number, v: number) => {
+      setSketchTracked(moveSketchPoint(sketchRef.current, handle, [u, v]), false);
     },
-    [setSketchPointsTracked],
+    [setSketchTracked],
   );
 
-  // Double-click on a handle. A committed polygon can't drop below 3 points
-  // (Save would have nothing valid to write); an in-progress drawing can
-  // delete freely.
+  // Double-click on a handle, Edit Points only (with a drawing tool the two
+  // clicks are clicks on that point). While editing a committed sketch its
+  // last loop can't be deleted (Save would have nothing valid to write).
   const handleDeleteSketchPoint = useCallback(
-    (index: number) => {
-      const prev = sketchPointsRef.current;
-      if (editingSketchIndex !== null && prev.length <= 3) return;
-      setSketchPointsTracked(
-        prev.filter((_, i) => i !== index),
-        true,
-      );
+    (handle: SketchHandle, wholeLoop: boolean) => {
+      if (sketchTool !== 'edit') return;
+      const prev = sketchRef.current;
+      const next = deleteSketchPoint(prev, handle, wholeLoop, editingSketchIndex !== null);
+      if (next !== prev) setSketchTracked(next, true);
     },
-    [editingSketchIndex, setSketchPointsTracked],
+    [sketchTool, editingSketchIndex, setSketchTracked],
   );
 
   const handleUndoSketch = useCallback(() => {
+    if (toolAnchors.length > 0) {
+      setToolAnchors([]);
+      return;
+    }
     if (sketchHistory.length === 0) return;
     const restored = sketchHistory[sketchHistory.length - 1];
-    sketchPointsRef.current = restored;
-    setSketchPoints(restored);
+    sketchRef.current = restored;
+    setSketch(restored);
     setSketchHistory(sketchHistory.slice(0, -1));
-  }, [sketchHistory]);
+  }, [sketchHistory, toolAnchors]);
 
-  // Commits the drawn points as a real polygon() statement (wrapped in the
-  // plane's translate()/rotate(), each omitted when identity) via the same
-  // append+select+render path every other toolbar insertion uses, then
-  // leaves sketch mode the same way Exit Sketch does — one sketch session
-  // produces one profile, consistent with keeping this slice's interaction
-  // model simple to reason about (multi-profile sessions can be a later
-  // refinement).
+  // Commits every loop (plus the open polyline, when it has 3+ points) as
+  // one polygon() statement — paths= when there are several, so inner loops
+  // become holes — wrapped in the plane's translate()/rotate() (each omitted
+  // when identity), via the same append+select+render path every other
+  // toolbar insertion uses, then leaves sketch mode the same way Exit
+  // Sketch does.
   const handleFinishSketch = useCallback(() => {
-    if (!activeSketchPlane || sketchPoints.length < 3) return;
-    const next = appendSketchPolygon(sourceRef.current, activeSketchPlane.origin, activeSketchPlane.rotationDeg, sketchPoints);
+    const loops = committableProfiles(sketchRef.current);
+    if (!activeSketchPlane || loops.length === 0) return;
+    const next = appendSketchPolygon(sourceRef.current, activeSketchPlane.origin, activeSketchPlane.rotationDeg, loops);
     pendingSelectLast.current = true;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setSource(next);
@@ -577,12 +701,12 @@ export function App() {
     setActiveSketchPlane(null);
     resetSketch();
     setResetViewToken((t) => t + 1);
-  }, [activeSketchPlane, sketchPoints, runRender, resetSketch]);
+  }, [activeSketchPlane, runRender, resetSketch]);
 
   // M7.5 on-plane editing: the selected node, when it's a sketch this app can
   // re-open (see readSketchProfile for exactly which shapes qualify — a bare
-  // committed polygon, or one under a linear_extrude). Drives whether the
-  // toolbar offers "Edit Sketch" at all.
+  // committed polygon, optionally under an offset() and/or a
+  // linear_extrude). Drives whether the toolbar offers "Edit Sketch" at all.
   const selectedSketchProfile = useMemo(() => {
     if (!tree || primarySelectedIndex === null) return null;
     const node = sceneNodes.find((n) => n.index === primarySelectedIndex);
@@ -591,17 +715,18 @@ export function App() {
   }, [tree, sceneNodes, primarySelectedIndex]);
 
   // Re-enters sketch mode on the plane the sketch was drawn on (rebuilt from
-  // its own translate()/rotate() wrap) with its committed points loaded as
-  // draggable handles.
+  // its own translate()/rotate() wrap) with its committed loops loaded as
+  // draggable handles, starting on the Edit Points tool. The drawing tools
+  // work here too, so a hole can be added to an existing sketch.
   const handleEditSketch = useCallback(() => {
     if (primarySelectedIndex === null || !selectedSketchProfile) return;
     setActiveSketchPlane(sketchPlaneFromTransform(selectedSketchProfile.origin, selectedSketchProfile.rotationDeg));
     setPickingFace(false);
     setEditingSketchIndex(primarySelectedIndex);
-    resetSketch(selectedSketchProfile.points);
+    resetSketch({ profiles: selectedSketchProfile.loops, open: [] }, 'edit');
   }, [primarySelectedIndex, selectedSketchProfile, resetSketch]);
 
-  // Writes the edited points back into the same polygon, in place. The
+  // Writes the edited loops back into the same polygon, in place. The
   // profile is re-read against the *current* tree rather than reusing the
   // one captured when editing started, so byte offsets are right even if the
   // source changed meanwhile (e.g. typed in the editor while sketching); if
@@ -609,14 +734,14 @@ export function App() {
   const handleSaveSketch = useCallback(() => {
     const currentTree = treeRef.current;
     const node = sceneNodesRef.current.find((n) => n.index === editingSketchIndex);
-    const points = sketchPointsRef.current;
-    if (!currentTree || !node || points.length < 3) return;
+    const loops = committableProfiles(sketchRef.current);
+    if (!currentTree || !node || loops.length === 0) return;
     const profile = readSketchProfile(currentTree.rootNode, node);
     if (!profile) {
       setStatus('Could not save sketch: the edited node is no longer a sketch polygon');
       return;
     }
-    const next = patchSketchPoints(sourceRef.current, profile, points);
+    const next = patchSketchPoints(sourceRef.current, profile, loops);
     pendingSelectAfterEdit.current = node.index;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setSource(next);
@@ -847,6 +972,20 @@ export function App() {
     [primarySelectedIndex, runRender, handleInsertPrimitive],
   );
 
+  // M7.5: offset() around the selected sketch, in place (same wrap as the
+  // extrudes). Only offered for a bare, not-yet-offset sketch: an extruded
+  // one is 3D, which offset() can't take, and a second offset is better
+  // done by editing the first one's r= in the parameter panel.
+  const handleOffsetSketch = useCallback(() => {
+    const tree = treeRef.current;
+    const node = primarySelectedIndex !== null ? sceneNodesRef.current.find((n) => n.index === primarySelectedIndex) : undefined;
+    if (!tree || !node) return;
+    const next = wrapInExtrude(sourceRef.current, tree.rootNode, node, 'offset');
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    setSource(next);
+    runRender(next);
+  }, [primarySelectedIndex, runRender]);
+
   // M7.5 snap-while-drawing controls, shown in both draw and edit-sketch
   // modes (point drags snap too). Hold Alt to bypass for a single click/drag.
   const snapControls = (
@@ -965,34 +1104,61 @@ export function App() {
               ))}
               <button onClick={() => setPickingFace(true)}>Pick Face</button>
               {selectedSketchProfile && <button onClick={handleEditSketch}>Edit Sketch</button>}
-            </>
-          ) : editingSketchIndex !== null ? (
-            <>
-              <span style={{ opacity: 0.7 }}>
-                {sketchPlaneLabel(activeSketchPlane.kind, true)} — drag points to move, click near an edge to add one, double-click
-                one to delete ({sketchPoints.length})
-              </span>
-              <button onClick={handleUndoSketch} disabled={sketchHistory.length === 0}>
-                Undo
-              </button>
-              <button onClick={handleSaveSketch} disabled={sketchPoints.length < 3 || sketchHistory.length === 0}>
-                Save Sketch
-              </button>
-              <button onClick={handleExitSketch}>Cancel</button>
-              {snapControls}
+              {selectedSketchProfile && !selectedSketchProfile.extruded && !selectedSketchProfile.offset && (
+                <button onClick={handleOffsetSketch} title="Wrap the selected sketch in offset(r=1); edit r in the parameter panel (negative insets)">
+                  Offset
+                </button>
+              )}
             </>
           ) : (
             <>
-              <span style={{ opacity: 0.7 }}>
-                {sketchPlaneLabel(activeSketchPlane.kind, false)} — click to place points, drag one to move it ({sketchPoints.length})
+              <span style={{ opacity: 0.7 }}>{sketchPlaneLabel(activeSketchPlane.kind, editingSketchIndex !== null)}:</span>
+              {SKETCH_TOOL_BUTTONS.map(({ tool, label }) => (
+                <button
+                  key={tool}
+                  onClick={() => handleSelectSketchTool(tool)}
+                  aria-pressed={sketchTool === tool}
+                  style={{ fontWeight: sketchTool === tool ? 'bold' : 'normal' }}
+                >
+                  {label}
+                </button>
+              ))}
+              {(sketchTool === 'arc' || sketchTool === 'circle') && (
+                <select
+                  aria-label="Curve segments"
+                  title="Segments in a full circle (an arc gets the same density)"
+                  value={curveSegments}
+                  onChange={(e) => setCurveSegments(Number(e.target.value))}
+                >
+                  {CURVE_SEGMENT_OPTIONS.map((n) => (
+                    <option key={n} value={n}>
+                      {n} segments
+                    </option>
+                  ))}
+                </select>
+              )}
+              <span style={{ opacity: 0.7 }} data-testid="sketch-hint">
+                {sketchToolHint(sketchTool, toolAnchors.length, sketch.open.length)} ({sketch.profiles.length} loop
+                {sketch.profiles.length === 1 ? '' : 's'}, {allSketchPoints(sketch).length} points)
               </span>
-              <button onClick={handleUndoSketch} disabled={sketchHistory.length === 0}>
+              <button onClick={handleUndoSketch} disabled={sketchHistory.length === 0 && toolAnchors.length === 0}>
                 Undo
               </button>
-              <button onClick={handleFinishSketch} disabled={sketchPoints.length < 3}>
-                Finish Sketch
-              </button>
-              <button onClick={handleExitSketch}>Exit Sketch</button>
+              {editingSketchIndex !== null ? (
+                <>
+                  <button onClick={handleSaveSketch} disabled={committableProfiles(sketch).length === 0 || sketchHistory.length === 0}>
+                    Save Sketch
+                  </button>
+                  <button onClick={handleExitSketch}>Cancel</button>
+                </>
+              ) : (
+                <>
+                  <button onClick={handleFinishSketch} disabled={committableProfiles(sketch).length === 0}>
+                    Finish Sketch
+                  </button>
+                  <button onClick={handleExitSketch}>Exit Sketch</button>
+                </>
+              )}
               {snapControls}
             </>
           )}
@@ -1162,10 +1328,13 @@ export function App() {
             activeSketchPlane={activeSketchPlane}
             pickingFace={pickingFace}
             onPickFace={handlePickFace}
-            sketchPoints={sketchPoints}
-            onAddSketchPoint={handleAddSketchPoint}
+            sketch={sketch}
+            onSketchClick={handleSketchClick}
+            sketchTool={sketchTool}
+            toolAnchors={toolAnchors}
+            curveSegments={curveSegments}
+            onHandleClick={handleSketchHandleClick}
             snapSettings={snapSettings}
-            onCloseSketch={handleFinishSketch}
             onMoveSketchPoint={handleMoveSketchPoint}
             onSketchDragStart={handleSketchDragStart}
             onDeleteSketchPoint={handleDeleteSketchPoint}

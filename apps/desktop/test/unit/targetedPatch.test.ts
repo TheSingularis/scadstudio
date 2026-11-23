@@ -384,18 +384,21 @@ describe('sketch profiles (M7.5 on-plane editing)', () => {
     const profile = readSketchProfile(tree.rootNode, node)!;
     expect(profile.origin).toEqual([0, 0, 5]);
     expect(profile.rotationDeg).toEqual([90, 0, 0]);
-    expect(profile.points).toEqual([
-      [0, 0],
-      [10, 0],
-      [10, -5],
+    expect(profile.loops).toEqual([
+      [
+        [0, 0],
+        [10, 0],
+        [10, -5],
+      ],
     ]);
+    expect(profile.pathsRange).toBeNull();
     expect(source.slice(profile.pointsStart, profile.pointsEnd)).toBe('[[0, 0], [10, 0], [10, -5]]');
   });
 
   it('reads a sketch under linear_extrude, positional points too', async () => {
     const source = 'linear_extrude(height=10) {\n    polygon([[0,0],[1,0],[0,1]]);\n}';
     const { tree, node } = await nodeAt(source);
-    expect(readSketchProfile(tree.rootNode, node)?.points).toHaveLength(3);
+    expect(readSketchProfile(tree.rootNode, node)?.loops[0]).toHaveLength(3);
   });
 
   it('refuses shapes it cannot round-trip exactly', async () => {
@@ -413,16 +416,18 @@ describe('sketch profiles (M7.5 on-plane editing)', () => {
   });
 
   it('save rewrites only the points vector', async () => {
-    const source = '#color([1,0,0]) translate([1,0,0]) polygon(points=[[0,0],[1,0],[0,1]], paths=undefined); // s';
+    const source = '#color([1,0,0]) translate([1,0,0]) polygon(points=[[0,0],[1,0],[0,1]], paths=undef); // s';
     const { tree, node } = await nodeAt(source);
     const profile = readSketchProfile(tree.rootNode, node)!;
     const out = patchSketchPoints(source, profile, [
-      [0, 0],
-      [2.0000001, 0],
-      [2, 2],
-      [0, 2],
+      [
+        [0, 0],
+        [2.0000001, 0],
+        [2, 2],
+        [0, 2],
+      ],
     ]);
-    expect(out).toBe('#color([1,0,0]) translate([1,0,0]) polygon(points=[[0, 0], [2, 0], [2, 2], [0, 2]], paths=undefined); // s');
+    expect(out).toBe('#color([1,0,0]) translate([1,0,0]) polygon(points=[[0, 0], [2, 0], [2, 2], [0, 2]], paths=undef); // s');
     await expectCleanParse(out);
   });
 

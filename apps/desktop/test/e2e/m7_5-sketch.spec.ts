@@ -21,7 +21,7 @@ async function drawTriangleOnXY(scad: ScadApp) {
   await expect(scad.page.getByText(/Sketching on XY plane/)).toBeVisible();
   await scad.page.waitForTimeout(1500); // camera animates onto the plane
   for (const p of TRIANGLE_PX) await scad.clickViewport(p.dx, p.dy);
-  await expect(scad.page.getByText(/\(3\)/)).toBeVisible();
+  await expect(scad.page.getByTestId('sketch-hint')).toContainText(/ 3 points\)/);
 }
 
 test.describe('M7.5 sketch mode', () => {
@@ -48,7 +48,7 @@ test.describe('M7.5 sketch mode', () => {
     await scad.load('cube(1);\n');
     await drawTriangleOnXY(scad);
     await scad.button('Undo').click();
-    await expect(scad.page.getByText(/\(2\)/)).toBeVisible();
+    await expect(scad.page.getByTestId('sketch-hint')).toContainText(/ 2 points\)/);
     await expect(scad.button('Finish Sketch')).toBeDisabled();
     await scad.button('Exit Sketch').click();
     await expect(scad.button('XY')).toBeVisible();
@@ -78,7 +78,7 @@ test.describe('M7.5 sketch mode', () => {
     await scad.page.waitForTimeout(1500);
     // Click a little below the middle of the base edge.
     await scad.clickViewport(0, 70);
-    await expect(scad.page.getByText(/\(4\)/)).toBeVisible();
+    await expect(scad.page.getByTestId('sketch-hint')).toContainText(/ 4 points\)/);
     await scad.rendersAfter(() => scad.button('Save Sketch').click());
     const src = await scad.source();
     const after = polygonPoints(src);

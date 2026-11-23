@@ -31,14 +31,14 @@ describe('appendSketchPolygon (M7.5)', () => {
   ];
 
   it('XY plane at the origin emits a bare polygon', () => {
-    expect(appendSketchPolygon('', [0, 0, 0], [0, 0, 0], pts)).toBe('\n\npolygon(points=[[0, 0], [10, 0], [10, 5]]);\n');
+    expect(appendSketchPolygon('', [0, 0, 0], [0, 0, 0], [pts])).toBe('\n\npolygon(points=[[0, 0], [10, 0], [10, 5]]);\n');
   });
 
   it('a face plane emits translate then rotate, and reads back as the same sketch', async () => {
-    const out = appendSketchPolygon('cube(10);\n', [0, 0, 10], [90, 0, 0], pts);
+    const out = appendSketchPolygon('cube(10);\n', [0, 0, 10], [90, 0, 0], [pts]);
     expect(out).toContain('translate([0, 0, 10]) rotate([90, 0, 0]) polygon(');
     const parsed = await expectCleanParse(out);
     const profile = readSketchProfile(parsed.tree.rootNode, parsed.graph.nodes[1])!;
-    expect(profile).toMatchObject({ origin: [0, 0, 10], rotationDeg: [90, 0, 0], points: pts });
+    expect(profile).toMatchObject({ origin: [0, 0, 10], rotationDeg: [90, 0, 0], loops: [pts] });
   });
 });

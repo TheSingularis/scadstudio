@@ -533,10 +533,16 @@ export function wrapInBoolean(source: string, nodesInSelectionOrder: SceneNode[]
 }
 
 export type ExtrudeOp = 'linear_extrude' | 'rotate_extrude';
+// M7.5 richer sketch tools: offset() is OpenSCAD's native 2D inset/outset,
+// a 2D→2D op that wraps a sketch exactly the way an extrude does, so it
+// shares wrapInExtrude's codegen. r= rounds outer corners; the parameter
+// panel can switch it to delta= for sharp ones, or make it negative to inset.
+export type WrapOp = ExtrudeOp | 'offset';
 
-const EXTRUDE_DEFAULT_ARGS: Record<ExtrudeOp, string> = {
+const EXTRUDE_DEFAULT_ARGS: Record<WrapOp, string> = {
   linear_extrude: 'height=10',
   rotate_extrude: '$fn=48',
+  offset: 'r=1',
 };
 
 // M7.5: wraps a single existing node's verbatim source in a new
@@ -558,7 +564,7 @@ const EXTRUDE_DEFAULT_ARGS: Record<ExtrudeOp, string> = {
 // non-Z-axis rotate() wrap ahead of a 2D primitive). So this decomposes the
 // node the same way patchTransform does, and re-emits the wrap prefix
 // ahead of the extrude block instead of inside it.
-export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: ExtrudeOp): string {
+export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: WrapOp): string {
   const decomposed = decomposeNode(root, node);
   const wrapStart = decomposed ? decomposed.wrapStart : node.startIndex;
   const primitiveStart = decomposed ? decomposed.primitiveStart : node.startIndex;
@@ -571,34 +577,40 @@ export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: E
 // M7.5 on-plane editing: everything needed to re-open an already-committed
 // sketch for editing — the plane it was drawn on (its translate()/rotate()
 // wrap, which is exactly what appendSketchPolygon emitted from the original
-// ActiveSketchPlane) plus its polygon's points and the byte range of the
-// points vector, so saving the edit rewrites just that one vector in place.
+// ActiveSketchPlane), its loops, and the byte ranges of the points and
+// paths vectors, so saving the edit rewrites just those vectors in place.
 export interface SketchProfile {
   origin: [number, number, number];
   rotationDeg: [number, number, number];
-  points: [number, number][];
+  // One entry per path (a single entry when the polygon has no paths=).
+  loops: [number, number][][];
   pointsStart: number;
   pointsEnd: number;
+  // null when the polygon has no paths= argument.
+  pathsRange: { start: number; end: number } | null;
+  // What sits between the plane wrap and the polygon, so the toolbar knows
+  // which follow-up ops make sense (no Offset on an extruded solid).
+  extruded: boolean;
+  offset: boolean;
 }
 
-function polygonPointsArg(call: Node): Node | null {
+// polygon(points, paths, convexity): a named argument, or the positional
+// one at `position`.
+function callArgValue(call: Node, name: string, position: number): Node | null {
   const argsNode = call.childForFieldName('arguments')?.namedChild(0);
   for (let i = 0; i < (argsNode?.namedChildCount ?? 0); i++) {
     const argument = argsNode!.namedChild(i);
-    const name = argument?.childForFieldName('name')?.text ?? null;
-    // `points` is polygon()'s first parameter, so a positional first
-    // argument is the points vector too (`polygon([[0,0], ...])`).
-    if (name === 'points' || (name === null && i === 0)) {
+    const argName = argument?.childForFieldName('name')?.text ?? null;
+    if (argName === name || (argName === null && i === position)) {
       return argument?.childForFieldName('value') ?? argument?.child(0) ?? null;
     }
   }
   return null;
 }
 
-// The single 2D child of a `linear_extrude(...) { child; }` or
-// `linear_extrude(...) child;` — null for zero or several children, since
-// "edit the extruded sketch" only has one honest meaning when there's
-// exactly one profile underneath.
+// The single child of a `op(...) { child; }` or `op(...) child;` — null for
+// zero or several children, since "edit the extruded sketch" only has one
+// honest meaning when there's exactly one profile underneath.
 function soleChildCall(call: Node): Node | null {
   const last = call.child(call.childCount - 1);
   if (!last) return null;
@@ -613,14 +625,42 @@ function soleChildCall(call: Node): Node | null {
   return child?.type === 'module_instantiation' ? child : null;
 }
 
-// Recognizes the two shapes sketch mode itself produces: a bare
-// `[translate(...)] [rotate(...)] polygon(points=[...]);` (Finish Sketch) and
-// the same with a linear_extrude between the wrap and the polygon (Finish
-// Sketch → Linear Extrude, see wrapInExtrude). Deliberately strict —
-// anything this can't round-trip exactly returns null, and the toolbar
-// simply doesn't offer "Edit Sketch" for that node:
-// - points must be literal numbers (a vector built from variables or
-//   expressions has no single position to drag; rewriting it as literals
+function readLiteralPoints(vec: Node): [number, number][] | null {
+  const points: [number, number][] = [];
+  for (const pointNode of vec.namedChildren) {
+    if (!pointNode || pointNode.type !== 'vector_expression' || pointNode.namedChildCount !== 2) return null;
+    const u = readNumber(pointNode.namedChild(0));
+    const v = readNumber(pointNode.namedChild(1));
+    if (u === null || v === null) return null;
+    points.push([u, v]);
+  }
+  return points;
+}
+
+function readLiteralPaths(vec: Node): number[][] | null {
+  const paths: number[][] = [];
+  for (const pathNode of vec.namedChildren) {
+    if (!pathNode || pathNode.type !== 'vector_expression') return null;
+    const path: number[] = [];
+    for (const indexNode of pathNode.namedChildren) {
+      const i = readNumber(indexNode);
+      if (i === null || !Number.isInteger(i)) return null;
+      path.push(i);
+    }
+    paths.push(path);
+  }
+  return paths;
+}
+
+// Recognizes the shapes sketch mode itself produces: a bare
+// `[translate(...)] [rotate(...)] polygon(points=[...][, paths=[...]]);`
+// (Finish Sketch), optionally with an offset() (the Offset op) and/or a
+// linear_extrude (Finish Sketch → Linear Extrude, see wrapInExtrude) between
+// the wrap and the polygon. Deliberately strict — anything this can't
+// round-trip exactly returns null, and the toolbar simply doesn't offer
+// "Edit Sketch" for that node:
+// - points and paths must be literal numbers (a vector built from variables
+//   or expressions has no single position to drag; rewriting it as literals
 //   would silently destroy the parametric intent),
 // - no scale()/mirror() wrap (handles live in the plane's unscaled frame;
 //   a scaled sketch would need the scale folded into every dragged point),
@@ -632,36 +672,94 @@ export function readSketchProfile(root: Node, node: SceneNode): SketchProfile | 
   const { transform } = decomposed;
   if (transform.scale.some((v) => v !== 1)) return null;
   let call: Node | null = decomposed.primitiveNode;
-  if (call.childForFieldName('name')?.text === 'linear_extrude') call = soleChildCall(call);
+  const extruded = call.childForFieldName('name')?.text === 'linear_extrude';
+  if (extruded) call = soleChildCall(call);
+  const offset = call?.childForFieldName('name')?.text === 'offset';
+  if (call && offset) call = soleChildCall(call);
   if (!call || call.childForFieldName('name')?.text !== 'polygon') return null;
-  const vec = polygonPointsArg(call);
+  const vec = callArgValue(call, 'points', 0);
   if (!vec || vec.type !== 'vector_expression') return null;
-  const points: [number, number][] = [];
-  for (const pointNode of vec.namedChildren) {
-    if (!pointNode || pointNode.type !== 'vector_expression' || pointNode.namedChildCount !== 2) return null;
-    const u = readNumber(pointNode.namedChild(0));
-    const v = readNumber(pointNode.namedChild(1));
-    if (u === null || v === null) return null;
-    points.push([u, v]);
-  }
-  if (points.length < 3) return null;
+  const points = readLiteralPoints(vec);
+  if (!points) return null;
+  const pathsNode = callArgValue(call, 'paths', 1);
+  // `paths=undef` is OpenSCAD's own default, same as leaving it out.
+  const hasPaths = pathsNode !== null && pathsNode.text !== 'undef';
+  if (hasPaths && pathsNode.type !== 'vector_expression') return null;
+  const paths = hasPaths ? readLiteralPaths(pathsNode) : null;
+  if (hasPaths && !paths) return null;
+  const loops = loopsFromPolygon(points, paths);
+  if (!loops) return null;
   return {
     origin: transform.translate,
     rotationDeg: transform.rotateDeg,
-    points,
+    loops,
     pointsStart: vec.startIndex,
     pointsEnd: vec.endIndex,
+    pathsRange: hasPaths ? { start: pathsNode.startIndex, end: pathsNode.endIndex } : null,
+    extruded,
+    offset,
   };
+}
+
+// Kept local (rather than importing sketchEditing.ts) so this module stays
+// free of renderer-state helpers; same rules as polygonToProfiles there.
+function loopsFromPolygon(points: [number, number][], paths: number[][] | null): [number, number][][] | null {
+  if (!paths) return points.length >= 3 ? [points] : null;
+  const loops: [number, number][][] = [];
+  for (const path of paths) {
+    if (path.length < 3 || path.some((i) => i < 0 || i >= points.length)) return null;
+    loops.push(path.map((i) => points[i]));
+  }
+  return loops.length > 0 ? loops : null;
 }
 
 export function formatSketchPoints(points: [number, number][]): string {
   return `[${points.map(([u, v]) => `[${formatNumber(u)}, ${formatNumber(v)}]`).join(', ')}]`;
 }
 
-// Saving an edited sketch: only the points vector's own bytes change — the
-// plane wrap, any extrude around it, paths=, modifiers, color, comments and
-// formatting all stay exactly as they were (same minimal-diff rule as
-// patchArgument).
-export function patchSketchPoints(source: string, profile: SketchProfile, points: [number, number][]): string {
-  return source.slice(0, profile.pointsStart) + formatSketchPoints(points) + source.slice(profile.pointsEnd);
+function flattenLoops(loops: [number, number][][]): { points: [number, number][]; paths: number[][] } {
+  const points: [number, number][] = [];
+  const paths: number[][] = [];
+  for (const loop of loops) {
+    paths.push(loop.map((_, i) => points.length + i));
+    points.push(...loop);
+  }
+  return { points, paths };
+}
+
+function formatPaths(paths: number[][]): string {
+  return `[${paths.map((p) => `[${p.join(', ')}]`).join(', ')}]`;
+}
+
+// polygon()'s argument list for a sketch: points only for a single loop,
+// points + paths for several.
+export function formatSketchPolygonArgs(loops: [number, number][][]): string {
+  const { points, paths } = flattenLoops(loops);
+  const pointsArg = `points=${formatSketchPoints(points)}`;
+  return loops.length > 1 ? `${pointsArg}, paths=${formatPaths(paths)}` : pointsArg;
+}
+
+// Saving an edited sketch: only the points vector's own bytes change (plus
+// the paths vector, when the polygon has or now needs one) — the plane
+// wrap, any extrude/offset around it, convexity, modifiers, color, comments
+// and formatting all stay exactly as they were (same minimal-diff rule as
+// patchArgument). A single loop saved into a polygon that never had paths=
+// leaves the call exactly as before apart from the points.
+export function patchSketchPoints(source: string, profile: SketchProfile, loops: [number, number][][]): string {
+  const { points, paths } = flattenLoops(loops);
+  const pointsText = formatSketchPoints(points);
+  if (profile.pathsRange) {
+    const { start, end } = profile.pathsRange;
+    const pathsText = formatPaths(paths);
+    // Two in-place replacements; do the later one first so the earlier
+    // offsets stay valid.
+    if (start > profile.pointsStart) {
+      const withPaths = source.slice(0, start) + pathsText + source.slice(end);
+      return withPaths.slice(0, profile.pointsStart) + pointsText + withPaths.slice(profile.pointsEnd);
+    }
+    const withPoints = source.slice(0, profile.pointsStart) + pointsText + source.slice(profile.pointsEnd);
+    return withPoints.slice(0, start) + pathsText + withPoints.slice(end);
+  }
+  const insertPaths = loops.length > 1 ? `, paths=${formatPaths(paths)}` : '';
+  return source.slice(0, profile.pointsStart) + pointsText + insertPaths + source.slice(profile.pointsEnd);
 }
