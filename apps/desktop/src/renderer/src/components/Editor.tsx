@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import * as monaco from 'monaco-editor/editor/editor.api.js';
 import { registerScadLanguage } from '../scadLanguage';
 import type { SceneNode } from '../sceneGraph';
+import { minimalReplacement } from '../textDiff';
 
 let languageRegistered = false;
 
@@ -11,9 +12,13 @@ interface EditorProps {
   nodes: SceneNode[];
   selectedIndex: number | null;
   onSelectNode: (index: number | null) => void;
+  // Changes when a different document is loaded (File > Open). Only then is
+  // the editor's undo history reset; every other `value` change is a visual
+  // edit, applied as an undoable edit on top of the existing history.
+  documentKey?: string | number;
 }
 
-export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: EditorProps) {
+export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, documentKey }: EditorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const decorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
@@ -23,6 +28,16 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: 
   onSelectNodeRef.current = onSelectNode;
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+  // True while this component itself is writing `value` into the model, so
+  // the change and cursor events that write fires are not mistaken for the
+  // user typing or clicking.
+  const applyingValueRef = useRef(false);
+  // Texts this editor has itself reported through onChange since the last
+  // visual edit. React can commit a render for an older keystroke after the
+  // user has already typed the next one; that stale `value` must not be
+  // written back over the newer text (doing so deleted typed characters).
+  const emittedRef = useRef<string[]>([]);
+  const documentKeyRef = useRef(documentKey);
 
   useEffect(() => {
     if (!languageRegistered) {
@@ -62,9 +77,15 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: 
     // making the duplicate obvious in the console. `isFlush` is Monaco's own
     // flag for "this change came from setValue()," the exact content-change
     // analog of the ContentFlush guard already below for cursor resets.
+    //
+    // Visual edits now go through executeEdits (see the value effect below),
+    // which is not a flush, so applyingValueRef covers them instead.
     const changeSub = editor.onDidChangeModelContent((e) => {
-      if (e.isFlush) return;
-      onChangeRef.current(editor.getValue());
+      if (e.isFlush || applyingValueRef.current) return;
+      const text = editor.getValue();
+      emittedRef.current.push(text);
+      if (emittedRef.current.length > 200) emittedRef.current.shift();
+      onChangeRef.current(text);
     });
 
     // Text -> selection: find which top-level scene node contains the cursor.
@@ -77,7 +98,7 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: 
     // silently deselecting whatever a gizmo drag had just been editing right
     // as its own re-render was about to land.
     const cursorSub = editor.onDidChangeCursorPosition((e) => {
-      if (e.reason === monaco.editor.CursorChangeReason.ContentFlush) return;
+      if (e.reason === monaco.editor.CursorChangeReason.ContentFlush || applyingValueRef.current) return;
       const model = editor.getModel();
       if (!model) return;
       const offset = model.getOffsetAt(e.position);
@@ -93,12 +114,41 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode }: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Programmatic edits (gizmo commits, toolbar inserts, booleans, modifiers,
+  // sketches) arrive as a new `value`. They used to go through
+  // model.setValue(), which wipes Monaco's undo stack, so no visual edit
+  // could be undone and the typed history before it was lost too (QC audit
+  // H3). PLAN.md's visual edit path specifies executeEdits: each visual edit
+  // becomes one undo step of its own, between undo stops, so Ctrl+Z steps
+  // back through visual and typed edits alike. Only loading a different
+  // document (documentKey changes) starts a fresh history.
   useEffect(() => {
-    const model = editorRef.current?.getModel();
-    if (model && model.getValue() !== value) {
-      model.setValue(value);
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+    const newDocument = documentKeyRef.current !== documentKey;
+    documentKeyRef.current = documentKey;
+    const current = model.getValue();
+    if (current === value) return;
+    // An echo of the user's own typing, possibly a keystroke behind: the
+    // model already holds that text or newer, so leave it alone.
+    if (!newDocument && emittedRef.current.includes(value)) return;
+    emittedRef.current = [];
+    applyingValueRef.current = true;
+    try {
+      if (newDocument) {
+        model.setValue(value);
+        return;
+      }
+      const { start, end, text } = minimalReplacement(current, value);
+      const range = monaco.Range.fromPositions(model.getPositionAt(start), model.getPositionAt(end));
+      editor.pushUndoStop();
+      editor.executeEdits('scadstudio-visual-edit', [{ range, text, forceMoveMarkers: true }]);
+      editor.pushUndoStop();
+    } finally {
+      applyingValueRef.current = false;
     }
-  }, [value]);
+  }, [value, documentKey]);
 
   // Selection -> text: highlight the selected node's range (doesn't move the
   // cursor, so it doesn't fight with the user if they're editing elsewhere).

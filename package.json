@@ -2,11 +2,13 @@
   "name": "scadstudio",
   "private": true,
   "version": "0.0.0",
+  "license": "GPL-3.0-or-later",
   "type": "module",
   "workspaces": [
     "apps/*"
   ],
   "scripts": {
+    "test": "npm test --workspace=@scadstudio/desktop",
     "spike:parse": "node spikes/parse-spike.mjs",
     "spike:render": "node spikes/render-spike.mjs",
     "spike:gaps": "node spikes/isolate-gaps.mjs",

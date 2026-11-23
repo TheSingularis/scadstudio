@@ -2,6 +2,7 @@
   "name": "@scadstudio/desktop",
   "private": true,
   "version": "0.1.1",
+  "license": "GPL-3.0-or-later",
   "description": "Visual CAD editor that reads and writes real OpenSCAD source",
   "author": "scadstudio",
   "type": "module",
@@ -12,7 +13,16 @@
     "start": "electron-vite preview",
     "typecheck": "tsc --build tsconfig.json",
     "package:linux": "electron-vite build && electron-builder --linux AppImage --publish never",
-    "package:win": "electron-vite build && electron-builder --win portable --publish never"
+    "package:win": "electron-vite build && electron-builder --win portable --publish never",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:watch": "vitest",
+    "typecheck:test": "tsc -p test/tsconfig.json",
+    "test:corpus": "vitest run test/corpus",
+    "corpus:fetch": "node test/corpus/fetch-corpus.mjs",
+    "test:e2e": "electron-vite build && playwright test",
+    "test:e2e:nobuild": "playwright test"
   },
   "dependencies": {
     "@holistic-stack/tree-sitter-openscad": "^0.1.0",
@@ -26,14 +36,16 @@
     "web-tree-sitter": "0.25.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@types/three": "^0.185.0",
     "@vitejs/plugin-react": "^5.0.0",
-    "electron": "44.1.1",
+    "electron": "44.11.5",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
     "typescript": "^5.9.3",
-    "vite": "^7.3.6"
+    "vite": "^7.3.6",
+    "vitest": "^3.2.7"
   }
 }

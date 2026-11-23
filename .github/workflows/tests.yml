@@ -1,0 +1,93 @@
+name: Tests
+
+# Runs on every PR and on main. See TESTING.md for what each job covers and
+# how to run the same suites locally. Known bugs from the QC audit are
+# expected failures (it.fails / test.fail) and do not turn this red.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vitest:
+    name: Unit + integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck app
+        run: npm run typecheck --workspace=@scadstudio/desktop
+
+      - name: Typecheck tests
+        run: npm run typecheck:test --workspace=@scadstudio/desktop
+
+      - name: Unit tests
+        run: npm run test:unit --workspace=@scadstudio/desktop -- --reporter=default --reporter=github-actions
+
+      - name: Integration tests (openscad-wasm render path)
+        run: npm run test:integration --workspace=@scadstudio/desktop -- --reporter=default --reporter=github-actions
+
+      # MCAD, OpenSCAD's examples and BOSL2 at pinned commits (not vendored).
+      - name: Fetch real-world corpus
+        run: npm run corpus:fetch --workspace=@scadstudio/desktop
+
+      - name: Corpus tests (grammar baseline + patch round-trip on real files)
+        run: npm run test:corpus --workspace=@scadstudio/desktop -- --reporter=default --reporter=github-actions
+
+  e2e:
+    name: End-to-end (Electron under Xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Same runtime libraries the AppImage smoke test in build-desktop.yml needs.
+      - name: Install headless runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libuuid1 libsecret-1-0 libgbm1
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+
+      - name: Build app
+        run: npm run build --workspace=@scadstudio/desktop
+
+      - name: End-to-end tests
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm run test:e2e:nobuild --workspace=@scadstudio/desktop
+
+      - name: Upload e2e report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: |
+            apps/desktop/playwright-report/
+            apps/desktop/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
