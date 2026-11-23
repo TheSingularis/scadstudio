@@ -7,6 +7,7 @@
     "apps/*"
   ],
   "scripts": {
+    "test": "npm test --workspace=@scadstudio/desktop",
     "spike:parse": "node spikes/parse-spike.mjs",
     "spike:render": "node spikes/render-spike.mjs",
     "spike:gaps": "node spikes/isolate-gaps.mjs",
