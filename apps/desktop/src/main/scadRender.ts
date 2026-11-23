@@ -1,0 +1,276 @@
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import { createOpenSCAD } from 'openscad-wasm';
+
+// Everything the main process needs to turn OpenSCAD source into STL bytes,
+// kept free of Electron imports so it can be exercised directly from Node.
+//
+// Two things this does that a bare `renderToStl()` call does not:
+//
+// 1. It runs OpenSCAD with `--backend=Manifold`. PLAN.md names Manifold as a
+//    fixed constraint; openscad-wasm's `renderToStl()` helper passes no
+//    backend flag, so OpenSCAD fell back to its CGAL default, which measured
+//    about 57x slower on basics.scad (QC audit H1).
+//
+// 2. It copies every file the source pulls in through `use <...>` /
+//    `include <...>` into the WASM filesystem before rendering (QC audit H4).
+//    The WASM build has only an in-memory filesystem, so before this a file
+//    that imported a library rendered nothing. Files are mirrored at a
+//    virtual path that mirrors their real absolute path (see toVirtualPath),
+//    so relative paths, including `../`, resolve exactly the way they would
+//    for desktop OpenSCAD, and library folders are handed to OpenSCAD through
+//    its own OPENSCADPATH lookup.
+
+export interface RenderOptions {
+  // Absolute path of the document being rendered, or null for an unsaved
+  // one. `use`/`include` paths resolve relative to its folder first.
+  documentPath?: string | null;
+  // OpenSCAD library folders, searched after the including file's own folder.
+  libraryDirs?: string[];
+}
+
+export class ScadRenderError extends Error {
+  constructor(
+    message: string,
+    readonly log: string[],
+  ) {
+    super(message);
+    this.name = 'ScadRenderError';
+  }
+}
+
+// Root of the mirrored host filesystem inside the WASM FS.
+const VIRTUAL_ROOT = '/host';
+// Name the source is written under, next to where the real document lives.
+// Unusual enough that it can't shadow a real file the document includes.
+const INPUT_NAME = '__scadstudio_render__.scad';
+const OUTPUT_PATH = '/__scadstudio_output__.stl';
+// Guards against runaway include graphs (a library that pulls in thousands
+// of files, or a pathological loop the visited set somehow misses).
+const MAX_DEPENDENCY_FILES = 2000;
+
+// `C:\Users\me\lib.scad` -> `/host/C/Users/me/lib.scad`; `/home/me/lib.scad`
+// -> `/host/home/me/lib.scad`.
+export function toVirtualPath(hostPath: string): string {
+  const resolved = path.resolve(hostPath);
+  const drive = /^([A-Za-z]):[\\/]/.exec(resolved);
+  if (drive) {
+    return `${VIRTUAL_ROOT}/${drive[1].toUpperCase()}/${resolved.slice(3).split(/[\\/]+/).filter(Boolean).join('/')}`;
+  }
+  return `${VIRTUAL_ROOT}/${resolved.split(/[\\/]+/).filter(Boolean).join('/')}`;
+}
+
+// Blanks out comments and string literals (keeping every other character's
+// offset), so a `use <x>` inside a comment or a string isn't picked up.
+function stripCommentsAndStrings(source: string): string {
+  let out = '';
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (c === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') {
+        out += ' ';
+        i++;
+      }
+    } else if (c === '/' && next === '*') {
+      out += '  ';
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) {
+        out += source[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      if (i < source.length) {
+        out += '  ';
+        i += 2;
+      }
+    } else if (c === '"') {
+      out += ' ';
+      i++;
+      while (i < source.length && source[i] !== '"') {
+        if (source[i] === '\\') {
+          out += ' ';
+          i++;
+        }
+        if (i < source.length) {
+          out += source[i] === '\n' ? '\n' : ' ';
+          i++;
+        }
+      }
+      if (i < source.length) {
+        out += ' ';
+        i++;
+      }
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+// The `<...>` targets of every use/include directive in a file, in order.
+export function findDependencyPaths(source: string): string[] {
+  const stripped = stripCommentsAndStrings(source);
+  const found: string[] = [];
+  const re = /\b(?:use|include)\s*<([^>\n]+)>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped)) !== null) found.push(m[1].trim());
+  return found;
+}
+
+async function readIfFile(hostPath: string): Promise<string | null> {
+  try {
+    return await readFile(hostPath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+// Every file reachable through use/include from `source`, keyed by absolute
+// host path. Resolution follows OpenSCAD: the including file's own folder
+// first, then each library folder in order. A path that resolves nowhere is
+// skipped; OpenSCAD itself then reports it as missing, which is the message
+// the user should see.
+export async function collectDependencies(
+  source: string,
+  documentDir: string | null,
+  libraryDirs: string[],
+  read: (hostPath: string) => Promise<string | null> = readIfFile,
+): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  const missing = new Set<string>();
+  const queue: { text: string; dir: string | null }[] = [{ text: source, dir: documentDir }];
+  while (queue.length > 0 && files.size < MAX_DEPENDENCY_FILES) {
+    const { text, dir } = queue.shift()!;
+    for (const rel of findDependencyPaths(text)) {
+      const candidates = [
+        ...(dir && !path.isAbsolute(rel) ? [path.resolve(dir, rel)] : []),
+        ...(path.isAbsolute(rel) ? [path.resolve(rel)] : libraryDirs.map((lib) => path.resolve(lib, rel))),
+      ];
+      for (const candidate of candidates) {
+        if (files.has(candidate)) break;
+        if (missing.has(candidate)) continue;
+        const contents = await read(candidate);
+        if (contents === null) {
+          missing.add(candidate);
+          continue;
+        }
+        files.set(candidate, contents);
+        queue.push({ text: contents, dir: path.dirname(candidate) });
+        break;
+      }
+    }
+  }
+  return files;
+}
+
+// OpenSCAD's own default user library folder for this platform (the one its
+// "Show Library Folder" menu opens), plus anything on OPENSCADPATH.
+export function defaultLibraryDirs(documentsDir: string = path.join(homedir(), 'Documents')): string[] {
+  const dirs: string[] = [];
+  const envPath = process.env['OPENSCADPATH'];
+  if (envPath) dirs.push(...envPath.split(path.delimiter).filter(Boolean));
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    dirs.push(path.join(documentsDir, 'OpenSCAD', 'libraries'));
+  } else {
+    const dataHome = process.env['XDG_DATA_HOME'] || path.join(homedir(), '.local', 'share');
+    dirs.push(path.join(dataHome, 'OpenSCAD', 'libraries'));
+  }
+  return dirs;
+}
+
+function mkdirTree(fs: { mkdirTree?: (p: string) => void; mkdir: (p: string) => void; analyzePath: (p: string) => { exists: boolean } }, dir: string): void {
+  if (fs.mkdirTree) {
+    fs.mkdirTree(dir);
+    return;
+  }
+  let current = '';
+  for (const part of dir.split('/').filter(Boolean)) {
+    current += `/${part}`;
+    if (!fs.analyzePath(current).exists) fs.mkdir(current);
+  }
+}
+
+// The lines worth showing a user from OpenSCAD's log: errors and warnings,
+// or the tail of the log if it printed neither.
+export function summarizeLog(log: string[]): string {
+  const important = log.filter((l) => /^(ERROR|WARNING|Parser error|Can't|Execution aborted|Current top level object)/i.test(l.trim()));
+  const lines = important.length > 0 ? important : log.slice(-3);
+  const text = lines
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join('\n')
+    // The virtual paths mean nothing to the user; show real-looking ones.
+    .replaceAll(`/${INPUT_NAME}`, '')
+    .replaceAll(`${VIRTUAL_ROOT}/`, '/');
+  return text || 'OpenSCAD produced no output';
+}
+
+// M0 spike finding: a single createOpenSCAD() instance corrupts state after
+// one render, so every render gets its own fresh instance.
+export async function renderScadToStl(source: string, options: RenderOptions = {}): Promise<Uint8Array> {
+  const documentPath = options.documentPath ? path.resolve(options.documentPath) : null;
+  const documentDir = documentPath ? path.dirname(documentPath) : null;
+  const libraryDirs = (options.libraryDirs ?? []).map((d) => path.resolve(d));
+  const dependencies = await collectDependencies(source, documentDir, libraryDirs);
+
+  const log: string[] = [];
+  const openscadPath = libraryDirs.map(toVirtualPath).join(':');
+  const openscad = await createOpenSCAD({
+    print: (text: string) => log.push(text),
+    printErr: (text: string) => log.push(text),
+    // OpenSCAD reads OPENSCADPATH once at startup, so it has to be in the
+    // environment before main runs; setting instance.ENV afterwards is too
+    // late. Emscripten passes the module to each preRun callback.
+    preRun: [
+      (module: { ENV?: Record<string, string> }) => {
+        if (module?.ENV && openscadPath) module.ENV['OPENSCADPATH'] = openscadPath;
+      },
+    ],
+  } as Parameters<typeof createOpenSCAD>[0]);
+  const instance = openscad.getInstance() as unknown as {
+    FS: {
+      writeFile: (p: string, data: string) => void;
+      readFile: (p: string) => Uint8Array;
+      mkdir: (p: string) => void;
+      mkdirTree?: (p: string) => void;
+      analyzePath: (p: string) => { exists: boolean };
+    };
+    callMain: (args: string[]) => number;
+  };
+  const { FS } = instance;
+
+  for (const [hostPath, contents] of dependencies) {
+    const virtual = toVirtualPath(hostPath);
+    mkdirTree(FS, path.posix.dirname(virtual));
+    FS.writeFile(virtual, contents);
+  }
+
+  const inputDir = documentDir ? toVirtualPath(documentDir) : '/untitled';
+  mkdirTree(FS, inputDir);
+  const inputPath = `${inputDir}/${INPUT_NAME}`;
+  FS.writeFile(inputPath, source);
+
+  let exitCode: number;
+  try {
+    exitCode = instance.callMain([inputPath, '--backend=Manifold', '-o', OUTPUT_PATH]);
+  } catch (err) {
+    // Emscripten throws its own non-Error objects (ExitStatus, a bare
+    // number) on abort, which used to reach the renderer as
+    // "[object Object]" (QC audit M4).
+    const detail = err instanceof Error ? err.message : JSON.stringify(err);
+    throw new ScadRenderError(`${summarizeLog(log)}${detail ? `\n(${detail})` : ''}`, log);
+  }
+  let stl: Uint8Array | null = null;
+  try {
+    stl = FS.readFile(OUTPUT_PATH);
+  } catch {
+    stl = null;
+  }
+  if (exitCode !== 0 || !stl || stl.byteLength === 0) {
+    throw new ScadRenderError(summarizeLog(log), log);
+  }
+  return stl;
+}

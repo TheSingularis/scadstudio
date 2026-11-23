@@ -1,20 +1,39 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import { readFile, writeFile } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createOpenSCAD } from 'openscad-wasm';
+import { defaultLibraryDirs, renderScadToStl } from './scadRender';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// M0 spike finding: a single createOpenSCAD() instance corrupts state after
-// one renderToStl() call, so every render gets its own fresh instance.
-async function renderScadToStl(source: string): Promise<Uint8Array> {
-  const openscad = await createOpenSCAD({
-    print: () => {},
-    printErr: () => {},
-  });
-  const stl = await openscad.renderToStl(source);
-  return typeof stl === 'string' ? new TextEncoder().encode(stl) : stl;
+// The document the renderer is showing, as far as the main process knows:
+// set whenever a file is opened (and, later, saved). Renders resolve
+// `use <...>` / `include <...>` against its folder (see scadRender.ts).
+let currentDocumentPath: string | null = null;
+// Mirrored from the renderer (scad:setDirty): whether the editor holds
+// changes that are not on disk. Used to ask before closing the window or
+// opening another file over them.
+let documentDirty = false;
+// Set once the user has chosen to close despite (or after saving) unsaved
+// changes, so the second close() goes through.
+let closeConfirmed = false;
+
+const SCAD_FILTERS = [{ name: 'OpenSCAD', extensions: ['scad'] }];
+
+// Asks before unsaved changes are thrown away. Returns 'save', 'discard' or
+// 'cancel'.
+async function confirmDiscard(win: BrowserWindow | null, action: string): Promise<'save' | 'discard' | 'cancel'> {
+  const options = {
+    type: 'warning' as const,
+    message: 'You have unsaved changes.',
+    detail: `Save them before ${action}?`,
+    buttons: ['Save', "Don't Save", 'Cancel'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  };
+  const { response } = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options);
+  return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
 }
 
 function createWindow(): void {
@@ -27,6 +46,23 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: false,
     },
+  });
+
+  win.on('close', (event) => {
+    if (!documentDirty || closeConfirmed || process.env['SCADSTUDIO_SCREENSHOT']) return;
+    event.preventDefault();
+    void confirmDiscard(win, 'closing').then((choice) => {
+      if (choice === 'cancel') return;
+      if (choice === 'discard') {
+        closeConfirmed = true;
+        win.close();
+        return;
+      }
+      // Saving needs the renderer's current text and, for an untitled
+      // document, a Save As dialog: hand it over, and the renderer calls
+      // scad:closeAfterSave once the file is written.
+      win.webContents.send('app:saveAndClose');
+    });
   });
 
   win.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
@@ -72,7 +108,9 @@ function createWindow(): void {
           );
           await new Promise((r) => setTimeout(r, 2500));
         }
-        if (process.env['SCADSTUDIO_EXEC_JS']) {
+        // Runs arbitrary JS from the environment, so never in a packaged
+        // release build (QC audit L4); the CI smoke test doesn't use it.
+        if (process.env['SCADSTUDIO_EXEC_JS'] && !app.isPackaged) {
           await win.webContents.executeJavaScript(process.env['SCADSTUDIO_EXEC_JS']);
           await new Promise((r) => setTimeout(r, 500));
         }
@@ -133,18 +171,63 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   ipcMain.handle('scad:render', async (_event, source: string) => {
-    return renderScadToStl(source);
+    return renderScadToStl(source, {
+      documentPath: currentDocumentPath,
+      libraryDirs: defaultLibraryDirs(app.getPath('documents')),
+    });
   });
 
-  ipcMain.handle('scad:openFile', async () => {
+  ipcMain.handle('scad:openFile', async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (documentDirty) {
+      const choice = await confirmDiscard(win, 'opening another file');
+      if (choice === 'cancel') return null;
+      // 'save' is the renderer's job (it has the text); tell it to save and
+      // retry. Returning a marker keeps this handler free of renderer state.
+      if (choice === 'save') return { saveFirst: true } as const;
+    }
     const result = await dialog.showOpenDialog({
       properties: ['openFile'],
-      filters: [{ name: 'OpenSCAD', extensions: ['scad'] }],
+      filters: SCAD_FILTERS,
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     const filePath = result.filePaths[0];
     const contents = await readFile(filePath, 'utf8');
+    currentDocumentPath = filePath;
     return { filePath, contents };
+  });
+
+  // Save / Save As (QC audit H5). Writes the renderer's current text to
+  // `filePath`, or asks for a path when there is none yet or saveAs is set.
+  // Resolves to the path written, or null if the user cancelled the dialog.
+  ipcMain.handle(
+    'scad:saveFile',
+    async (event, request: { filePath: string | null; contents: string; saveAs: boolean }) => {
+      let target = request.saveAs || !request.filePath ? null : request.filePath;
+      if (!target) {
+        const win = BrowserWindow.fromWebContents(event.sender);
+        const options = {
+          defaultPath: request.filePath ?? 'untitled.scad',
+          filters: SCAD_FILTERS,
+        };
+        const result = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
+        if (result.canceled || !result.filePath) return null;
+        target = extname(result.filePath) ? result.filePath : `${result.filePath}.scad`;
+      }
+      await writeFile(target, request.contents, 'utf8');
+      currentDocumentPath = target;
+      documentDirty = false;
+      return target;
+    },
+  );
+
+  ipcMain.on('scad:setDirty', (_event, dirty: boolean) => {
+    documentDirty = dirty;
+  });
+
+  ipcMain.on('scad:closeAfterSave', (event) => {
+    closeConfirmed = true;
+    BrowserWindow.fromWebContents(event.sender)?.close();
   });
 
   createWindow();

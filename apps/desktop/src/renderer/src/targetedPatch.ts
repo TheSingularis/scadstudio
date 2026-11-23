@@ -26,8 +26,12 @@ export interface NodeTransform {
   // in real OpenSCAD source — `scale([-1,1,1])` would look like a stretch.
   scale: [number, number, number];
   // null means "no color() wrap" — distinct from an explicit black [0,0,0].
-  color: [number, number, number] | null;
+  // A fourth component is color()'s alpha, kept so an edit never drops it
+  // from the file (QC audit M2).
+  color: ColorVector | null;
 }
+
+export type ColorVector = [number, number, number] | [number, number, number, number];
 
 export const IDENTITY_TRANSFORM: NodeTransform = {
   translate: [0, 0, 0],
@@ -57,13 +61,15 @@ export function formatNumber(n: number): string {
   return String(rounded);
 }
 
-function formatVector([x, y, z]: [number, number, number]): string {
-  return `[${formatNumber(x)}, ${formatNumber(y)}, ${formatNumber(z)}]`;
+function formatVector(v: readonly number[]): string {
+  return `[${v.map(formatNumber).join(', ')}]`;
 }
 
 interface VectorCall {
   name: string;
   xyz: [number, number, number];
+  // Fourth component when the vector has exactly four (color's alpha).
+  w: number | null;
 }
 
 function topConcreteNode(root: Node, node: SceneNode): Node | null {
@@ -98,10 +104,14 @@ function readVectorCall(call: Node): VectorCall | null {
   const args = call.childForFieldName('arguments')?.namedChild(0); // `arguments` node
   const firstArg = args?.namedChild(0); // `argument` node
   const vec = firstArg?.child(0);
-  if (!vec || vec.type !== 'vector_expression' || vec.namedChildCount < 3) return null;
-  const nums = [0, 1, 2].map((n) => readNumber(vec.namedChild(n)));
+  // Exactly three components, or four for color's alpha: anything else is
+  // not a vector this module can round-trip, so the wrap is left alone.
+  if (!vec || vec.type !== 'vector_expression') return null;
+  const count = vec.namedChildCount;
+  if (count !== 3 && !(count === 4 && name === 'color')) return null;
+  const nums = Array.from({ length: count }, (_, n) => readNumber(vec.namedChild(n)));
   if (nums.some((n) => n === null)) return null;
-  return { name, xyz: nums as [number, number, number] };
+  return { name, xyz: nums.slice(0, 3) as [number, number, number], w: count === 4 ? nums[3] : null };
 }
 
 export interface DecomposedNode {
@@ -152,11 +162,35 @@ function axisAlignedMirrorAxis(xyz: [number, number, number]): 0 | 1 | 2 | null 
 // (and gizmo-generated) canonical-order case.
 export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | null {
   const top = topConcreteNode(root, node);
-  if (!top || top.type !== 'module_instantiation') return null;
+  if (!top) return null;
+  // A bare top-level block, `{ cube(5); }`, is valid OpenSCAD (and is what
+  // a brace-form wrap like `translate(v) { ... }` leaves behind once a gizmo
+  // drag returns it to identity). It has no wraps of its own; the block is
+  // its own primitive, so it can still be moved and wrapped.
+  if (top.type === 'block') {
+    return {
+      transform: { ...IDENTITY_TRANSFORM },
+      primitiveStart: top.startIndex,
+      wrapStart: top.startIndex,
+      primitiveNode: top,
+    };
+  }
+  if (top.type !== 'module_instantiation') return null;
 
   const transform: NodeTransform = { translate: [0, 0, 0], rotateDeg: [0, 0, 0], scale: [1, 1, 1], color: null };
   const mirrorSign: [number, number, number] = [1, 1, 1];
   let sawColor = false;
+  let sawScale = false;
+  // Canonical-order rank of the innermost wrap consumed so far (see
+  // WRAP_RANK). Only a chain that is already in canonical order, with at most
+  // one translate/rotate/scale, can be represented as independent slots and
+  // written back unchanged. Anything else (a second translate stacked on the
+  // first, or rotate() outside translate()) stops the walk *before* it is
+  // recorded: the rest of the chain stays part of the primitive's own text,
+  // which WASM renders with those transforms baked in. That keeps the
+  // display identical to real OpenSCAD and means a gizmo edit only ever
+  // rewrites the outer, canonical part (QC audit M1).
+  let lastRank = -1;
   // A leading modifier character (`# % ! *`, see readModifier/patchModifier
   // below) is `top`'s own first child, not part of the transform/primitive
   // content — wrapStart must start *after* it, or patchTransform's rewrite
@@ -169,37 +203,46 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
 
   while (current.type === 'module_instantiation') {
     const name = current.childForFieldName('name')?.text;
+    const rank = name ? WRAP_RANK.get(name) : undefined;
+    if (rank === undefined) break;
+
+    // The wrap's body decides whether there is anything to descend into.
+    // `translate(v) child;` has a `statement` body; `translate(v) { ... }`
+    // has a `block` body, which becomes the primitive itself (rendered as
+    // `{ ... }`, valid OpenSCAD). Checked *before* the value is recorded: a
+    // value recorded for a wrap that then stays in the primitive's text gets
+    // applied twice, once baked in by WASM and once by three.js (QC audit H2).
+    const last = current.child(current.childCount - 1);
+    let next: Node | null = null;
+    if (last?.type === 'statement' && last.child(0)) next = last.child(0);
+    else if (last?.type === 'block') next = last;
+    if (!next) break;
+
+    const vc = readVectorCall(current);
+    if (!vc) break;
     if (name === 'color') {
       if (sawColor) break; // a second color() wrap is unusual; stop rather than guess which wins
-      const vc = readVectorCall(current);
-      if (!vc) break;
-      transform.color = vc.xyz;
+      transform.color = vc.w === null ? vc.xyz : [...vc.xyz, vc.w];
       sawColor = true;
-    } else if (name === 'translate') {
-      const vc = readVectorCall(current);
-      if (!vc) break;
-      transform.translate = vc.xyz;
-    } else if (name === 'rotate') {
-      const vc = readVectorCall(current);
-      if (!vc) break;
-      transform.rotateDeg = vc.xyz;
     } else if (name === 'mirror') {
-      const vc = readVectorCall(current);
-      if (!vc) break;
       const axis = axisAlignedMirrorAxis(vc.xyz);
-      if (axis === null) break;
+      if (axis === null || rank < lastRank) break;
       mirrorSign[axis] *= -1;
+      lastRank = rank;
     } else if (name === 'scale') {
-      const vc = readVectorCall(current);
-      if (!vc) break;
+      if (sawScale || rank < lastRank) break;
       transform.scale = vc.xyz;
+      sawScale = true;
+      lastRank = rank;
     } else {
-      break;
+      // translate / rotate: each at most once, and only in canonical order.
+      if (rank <= lastRank) break;
+      if (name === 'translate') transform.translate = vc.xyz;
+      else transform.rotateDeg = vc.xyz;
+      lastRank = rank;
     }
 
-    const last = current.child(current.childCount - 1);
-    if (last?.type !== 'statement' || !last.child(0)) break;
-    current = last.child(0)!;
+    current = next;
   }
 
   transform.scale = transform.scale.map((v, i) => v * mirrorSign[i]) as [number, number, number];
@@ -212,6 +255,18 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   const primitiveStart = Math.max(current.startIndex, wrapStart);
   return { transform, primitiveStart, wrapStart, primitiveNode: current };
 }
+
+// Canonical outer-to-inner order that formatTransformPrefix writes and
+// three.js composes (T·R·S). color() changes no geometry, so it may sit
+// anywhere in the chain. mirror and scale share a rank: both are diagonal
+// matrices, so their relative order doesn't change the result.
+const WRAP_RANK = new Map<string, number>([
+  ['color', -1],
+  ['translate', 0],
+  ['rotate', 1],
+  ['mirror', 2],
+  ['scale', 2],
+]);
 
 // M6's four OpenSCAD modifier characters — highlight (#), background/ghost
 // (%), root/show-only (!), disable (*). Grammar-level, these prefix a
@@ -295,11 +350,13 @@ const MIRROR_AXIS_VECTORS: [number, number, number][] = [
   [0, 0, 1],
 ];
 
+const WRAP_SEPARATOR = '\n    ';
+
 function formatTransformPrefix(t: NodeTransform): string {
   let prefix = '';
-  if (t.color) prefix += `color(${formatVector(t.color)})\n    `;
-  if (t.translate.some((v) => v !== 0)) prefix += `translate(${formatVector(t.translate)})\n    `;
-  if (t.rotateDeg.some((v) => v !== 0)) prefix += `rotate(${formatVector(t.rotateDeg)})\n    `;
+  if (t.color) prefix += `color(${formatVector(t.color)})${WRAP_SEPARATOR}`;
+  if (t.translate.some((v) => v !== 0)) prefix += `translate(${formatVector(t.translate)})${WRAP_SEPARATOR}`;
+  if (t.rotateDeg.some((v) => v !== 0)) prefix += `rotate(${formatVector(t.rotateDeg)})${WRAP_SEPARATOR}`;
   // Negative scale components are written back out as real mirror() calls
   // rather than a literal negative scale() — see NodeTransform.scale's
   // comment for why they're equivalent and why source should read as
@@ -307,11 +364,11 @@ function formatTransformPrefix(t: NodeTransform): string {
   const absScale: [number, number, number] = [...t.scale];
   for (let axis = 0; axis < 3; axis++) {
     if (t.scale[axis] < 0) {
-      prefix += `mirror(${formatVector(MIRROR_AXIS_VECTORS[axis])})\n    `;
+      prefix += `mirror(${formatVector(MIRROR_AXIS_VECTORS[axis])})${WRAP_SEPARATOR}`;
       absScale[axis] = -t.scale[axis];
     }
   }
-  if (absScale.some((v) => v !== 1)) prefix += `scale(${formatVector(absScale)})\n    `;
+  if (absScale.some((v) => v !== 1)) prefix += `scale(${formatVector(absScale)})${WRAP_SEPARATOR}`;
   return prefix;
 }
 
@@ -326,7 +383,18 @@ function formatTransformPrefix(t: NodeTransform): string {
 export function patchTransform(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): string {
   const decomposed = decomposeNode(tree.rootNode, node);
   if (!decomposed) return source;
-  const prefix = formatTransformPrefix(transform);
+  let prefix = formatTransformPrefix(transform);
+  // Brace form keeps its brace on the wrap's own line:
+  // `translate([40, 0, 0]) { ... }`, not a `{` alone on the next line.
+  if (decomposed.primitiveNode.type === 'block' && prefix.endsWith(WRAP_SEPARATOR)) {
+    prefix = `${prefix.slice(0, -WRAP_SEPARATOR.length)} `;
+  }
+  // A modifier can only prefix a module call, not a bare `{ ... }`, so an
+  // identity transform on a modified brace body keeps a no-op call to hang
+  // the modifier on.
+  if (decomposed.primitiveNode.type === 'block' && prefix === '' && readModifier(tree.rootNode, node)) {
+    prefix = 'union() ';
+  }
   return source.slice(0, decomposed.wrapStart) + prefix + source.slice(decomposed.primitiveStart);
 }
 
@@ -354,7 +422,15 @@ export interface PrimitiveArg {
 export function primitiveArgs(root: Node, node: SceneNode): { callName: string; args: PrimitiveArg[] } | null {
   const decomposed = decomposeNode(root, node);
   if (!decomposed) return null;
-  const call = decomposed.primitiveNode;
+  let call = decomposed.primitiveNode;
+  // Brace form with a single child, `translate(v) { cube(5); }`: the panel
+  // edits that child's arguments, the same as for `translate(v) cube(5);`.
+  if (call.type === 'block') {
+    const statements = call.namedChildren.filter((c) => c?.type === 'statement');
+    const only = statements.length === 1 ? statements[0]?.child(0) : null;
+    if (only?.type !== 'module_instantiation') return null;
+    call = only;
+  }
   const callName = call.childForFieldName('name')?.text;
   if (!callName) return null;
   const argsNode = call.childForFieldName('arguments')?.namedChild(0); // `arguments` node, absent if call has zero args
@@ -423,13 +499,24 @@ function indent(text: string, spaces: string): string {
 // entirely, and everything else is untouched — same minimal-diff philosophy
 // as patchTransform/patchArgument, just applied to multiple disjoint ranges
 // in one edit instead of one.
+// End of a comment that follows a statement on its own line
+// (`cube(5); // base`), or `end` itself if there is none. A boolean wrap
+// moves that comment along with its statement; before, the statement moved
+// into the block and its comment stayed behind after the closing brace
+// (QC audit L1).
+function trailingCommentEnd(source: string, end: number): number {
+  const m = /^[ \t]*(\/\/[^\n]*|\/\*[^\n]*?\*\/[ \t]*(?=\n|$))/.exec(source.slice(end));
+  return m ? end + m[0].length : end;
+}
+
 export function wrapInBoolean(source: string, nodesInSelectionOrder: SceneNode[], op: BooleanOp): string {
   if (nodesInSelectionOrder.length < 2) return source;
   const byDocOrder = [...nodesInSelectionOrder].sort((a, b) => a.startIndex - b.startIndex);
   const first = byDocOrder[0];
+  const endOf = (n: SceneNode) => trailingCommentEnd(source, n.endIndex);
 
   const body = nodesInSelectionOrder
-    .map((n) => indent(source.slice(n.startIndex, n.endIndex).trim(), '    '))
+    .map((n) => indent(source.slice(n.startIndex, endOf(n)).trim(), '    '))
     .join('\n');
   const block = `${op}() {\n${body}\n}`;
 
@@ -438,7 +525,7 @@ export function wrapInBoolean(source: string, nodesInSelectionOrder: SceneNode[]
   for (const node of byDocOrder) {
     result += source.slice(cursor, node.startIndex);
     result += node === first ? block : '';
-    cursor = node.endIndex;
+    cursor = endOf(node);
     if (node !== first && source[cursor] === '\n') cursor++;
   }
   result += source.slice(cursor);

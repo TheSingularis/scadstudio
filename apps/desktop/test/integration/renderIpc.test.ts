@@ -57,7 +57,7 @@ describe('scad:render IPC handler (M1/M2)', () => {
     await expect(render('circle(r=5);')).rejects.toBeDefined();
   });
 
-  it.fails(audit('M4', 'render errors are real Errors with a readable message, not [object Object]'), async () => {
+  it(audit('M4', 'render errors are real Errors with a readable message, not [object Object]'), async () => {
     const err = await render('cube(;').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Error);
     expect(String((err as Error).message)).not.toMatch(/^\[object Object\]$|^$/);
@@ -71,7 +71,7 @@ describe('render backend and timing (audit H1)', () => {
       `translate([${(i % 4) * 15}, ${Math.floor(i / 4) * 15}, 0]) difference() { cube(10); translate([5, 5, -1]) cylinder(h=12, r=3, $fn=32); }`,
   ).join('\n');
 
-  it.fails(audit('H1', 'renders with the Manifold backend'), async () => {
+  it(audit('H1', 'renders with the Manifold backend'), async () => {
     await render('difference() { cube(10); sphere(6); }');
     const log = main.engineLog[main.engineLog.length - 1].join('\n');
     expect(log).toMatch(/\(manifold\)/i);
@@ -80,7 +80,7 @@ describe('render backend and timing (audit H1)', () => {
 
   // Manifold renders this in ~20-50 ms and CGAL in ~2.3 s on a dev machine,
   // so a 750 ms budget separates them with a wide margin either way.
-  it.fails(audit('H1', 'a 12-part boolean file renders inside the latency budget (750 ms)'), async () => {
+  it(audit('H1', 'a 12-part boolean file renders inside the latency budget (750 ms)'), async () => {
     const t0 = performance.now();
     await render(twelveBooleanParts);
     expect(performance.now() - t0).toBeLessThan(750);

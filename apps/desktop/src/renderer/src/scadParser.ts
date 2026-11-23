@@ -1,6 +1,8 @@
 import { Parser, Language, Tree } from 'web-tree-sitter';
 
 let parserPromise: Promise<Parser> | null = null;
+// The same Parser once it has loaded, for parseScadSync below.
+let loadedParser: Parser | null = null;
 
 async function loadWasmBytes(url: string): Promise<Uint8Array> {
   const res = await fetch(url);
@@ -19,6 +21,7 @@ function getParser(): Promise<Parser> {
       const language = await Language.load(await loadWasmBytes(`${base}tree-sitter-openscad.wasm`));
       const parser = new Parser();
       parser.setLanguage(language);
+      loadedParser = parser;
       return parser;
     })();
   }
@@ -39,12 +42,20 @@ function countErrors(node: import('web-tree-sitter').Node): number {
   return count;
 }
 
-// M2 scope: incremental parse only (feeding tree.edit() forward isn't wired
-// in yet since there's no scene-graph consuming byte ranges until M3 — this
-// re-parses fresh each call but reuses the loaded Parser/Language instance).
-export async function parseScad(source: string, previousTree?: Tree): Promise<ParseResult> {
+// Re-parses from scratch on each call, reusing the loaded Parser/Language
+// instance. Not incremental: that would need tree.edit() fed with each
+// change's byte ranges, and a full parse of a typical file is a few ms.
+export async function parseScad(source: string): Promise<ParseResult> {
   const parser = await getParser();
-  const tree = parser.parse(source, previousTree);
+  const tree = parser.parse(source);
   if (!tree) throw new Error('tree-sitter returned no tree');
   return { tree, errorCount: countErrors(tree.rootNode) };
+}
+
+// Synchronous parse for edit handlers that must work on a tree matching the
+// latest text right now, not the one the last async render parsed (QC audit
+// M3). Null only before the grammar has finished loading, which is before
+// the first render, so before any visual edit is possible.
+export function parseScadSync(source: string): Tree | null {
+  return loadedParser?.parse(source) ?? null;
 }

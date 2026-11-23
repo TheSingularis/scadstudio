@@ -25,7 +25,6 @@ async function answerUnsavedPrompts(scad: import('./fixtures').ScadApp, response
 // 12 isolated node renders land around 9 s versus 1-2 s: a 4 s budget
 // separates the two with room for slow CI runners.
 test(audit('H1', 'a 12-part boolean file renders in the app within 4 s'), async ({ scad }) => {
-  test.fail();
   const parts = Array.from(
     { length: 12 },
     (_, i) => `translate([${(i % 4) * 15}, ${Math.floor(i / 4) * 15}, 0]) difference() { cube(10, center=true); sphere(r=6.5, $fn=48); }`,
@@ -38,7 +37,6 @@ test(audit('H1', 'a 12-part boolean file renders in the app within 4 s'), async 
 });
 
 test(audit('H3', 'a visual edit can be undone with Ctrl+Z, and typed history survives it'), async ({ scad }) => {
-  test.fail();
   await scad.load('cube(1);\n', { fit: false });
   await scad.rendersAfter(() => scad.typeAtEnd('// typed\n'));
   await scad.rendersAfter(() => scad.button('Sphere').click());
@@ -57,7 +55,6 @@ test(audit('H3', 'a visual edit can be undone with Ctrl+Z, and typed history sur
 });
 
 test(audit('H4', 'opening a file with use <lib.scad> renders the library geometry'), async ({ scad, tmpDir }) => {
-  test.fail();
   mkdirSync(join(tmpDir, 'libs'));
   writeFileSync(join(tmpDir, 'lib.scad'), 'module peg(h) { cylinder(h=h, r=2, $fn=16); }\n');
   writeFileSync(join(tmpDir, 'libs', 'plate.scad'), 'module plate() { cube([10, 10, 1]); }\n');
@@ -71,7 +68,6 @@ test(audit('H4', 'opening a file with use <lib.scad> renders the library geometr
 });
 
 test(audit('H5', 'Ctrl+S saves the document to disk'), async ({ scad, tmpDir }) => {
-  test.fail();
   const target = join(tmpDir, 'saved.scad');
   await scad.stubDialogs({ save: target });
   await scad.load('cube(3);\n', { fit: false });
@@ -82,7 +78,6 @@ test(audit('H5', 'Ctrl+S saves the document to disk'), async ({ scad, tmpDir }) 
 });
 
 test(audit('H5', 'closing with unsaved changes asks first'), async ({ scad }) => {
-  test.fail();
   await scad.typeAtEnd('// unsaved\n');
   await answerUnsavedPrompts(scad, 2); // the fix's Cancel button: keep the window open
   await scad.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.close());
@@ -92,7 +87,6 @@ test(audit('H5', 'closing with unsaved changes asks first'), async ({ scad }) =>
 });
 
 test(audit('M3', 'a toolbar edit right after typing (inside the debounce) does not corrupt the file'), async ({ scad }) => {
-  test.fail();
   await scad.load('cube(10, center=true);\n');
   await scad.clickViewport();
   expect(await scad.selectedCall()).toBe('cube');
@@ -112,7 +106,6 @@ test(audit('M3', 'a toolbar edit right after typing (inside the debounce) does n
 });
 
 test(audit('M4', 'a node that fails to render says which node and why'), async ({ scad }) => {
-  test.fail();
   const status = await scad.load('cube(5);\nnot_a_module(3);\n', { fit: false });
   expect(status).toMatch(/Rendered 1\/2 nodes/);
   expect(status).toMatch(/not_a_module|unknown module/i);
@@ -120,7 +113,6 @@ test(audit('M4', 'a node that fails to render says which node and why'), async (
 });
 
 test(audit('M5', 'comments are highlighted as comments, not as code'), async ({ scad }) => {
-  test.fail();
   await scad.load('// for comment here\nfor (i = [0:1]) cube(1);\n', { fit: false });
   const classes = await scad.page.evaluate(() => {
     const lines = [...document.querySelectorAll('.monaco-editor .view-line')];

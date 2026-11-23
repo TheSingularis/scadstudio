@@ -16,7 +16,7 @@ import {
   sketchPlaneFromTransform,
 } from './components/Viewport';
 import { DEFAULT_SNAP_SETTINGS, type SnapSettings } from './sketchSnap';
-import { parseScad } from './scadParser';
+import { parseScad, parseScadSync } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import {
   patchTransform,
@@ -36,6 +36,7 @@ import {
   type BooleanOp,
   type ExtrudeOp,
   type Modifier,
+  type ColorVector,
 } from './targetedPatch';
 import { appendPrimitive, appendSketchPolygon, type PrimitiveKind } from './primitives';
 import { createCoalescingRunner } from './coalescingRunner';
@@ -127,7 +128,7 @@ const BOOLEAN_OP_BUTTONS: { op: BooleanOp; label: string }[] = [
 // material color the viewport defaults to.
 const NO_COLOR_HEX = '#4a90d9';
 
-function rgbToHex(rgb: [number, number, number] | null): string {
+function rgbToHex(rgb: ColorVector | null): string {
   if (!rgb) return NO_COLOR_HEX;
   const toHex = (v: number) =>
     Math.round(Math.min(1, Math.max(0, v)) * 255)
@@ -161,9 +162,19 @@ translate([40, 0, 0])
 // renders, no per-keystroke pile-up) rather than relying on debounce alone.
 const RENDER_DEBOUNCE_MS = 400;
 
+// Electron wraps an error thrown by an ipcMain handler as "Error invoking
+// remote method 'scad:render': ScadRenderError: <message>"; keep the message.
+function renderErrorMessage(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err);
+  return text.replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
+}
+
 export function App() {
-  const [source, setSource] = useState(DEFAULT_SOURCE);
+  const [source, setSourceState] = useState(DEFAULT_SOURCE);
   const [filePath, setFilePath] = useState<string | null>(null);
+  // The text as last opened or saved: the document is dirty while the
+  // editor holds anything else.
+  const [savedSource, setSavedSource] = useState(DEFAULT_SOURCE);
   // Bumped by the "Reset View" button — combined with filePath into
   // Viewport's fitToken, so the camera re-fits on an explicit request too,
   // not just on opening a new file.
@@ -230,12 +241,32 @@ export function App() {
   const treeRef = useRef<Tree | null>(null);
   const sourceRef = useRef(source);
   const sceneNodesRef = useRef<SceneNode[]>([]);
-  useEffect(() => {
-    sourceRef.current = source;
-  }, [source]);
-  useEffect(() => {
-    sceneNodesRef.current = sceneNodes;
-  }, [sceneNodes]);
+  // Bumped whenever a different document is loaded, so the editor starts a
+  // fresh undo history for it (and only then; see Editor's documentKey).
+  const [documentToken, setDocumentToken] = useState(0);
+
+  // Every source change goes through here, typed or visual. It keeps
+  // sourceRef, treeRef and sceneNodesRef describing the *same* text at all
+  // times, synchronously, so an edit handler never splices byte offsets
+  // from an older parse into newer text. Before this, typing and then
+  // dragging a gizmo (or clicking a toolbar button) inside the render
+  // debounce combined the last-rendered tree with the just-typed source and
+  // corrupted the file (QC audit M3). A visual edit also cancels a pending
+  // typed-text render, which would otherwise land after it and show stale
+  // geometry.
+  const setSource = useCallback((next: string) => {
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+    }
+    sourceRef.current = next;
+    const parsed = parseScadSync(next);
+    if (parsed) {
+      treeRef.current = parsed;
+      sceneNodesRef.current = buildSceneGraph(parsed, next).nodes;
+    }
+    setSourceState(next);
+  }, []);
 
   const runRender = useMemo(
     () =>
@@ -243,10 +274,13 @@ export function App() {
         setStatus('Rendering...');
         try {
           const { tree: parsedTree, errorCount } = await parseScad(src);
-          treeRef.current = parsedTree;
+          // Only adopt this parse for edit handlers if it is still the
+          // current text; otherwise setSource has already parsed newer text.
+          if (src === sourceRef.current) treeRef.current = parsedTree;
           setTree(parsedTree);
           setParseErrorCount(errorCount);
           const graph = buildSceneGraph(parsedTree, src);
+          if (src === sourceRef.current) sceneNodesRef.current = graph.nodes;
           setSceneNodes(graph.nodes);
 
           // Isolated per-node renders (M3 scope: one call per top-level
@@ -254,6 +288,9 @@ export function App() {
           // stays simple rather than the full render-worker job queue).
           const meshes: NodeMesh[] = [];
           let disabledCount = 0;
+          // First node that failed both render attempts, shown in the status
+          // bar so a failure says which node and why (QC audit M4).
+          let firstFailure: string | null = null;
           for (const node of graph.nodes) {
             // `*` (disable) — real OpenSCAD never evaluates disabled
             // geometry at all, so skip the WASM call entirely rather than
@@ -293,6 +330,12 @@ export function App() {
                 meshes.push({ index: node.index, bytes, transform, modifier });
               } catch (err2) {
                 console.error(`[scadstudio] node ${node.index} render failed`, err, err2);
+                // A 2D node's first error is only "not a 3D object"; its
+                // real reason is in the retry's error. For anything else the
+                // first attempt's error is the real one.
+                const firstMessage = renderErrorMessage(err);
+                const reason = /not a 3D object/i.test(firstMessage) ? renderErrorMessage(err2) : firstMessage;
+                firstFailure ??= `node ${node.index + 1} (${node.label.trim()}): ${reason.split('\n')[0]}`;
               }
             }
           }
@@ -309,7 +352,11 @@ export function App() {
           }
           const expected = graph.nodes.length - disabledCount;
           const disabledSuffix = disabledCount > 0 ? ` (${disabledCount} disabled)` : '';
-          setStatus(meshes.length === expected ? `Rendered${disabledSuffix}` : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}`);
+          setStatus(
+            meshes.length === expected
+              ? `Rendered${disabledSuffix}`
+              : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}${firstFailure ? ` — ${firstFailure}` : ''}`,
+          );
         } catch (err) {
           setStatus(`Render failed: ${(err as Error).message}`);
           console.error('[scadstudio] render failed', err);
@@ -350,14 +397,68 @@ export function App() {
     [runRender],
   );
 
+  const dirty = source !== savedSource;
+
+  // Save / Save As (QC audit H5). Resolves true once the text is on disk.
+  const handleSave = useCallback(
+    async (saveAs: boolean): Promise<boolean> => {
+      const contents = sourceRef.current;
+      const written = await window.scadstudio.saveFile({ filePath, contents, saveAs });
+      if (!written) return false;
+      setFilePath(written);
+      setSavedSource(contents);
+      setStatus(`Saved ${written}`);
+      return true;
+    },
+    [filePath],
+  );
+
   const handleOpen = useCallback(async () => {
-    const result = await window.scadstudio.openFile();
-    if (!result) return;
+    let result = await window.scadstudio.openFile();
+    if (result && 'saveFirst' in result) {
+      if (!(await handleSave(false))) return;
+      result = await window.scadstudio.openFile();
+    }
+    if (!result || 'saveFirst' in result) return;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setFilePath(result.filePath);
+    setSavedSource(result.contents);
+    setDocumentToken((t) => t + 1);
     setSource(result.contents);
     runRender(result.contents);
-  }, [runRender]);
+  }, [runRender, handleSave, setSource]);
+
+  // Keep the main process's copy of the dirty flag current (it asks before
+  // closing the window or opening over unsaved changes), and show it in the
+  // window title the usual way.
+  useEffect(() => {
+    window.scadstudio.setDirty(dirty);
+    const name = filePath ? filePath.split(/[\\/]/).pop() : 'Untitled';
+    document.title = `${dirty ? '• ' : ''}${name} - ScadStudio`;
+  }, [dirty, filePath]);
+
+  // Ctrl+S / Ctrl+Shift+S (Cmd on macOS). Capture phase, so the editor
+  // doesn't swallow the key first.
+  const handleSaveRef = useRef(handleSave);
+  handleSaveRef.current = handleSave;
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== 's') return;
+      e.preventDefault();
+      e.stopPropagation();
+      void handleSaveRef.current(e.shiftKey);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    const unsubscribe = window.scadstudio.onSaveAndClose(() => {
+      void handleSaveRef.current(false).then((saved) => {
+        if (saved) window.scadstudio.closeAfterSave();
+      });
+    });
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      unsubscribe();
+    };
+  }, []);
 
   // M7.5 on-plane editing: the only two writers of sketchPoints, keeping
   // sketchPointsRef in step. History snapshots are captured *before* the
@@ -571,7 +672,9 @@ export function App() {
       const r = parseInt(hex.slice(1, 3), 16) / 255;
       const g = parseInt(hex.slice(3, 5), 16) / 255;
       const b = parseInt(hex.slice(5, 7), 16) / 255;
-      handleTransformCommit(primarySelectedIndex, { ...current, color: [r, g, b] });
+      // Keep an existing alpha: the picker only chooses the RGB part.
+      const color: ColorVector = current.color?.length === 4 ? [r, g, b, current.color[3]] : [r, g, b];
+      handleTransformCommit(primarySelectedIndex, { ...current, color });
     },
     [primarySelectedIndex, nodeMeshes, handleTransformCommit],
   );
@@ -794,8 +897,17 @@ export function App() {
         }}
       >
         <button onClick={handleOpen}>Open .scad file...</button>
+        <button onClick={() => void handleSave(false)} title="Save (Ctrl+S)">
+          Save
+        </button>
+        <button onClick={() => void handleSave(true)} title="Save As (Ctrl+Shift+S)">
+          Save As...
+        </button>
         <button onClick={() => setResetViewToken((t) => t + 1)}>Reset View</button>
-        <span>{filePath ?? '(unsaved default example)'}</span>
+        <span title={dirty ? 'Unsaved changes' : undefined}>
+          {filePath ?? '(unsaved default example)'}
+          {dirty ? ' •' : ''}
+        </span>
         <span style={{ marginLeft: 'auto', opacity: 0.7 }}>
           {parseErrorCount ? `${parseErrorCount} parse error(s) — ` : ''}
           {status}
@@ -1035,6 +1147,7 @@ export function App() {
             nodes={sceneNodes}
             selectedIndex={primarySelectedIndex}
             onSelectNode={(index) => handleSelect(index, 'replace')}
+            documentKey={documentToken}
           />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>

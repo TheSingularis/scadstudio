@@ -119,7 +119,7 @@ interface ViewportProps {
   rotateSpace: RotateSpace;
   onTransformCommit: (index: number, transform: NodeTransform) => void;
   // Changing this value re-fits/re-centers the camera on the current scene
-  // (see the <Bounds key={fitToken}> below) — deliberately *not* derived from
+  // (see FitController below) — deliberately *not* derived from
   // `meshes` itself, so routine edits (dragging a gizmo, tweaking a
   // parameter) don't yank the camera around. App.tsx changes it only when a
   // genuinely new file is opened or the user explicitly clicks "Reset View".
@@ -219,8 +219,12 @@ function NodeModel({
     if (role === 'base') return SELECTED_MESH_COLOR;
     if (role === 'operand') return OPERAND_MESH_COLOR;
     if (mesh.modifier === '#') return HIGHLIGHT_MESH_COLOR;
-    return mesh.transform.color ? new Color(...mesh.transform.color) : DEFAULT_MESH_COLOR;
+    const c = mesh.transform.color;
+    return c ? new Color(c[0], c[1], c[2]) : DEFAULT_MESH_COLOR;
   }, [role, mesh.modifier, mesh.transform.color]);
+  // color([r,g,b,a])'s alpha, shown translucent the way OpenSCAD's preview
+  // shows it (QC audit M2).
+  const colorAlpha = mesh.transform.color?.length === 4 ? Math.min(1, Math.max(0, mesh.transform.color[3])) : 1;
   // `%` stays translucent regardless of selection/highlight — it's a
   // persistent "ghost reference" state, not something selecting the node
   // should visually override.
@@ -267,8 +271,8 @@ function NodeModel({
         <meshStandardMaterial
           color={materialColor}
           side={2}
-          transparent={isGhost}
-          opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : 1}
+          transparent={isGhost || colorAlpha < 1}
+          opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : colorAlpha}
           depthWrite={!editing}
           // Hidden surface still raycasts (only drawing is skipped, same
           // split as SketchDrawingPlane's material) — shapes stay clickable
