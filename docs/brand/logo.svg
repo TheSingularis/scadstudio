@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs><mask id="hole"><rect width="64" height="64" fill="#fff"/><circle cx="44" cy="20" r="15.2" fill="#000"/></mask></defs>
+  <rect x="4" y="12" width="46" height="46" rx="5" fill="#e8a33d" mask="url(#hole)"/>
+  <circle cx="44" cy="20" r="14" fill="none" stroke="#4a90d9" stroke-width="3.4" stroke-dasharray="5.4 3.396"/>
+</svg>
