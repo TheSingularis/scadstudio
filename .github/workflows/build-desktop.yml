@@ -68,7 +68,7 @@ jobs:
 
       - name: Upload smoke test screenshot
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-test-screenshot-linux
           path: /tmp/smoke.png
@@ -76,7 +76,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: scadstudio-appimage
           path: apps/desktop/dist/*.AppImage
@@ -140,7 +140,7 @@ jobs:
 
       - name: Upload smoke test screenshot
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-test-screenshot-windows
           path: ${{ runner.temp }}/smoke-win.png
@@ -148,7 +148,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload portable exe
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: scadstudio-exe
           path: apps/desktop/dist/*.exe
