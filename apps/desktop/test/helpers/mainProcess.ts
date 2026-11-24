@@ -17,6 +17,8 @@ export interface MainProcessHarness {
   engineLog: string[][];
   dialog: { showOpenDialog: ReturnType<typeof vi.fn>; showSaveDialog: ReturnType<typeof vi.fn> };
   invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
+  /** Channels the main process sent to the renderer (webContents.send), oldest first. */
+  sent: string[];
 }
 
 export async function loadMainProcess(): Promise<MainProcessHarness> {
@@ -24,6 +26,9 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
   const handlers = new Map<string, IpcHandler>();
   const engineLog: string[][] = [];
   const dialog = { showOpenDialog: vi.fn(), showSaveDialog: vi.fn() };
+  const sent: string[] = [];
+  // The one window events reach (e.g. M8's modules:changed).
+  const fakeWindow = { webContents: { send: (channel: string) => sent.push(channel) } };
 
   vi.doMock('electron', () => {
     class FakeWebContents {
@@ -33,7 +38,7 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
     }
     class FakeBrowserWindow {
       static getAllWindows() {
-        return [];
+        return [fakeWindow];
       }
       static fromWebContents() {
         return null;
@@ -84,5 +89,5 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
     if (!fn) throw new Error(`no IPC handler for ${channel}`);
     return fn({ sender: {} }, ...args);
   };
-  return { handlers, engineLog, dialog, invoke };
+  return { handlers, engineLog, dialog, invoke, sent };
 }

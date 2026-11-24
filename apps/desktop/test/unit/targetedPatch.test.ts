@@ -298,7 +298,7 @@ describe('parameter panel (M5)', () => {
 
   it('handles a zero-arg call', async () => {
     const { tree, node } = await nodeAt('sphere();');
-    expect(primitiveArgs(tree.rootNode, node)).toEqual({ callName: 'sphere', args: [] });
+    expect(primitiveArgs(tree.rootNode, node)).toEqual({ callName: 'sphere', args: [], closeParen: 7 });
   });
 
   it('patches one argument and leaves everything else byte-identical', async () => {

@@ -120,7 +120,7 @@ test.describe('M5 transforms, insertion and parameters', () => {
     await scad.load('translate([0, 0, 0]) cylinder(h=20, r=5, $fn=32); // keep\n');
     await scad.clickEditorLine(1);
     expect(await scad.selectedCall()).toBe('cylinder');
-    const r = scad.page.locator('input[type=text]').nth(1);
+    const r = scad.page.getByLabel('Parameter r', { exact: true });
     await expect(r).toHaveValue('5');
     await scad.rendersAfter(async () => {
       await r.fill('7.5');

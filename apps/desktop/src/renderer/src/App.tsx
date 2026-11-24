@@ -25,6 +25,7 @@ import {
   decomposeNode,
   primitiveArgs,
   patchArgument,
+  addNamedArgument,
   wrapInBoolean,
   wrapInExtrude,
   readModifier,
@@ -38,7 +39,12 @@ import {
   type Modifier,
   type ColorVector,
 } from './targetedPatch';
-import { appendPrimitive, appendSketchPolygon, type PrimitiveKind } from './primitives';
+import { appendSketchPolygon } from './primitives';
+import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, builtinTool, insertTool, type ToolDefinition } from './tools';
+import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleIntrospection';
+import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
+
+type ModuleSourceFile = Awaited<ReturnType<Window['scadstudio']['scanModules']>>[number];
 import { createCoalescingRunner } from './coalescingRunner';
 import {
   EMPTY_SKETCH,
@@ -58,22 +64,24 @@ import {
 import { arcPoints, circlePoints, rectanglePoints, type SketchTool } from './sketchShapes';
 import type { SnapKind } from './sketchSnap';
 
-const PRIMITIVE_BUTTONS: { kind: PrimitiveKind; label: string }[] = [
-  { kind: 'cube', label: 'Cube' },
-  { kind: 'sphere', label: 'Sphere' },
-  { kind: 'cylinder', label: 'Cylinder' },
-  { kind: 'square', label: 'Square' },
-  { kind: 'circle', label: 'Circle' },
-];
+// Built-in insert tools (M5) and extrusions (M7) share M8's ToolDefinition
+// shape with the Custom section's tools (see tools.ts). Extrusions insert a
+// whole pre-wrapped statement (extrude + default 2D profile) through the same
+// append path, separated into their own labelled group only for clarity.
+const INSERT_TOOLS = BUILTIN_TOOL_DEFINITIONS.filter((t) => t.section === 'insert');
+const EXTRUDE_TOOLS = BUILTIN_TOOL_DEFINITIONS.filter((t) => t.section === 'extrude') as (ToolDefinition & { callName: ExtrudeOp })[];
 
-// M7: extrusions insert a whole pre-wrapped statement (extrude + default 2D
-// profile) via the same append path as the primitives above — separated into
-// their own labelled toolbar group only for clarity, since they're a distinct
-// operation category (a 2D→3D feature, not a bare primitive).
-const EXTRUDE_BUTTONS: { kind: ExtrudeOp; label: string }[] = [
-  { kind: 'linear_extrude', label: 'Linear Extrude' },
-  { kind: 'rotate_extrude', label: 'Rotate Extrude' },
-];
+// Past this many Custom tools (a big library such as BOSL2), the section
+// gets a filter box and shows only the first matches.
+const CUSTOM_TOOL_LIMIT = 12;
+
+function toolTitle(tool: ToolDefinition): string {
+  const where = tool.origin ? `${tool.origin.file ? tool.origin.file.split(/[\\/]/).pop() : 'this file'}:${tool.origin.line}` : '';
+  const params = tool.params.map((p) => (p.required ? `${p.name} (required)` : `${p.name} = ${p.defaultText}`)).join(', ');
+  return [tool.description, `${tool.callName}(${params})`, where && `Defined in ${where}`, tool.useDirective && `Adds use <${tool.useDirective}>`]
+    .filter(Boolean)
+    .join('\n');
+}
 
 // M7.5: global plane shortcuts. "Pick Face" (slice 3) is a distinct
 // interaction (click a face rather than pick from a fixed list), handled
@@ -298,6 +306,12 @@ export function App() {
   // Bumped whenever a different document is loaded, so the editor starts a
   // fresh undo history for it (and only then; see Editor's documentKey).
   const [documentToken, setDocumentToken] = useState(0);
+  // M8: library files that can supply Custom tools (from the main process's
+  // scan of the document's `use`s), bumped-on-change version, and the
+  // Custom section's filter text.
+  const [libraryFiles, setLibraryFiles] = useState<ModuleSourceFile[]>([]);
+  const [libraryVersion, setLibraryVersion] = useState(0);
+  const [customFilter, setCustomFilter] = useState('');
 
   // Every source change goes through here, typed or visual. It keeps
   // sourceRef, treeRef and sceneNodesRef describing the *same* text at all
@@ -418,6 +432,75 @@ export function App() {
       }),
     [],
   );
+
+  // M8: rescan the document's libraries whenever its set of `use`
+  // directives or its location changes (relative paths resolve from its
+  // folder), or a watched library changes on disk. Keyed on the directives,
+  // not the whole text, so typing elsewhere doesn't re-read files.
+  const useKey = useMemo(() => {
+    if (!tree) return null;
+    const uses: string[] = [];
+    for (const child of tree.rootNode.children) {
+      const concrete = child?.type === 'statement' ? child.child(0) : child;
+      // Includes too: they don't supply tools, but the scan also tells the
+      // main process which files to watch for re-rendering.
+      if (concrete?.type === 'use_statement' || concrete?.type === 'include_statement') uses.push(concrete.text);
+    }
+    return uses.join('\n');
+  }, [tree]);
+  useEffect(() => {
+    if (useKey === null) return;
+    let cancelled = false;
+    window.scadstudio
+      .scanModules(sourceRef.current)
+      .then((files) => {
+        if (!cancelled) setLibraryFiles(files);
+      })
+      .catch((err) => console.error('[scadstudio] module scan failed', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [useKey, filePath, libraryVersion]);
+  useEffect(
+    () =>
+      window.scadstudio.onModulesChanged(() => {
+        // A used file changed: its modules may have, and so may the
+        // geometry of every call into it.
+        setLibraryVersion((v) => v + 1);
+        runRender(sourceRef.current);
+      }),
+    [runRender],
+  );
+
+  // Library files analyzed once per path+contents (definitions, recovered
+  // ones included, and call sites), so an unchanged file isn't re-read on
+  // every document edit: for BOSL2 that is about 0.6 s per render.
+  const libraryAnalysis = useRef(new Map<string, { contents: string; analyzed: AnalyzedSource }>());
+  const customTools = useMemo(() => {
+    if (!tree) return [];
+    const cache = libraryAnalysis.current;
+    const analyzed: AnalyzedSource[] = [
+      analyzeSource({ path: null, tree, useDirective: null, contents: tree.rootNode.text }, parseScadSync),
+    ];
+    const live = new Set<string>();
+    for (const file of libraryFiles) {
+      live.add(file.path);
+      let entry = cache.get(file.path);
+      if (!entry || entry.contents !== file.contents) {
+        const parsed = parseScadSync(file.contents);
+        if (!parsed) continue;
+        entry = { contents: file.contents, analyzed: analyzeSource({ path: file.path, tree: parsed, useDirective: null, contents: file.contents }, parseScadSync) };
+        parsed.delete();
+        cache.set(file.path, entry);
+      }
+      analyzed.push({ ...entry.analyzed, useDirective: file.useDirective });
+    }
+    for (const path of cache.keys()) if (!live.has(path)) cache.delete(path);
+    // In scope first, so a module both in scope and behind a nested use
+    // keeps its in-scope definition.
+    analyzed.sort((a, b) => Number(a.useDirective !== null) - Number(b.useDirective !== null));
+    return toolsFromAnalyzed(analyzed);
+  }, [tree, libraryFiles]);
 
   useEffect(() => {
     runRender(source);
@@ -923,6 +1006,31 @@ export function App() {
     return readModifier(tree.rootNode, node);
   }, [tree, sceneNodes, primarySelectedIndex]);
 
+  // M8: the panel's fields, with real parameter names. A Custom module's
+  // definition wins over a built-in signature (a user module shadows a
+  // built-in of the same name).
+  const panel = useMemo(() => {
+    if (!selectedArgs) return null;
+    const custom = customTools.find((t) => t.callName === selectedArgs.callName);
+    const params = custom?.params ?? BUILTIN_SIGNATURES[selectedArgs.callName] ?? [];
+    return { callName: selectedArgs.callName, custom: !!custom, fields: panelFields(selectedArgs, params, !!custom) };
+  }, [selectedArgs, customTools]);
+
+  // A parameter the call doesn't pass yet: add it as a named argument.
+  const handleAddArg = useCallback(
+    (name: string, valueText: string) => {
+      const currentTree = treeRef.current;
+      const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
+      if (!currentTree || !node || valueText.trim() === '') return;
+      const patched = addNamedArgument(sourceRef.current, currentTree, node, name, valueText);
+      if (patched === sourceRef.current) return;
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(patched);
+      runRender(patched);
+    },
+    [primarySelectedIndex, runRender],
+  );
+
   const handleArgCommit = useCallback(
     (argIndex: number, newValueText: string) => {
       const currentTree = treeRef.current;
@@ -939,9 +1047,10 @@ export function App() {
 
   // M5: toolbar primitive insertion, reusing the same targeted-patch +
   // re-render pipeline as every other edit path.
-  const handleInsertPrimitive = useCallback(
-    (kind: PrimitiveKind) => {
-      const next = appendPrimitive(sourceRef.current, kind);
+  // M8: one path for built-in and Custom tools alike (tools.ts insertTool).
+  const handleInsertTool = useCallback(
+    (tool: ToolDefinition) => {
+      const next = insertTool(sourceRef.current, tool);
       pendingSelectLast.current = true;
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(next);
@@ -961,7 +1070,7 @@ export function App() {
       const tree = treeRef.current;
       const node = primarySelectedIndex !== null ? sceneNodesRef.current.find((n) => n.index === primarySelectedIndex) : undefined;
       if (!tree || !node) {
-        handleInsertPrimitive(op);
+        handleInsertTool(builtinTool(op));
         return;
       }
       const next = wrapInExtrude(sourceRef.current, tree.rootNode, node, op);
@@ -969,7 +1078,7 @@ export function App() {
       setSource(next);
       runRender(next);
     },
-    [primarySelectedIndex, runRender, handleInsertPrimitive],
+    [primarySelectedIndex, runRender, handleInsertTool],
   );
 
   // M7.5: offset() around the selected sketch, in place (same wrap as the
@@ -1067,20 +1176,52 @@ export function App() {
       >
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Insert:
-          {PRIMITIVE_BUTTONS.map(({ kind, label }) => (
-            <button key={kind} onClick={() => handleInsertPrimitive(kind)}>
-              {label}
+          {INSERT_TOOLS.map((tool) => (
+            <button key={tool.id} onClick={() => handleInsertTool(tool)}>
+              {tool.label}
             </button>
           ))}
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Extrude{primarySelectedIndex !== null ? ' (selected)' : ''}:
-          {EXTRUDE_BUTTONS.map(({ kind, label }) => (
-            <button key={kind} onClick={() => handleExtrude(kind)}>
-              {label}
+          {EXTRUDE_TOOLS.map((tool) => (
+            <button key={tool.id} onClick={() => handleExtrude(tool.callName)}>
+              {tool.label}
             </button>
           ))}
         </span>
+        {customTools.length > 0 && (
+          <span
+            role="group"
+            aria-label="Custom modules"
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 6px', borderLeft: '2px solid #c586c0' }}
+          >
+            Custom:
+            {customTools.length > CUSTOM_TOOL_LIMIT && (
+              <input
+                type="search"
+                aria-label="Filter custom modules"
+                placeholder={`Filter ${customTools.length} modules`}
+                value={customFilter}
+                onChange={(e) => setCustomFilter(e.target.value)}
+                size={14}
+              />
+            )}
+            {customTools
+              .filter((t) => t.label.toLowerCase().includes(customFilter.trim().toLowerCase()))
+              .slice(0, CUSTOM_TOOL_LIMIT)
+              .map((tool) => (
+                <button
+                  key={tool.id}
+                  title={toolTitle(tool)}
+                  onClick={() => handleInsertTool(tool)}
+                  style={{ fontStyle: tool.useDirective ? 'italic' : 'normal' }}
+                >
+                  {tool.label}
+                </button>
+              ))}
+          </span>
+        )}
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           {pickingFace ? (
             <>
@@ -1271,10 +1412,11 @@ export function App() {
           </span>
         )}
       </div>
-      {selectedArgs && selectedArgs.args.length > 0 && (
+      {panel && panel.fields.length > 0 && (
         <div
           style={{
             display: 'flex',
+            flexWrap: 'wrap',
             alignItems: 'center',
             gap: 12,
             padding: '6px 12px',
@@ -1284,24 +1426,17 @@ export function App() {
             borderBottom: '1px solid #333',
           }}
         >
-          <span style={{ opacity: 0.7 }}>{selectedArgs.callName}:</span>
-          {selectedArgs.args.map((arg, i) => (
+          <span style={{ opacity: 0.7 }}>{panel.callName}:</span>
+          {panel.fields.map((field, i) => (
             // Keyed on the value text too, not just index: after a commit
             // lands, the canonical (possibly reformatted) text should
             // replace whatever the user typed, which an uncontrolled input
             // only does on remount — see handleArgCommit's comment.
-            <span key={`${i}-${arg.name}-${arg.valueText}`} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ opacity: 0.6 }}>{arg.name ?? `#${i + 1}`}:</span>
-              <input
-                type="text"
-                defaultValue={arg.valueText}
-                size={Math.max(4, arg.valueText.length)}
-                onBlur={(e) => handleArgCommit(i, e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') e.currentTarget.blur();
-                }}
-              />
-            </span>
+            <ParamField
+              key={`${i}-${field.label}-${field.valueText}`}
+              field={field}
+              onCommit={(text) => (field.argIndex !== null ? handleArgCommit(field.argIndex, text) : handleAddArg(field.label, text))}
+            />
           ))}
         </div>
       )}
@@ -1343,5 +1478,143 @@ export function App() {
         </div>
       </div>
     </div>
+  );
+}
+
+// M8: one parameter-panel field, its widget inferred from the parameter's
+// default (or the argument's own literal; see paramPanel.ts). Every widget
+// commits OpenSCAD source text, so a commit is the same targeted argument
+// patch whichever widget made it.
+function ParamField({ field, onCommit }: { field: PanelField; onCommit: (valueText: string) => void }) {
+  const unset = field.valueText === null;
+  const shown = field.valueText ?? field.param?.defaultText ?? '';
+  const label = `Parameter ${field.label}`;
+  const commitOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') e.currentTarget.blur();
+  };
+  const title = field.param?.required
+    ? `${field.label} is required (no default)`
+    : unset
+      ? `Not passed: uses the default ${field.param?.defaultText ?? ''}. Edit to pass a value.`
+      : undefined;
+  let control: React.ReactNode;
+  switch (field.widget) {
+    case 'checkbox':
+      control = (
+        <input
+          type="checkbox"
+          aria-label={label}
+          defaultChecked={shown.trim() === 'true'}
+          onChange={(e) => onCommit(e.target.checked ? 'true' : 'false')}
+        />
+      );
+      break;
+    case 'number':
+    case 'angle':
+      control = (
+        <>
+          <input
+            type="number"
+            aria-label={label}
+            step="any"
+            size={5}
+            style={{ width: 64 }}
+            defaultValue={unset ? undefined : shown}
+            placeholder={unset ? shown : undefined}
+            onBlur={(e) => {
+              if (e.target.value !== '' && e.target.value !== field.valueText) onCommit(e.target.value);
+            }}
+            onKeyDown={commitOnEnter}
+          />
+          {field.widget === 'angle' && (
+            <input
+              type="range"
+              aria-label={`${label} slider`}
+              min={Math.min(0, Number(shown) || 0)}
+              max={Math.max(360, Number(shown) || 0)}
+              step={1}
+              defaultValue={Number(shown) || 0}
+              style={{ width: 90 }}
+              onPointerUp={(e) => onCommit(e.currentTarget.value)}
+              onKeyUp={(e) => onCommit(e.currentTarget.value)}
+            />
+          )}
+          {field.widget === 'angle' && <span style={{ opacity: 0.6 }}>°</span>}
+        </>
+      );
+      break;
+    case 'xyz': {
+      const parts = parseVec3(shown) ?? ['0', '0', '0'];
+      const commitXyz = (container: HTMLElement) => {
+        const values = [...container.querySelectorAll('input')].map((input, k) => (input.value === '' ? parts[k] : input.value));
+        const next = `[${values.join(', ')}]`;
+        if (unset || next.replace(/\s/g, '') !== shown.replace(/\s/g, '')) onCommit(next);
+      };
+      control = (
+        <span
+          style={{ display: 'flex', gap: 2 }}
+          onBlur={(e) => {
+            // Commit once focus leaves the whole X/Y/Z group.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) commitXyz(e.currentTarget);
+          }}
+        >
+          {(['X', 'Y', 'Z'] as const).map((axis, k) => (
+            <input
+              key={axis}
+              type="number"
+              aria-label={`${label} ${axis}`}
+              step="any"
+              style={{ width: 52 }}
+              defaultValue={unset ? undefined : parts[k]}
+              placeholder={unset ? parts[k] : axis}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitXyz(e.currentTarget.parentElement!);
+              }}
+            />
+          ))}
+        </span>
+      );
+      break;
+    }
+    case 'text': {
+      const text = /^\s*"/.test(shown) ? unquoteScadString(shown) : shown;
+      control = (
+        <input
+          type="text"
+          aria-label={label}
+          size={Math.max(6, text.length)}
+          defaultValue={unset ? undefined : text}
+          placeholder={unset ? text : undefined}
+          onBlur={(e) => {
+            const next = quoteScadString(e.target.value);
+            if ((unset && e.target.value !== '') || (!unset && next !== field.valueText)) onCommit(next);
+          }}
+          onKeyDown={commitOnEnter}
+        />
+      );
+      break;
+    }
+    default:
+      control = (
+        <input
+          type="text"
+          aria-label={label}
+          size={Math.max(4, shown.length)}
+          defaultValue={unset ? undefined : shown}
+          placeholder={unset ? shown || 'required' : undefined}
+          onBlur={(e) => {
+            if (e.target.value.trim() !== '' && e.target.value !== field.valueText) onCommit(e.target.value);
+          }}
+          onKeyDown={commitOnEnter}
+        />
+      );
+  }
+  return (
+    <span style={{ display: 'flex', alignItems: 'center', gap: 4, opacity: unset ? 0.75 : 1 }} title={title}>
+      <span style={{ opacity: 0.6, fontStyle: unset ? 'italic' : 'normal', color: field.param?.required ? '#e8a05a' : undefined }}>
+        {field.label}:
+      </span>
+      {control}
+    </span>
   );
 }
