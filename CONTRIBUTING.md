@@ -68,8 +68,6 @@ Every pull request runs these checks, and `main` requires them to pass before me
 - **Unit + integration**: typecheck, unit, integration and real-world corpus tests.
 - **End-to-end (Electron under Xvfb)**: the built app, driven with real mouse and keyboard input.
 
-A third check, **No AI attribution**, fails if commits or files carry AI tool attribution trailers or footers. Please leave those out of commit messages and PR descriptions.
-
 ## License
 
 ScadStudio is licensed under the GNU General Public License, version 3 or later. By contributing, you agree that your contributions are licensed under the same terms (see [LICENSE](LICENSE)).

@@ -19,7 +19,3 @@ Each completed milestone gets its own GitHub pre-release.
    - Or, when tags can't be pushed (cloud sessions block it), run the "Build Desktop Apps" workflow manually on `main` with `release_tag` set to `beta-v0.1.1`. The workflow creates the tag at that commit.
 
 Either way the workflow runs `.github/workflows/build-desktop.yml`. It builds the Linux AppImage and the Windows portable exe, smoke-tests them, and creates the pre-release with both attached. Don't create the release by hand, or the workflow's `gh release create` step fails because the release already exists.
-
-## No AI attribution
-
-Release notes, commits and PR bodies must not carry AI tool attribution (the `no-ai-attribution` workflow checks this). The project-required "requested by" block on PRs is the one exception.
