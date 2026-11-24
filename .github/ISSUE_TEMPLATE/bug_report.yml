@@ -10,8 +10,8 @@ body:
     id: version
     attributes:
       label: ScadStudio version
-      description: The release tag you downloaded (for example beta-v0.1.1), or the commit if you built from source.
-      placeholder: beta-v0.1.1
+      description: The release tag you downloaded (for example beta-v0.1.2), or the commit if you built from source.
+      placeholder: beta-v0.1.2
     validations:
       required: true
   - type: dropdown

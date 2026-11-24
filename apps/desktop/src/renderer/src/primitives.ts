@@ -10,7 +10,7 @@ import type { SketchPoint } from './sketchEditing';
 // interactive sketching (that's M7.5, see PLAN.md).
 export type PrimitiveKind = 'cube' | 'sphere' | 'cylinder' | 'square' | 'circle' | 'linear_extrude' | 'rotate_extrude';
 
-const PRIMITIVE_DEFAULTS: Record<PrimitiveKind, string> = {
+export const PRIMITIVE_DEFAULTS: Record<PrimitiveKind, string> = {
   cube: 'cube([10, 10, 10]);',
   sphere: 'sphere(r=5);',
   cylinder: 'cylinder(h=10, r=5, $fn=32);',
@@ -23,7 +23,7 @@ const PRIMITIVE_DEFAULTS: Record<PrimitiveKind, string> = {
   rotate_extrude: 'rotate_extrude($fn=48) translate([15, 0, 0]) circle(r=4, $fn=32);',
 };
 
-function appendStatement(source: string, statement: string): string {
+export function appendStatement(source: string, statement: string): string {
   const separator = source.endsWith('\n\n') ? '' : source.endsWith('\n') ? '\n' : '\n\n';
   return `${source}${separator}${statement}\n`;
 }

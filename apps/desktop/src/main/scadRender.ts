@@ -110,14 +110,31 @@ function stripCommentsAndStrings(source: string): string {
   return out;
 }
 
+export interface Directive {
+  kind: 'use' | 'include';
+  path: string;
+}
+
+// Every use/include directive in a file, in order, with its `<...>` target.
+export function findDirectives(source: string): Directive[] {
+  const stripped = stripCommentsAndStrings(source);
+  const found: Directive[] = [];
+  const re = /\b(use|include)\s*<([^>\n]+)>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped)) !== null) found.push({ kind: m[1] as Directive['kind'], path: m[2].trim() });
+  return found;
+}
+
 // The `<...>` targets of every use/include directive in a file, in order.
 export function findDependencyPaths(source: string): string[] {
-  const stripped = stripCommentsAndStrings(source);
-  const found: string[] = [];
-  const re = /\b(?:use|include)\s*<([^>\n]+)>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(stripped)) !== null) found.push(m[1].trim());
-  return found;
+  return findDirectives(source).map((d) => d.path);
+}
+
+// Where OpenSCAD finds `rel` when a file in `dir` names it: that folder
+// first, then each library folder in order (absolute paths as they are).
+export function resolutionCandidates(rel: string, dir: string | null, libraryDirs: string[]): string[] {
+  if (path.isAbsolute(rel)) return [path.resolve(rel)];
+  return [...(dir ? [path.resolve(dir, rel)] : []), ...libraryDirs.map((lib) => path.resolve(lib, rel))];
 }
 
 async function readIfFile(hostPath: string): Promise<string | null> {
@@ -145,11 +162,7 @@ export async function collectDependencies(
   while (queue.length > 0 && files.size < MAX_DEPENDENCY_FILES) {
     const { text, dir } = queue.shift()!;
     for (const rel of findDependencyPaths(text)) {
-      const candidates = [
-        ...(dir && !path.isAbsolute(rel) ? [path.resolve(dir, rel)] : []),
-        ...(path.isAbsolute(rel) ? [path.resolve(rel)] : libraryDirs.map((lib) => path.resolve(lib, rel))),
-      ];
-      for (const candidate of candidates) {
+      for (const candidate of resolutionCandidates(rel, dir, libraryDirs)) {
         if (files.has(candidate)) break;
         if (missing.has(candidate)) continue;
         const contents = await read(candidate);

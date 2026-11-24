@@ -7,7 +7,7 @@ By taking part you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Reporting bugs and asking for features
 
 - Search [existing issues](https://github.com/TheSingularis/scadstudio/issues) first.
-- Use the **Bug report** template. Include the ScadStudio version (the release tag, for example `beta-v0.1.1`), your OS, and the smallest `.scad` source that reproduces the problem. Paste it into the issue; most bugs in a source-preserving editor depend on the exact text.
+- Use the **Bug report** template. Include the ScadStudio version (the release tag, for example `beta-v0.1.2`), your OS, and the smallest `.scad` source that reproduces the problem. Paste it into the issue; most bugs in a source-preserving editor depend on the exact text.
 - If the file renders differently in desktop OpenSCAD, say which OpenSCAD version you compared with.
 - Security problems: see [SECURITY.md](SECURITY.md) instead of opening a public issue.
 - For a feature, check the roadmap in [PLAN.md](PLAN.md) first. Many ideas are already planned for a specific milestone.
@@ -42,7 +42,7 @@ On Linux without a display (a container, SSH, CI), Electron needs a virtual disp
 
 ## How the code is laid out
 
-- `apps/desktop/src/main/` is the Electron main process: file dialogs, saving, and rendering through `openscad-wasm`.
+- `apps/desktop/src/main/` is the Electron main process: file dialogs, saving, scanning and watching `use`d libraries, and rendering through `openscad-wasm`.
 - `apps/desktop/src/preload/` is the bridge the renderer uses to call the main process.
 - `apps/desktop/src/renderer/` is the React UI: the Monaco editor, the three.js viewport, the toolbar, sketch mode, and the code that patches `.scad` source (`targetedPatch.ts`).
 - `apps/desktop/test/` holds the unit, integration, corpus and end-to-end tests.

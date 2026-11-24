@@ -120,7 +120,7 @@
 <body>
 
 <h1>scadstudio — Milestone Progress</h1>
-<div class="subtitle">Snapshot as of 2026-11-22 (M0–M7.5 complete. M7.5 finished with Rectangle/Circle/3-point Arc tools, several loops per sketch (inner loops become holes) and Offset; before that, draw-time snapping, the nav cube with shading modes and a Z-up viewport, and on-plane "Edit Sketch". Next: M8). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section — M7.5 (sketch mode) sits between M7 and M8, kept as a ".5" rather than renumbering M8-M14 again. Progress bar counts M0-M11, M7.5, M13 and M15 (v1 scope as of 2026-10-16); M12 is post-v1 and M14 is a stretch goal, so neither is counted.</div>
+<div class="subtitle">Snapshot as of 2026-11-24 (M0–M8 complete. M8 added the Custom toolbar section for modules in the open file and its use&lt;&gt; libraries, with inferred parameter widgets and real parameter names in the panel. M7.5 finished with Rectangle/Circle/3-point Arc tools, several loops per sketch (inner loops become holes) and Offset; before that, draw-time snapping, the nav cube with shading modes and a Z-up viewport, and on-plane "Edit Sketch". Next: M9). Regenerated manually at checkpoints, not live. Milestones from PLAN.md's "Build order / milestones" section — M7.5 (sketch mode) sits between M7 and M8, kept as a ".5" rather than renumbering M8-M14 again. Progress bar counts M0-M11, M7.5, M13 and M15 (v1 scope as of 2026-10-16); M12 is post-v1 and M14 is a stretch goal, so neither is counted.</div>
 
 <div class="legend">
   <div>
@@ -136,7 +136,7 @@
   </div>
 </div>
 
-<div class="progress-bar"><div class="progress-bar-fill" style="width: 53%"></div></div>
+<div class="progress-bar"><div class="progress-bar-fill" style="width: 67%"></div></div>
 
 <details class="phase">
   <summary class="phase-header">
@@ -317,12 +317,19 @@
   </div>
 </details>
 
-<div class="phase">
-  <div class="phase-header">
-    <span class="name">M8 — Custom module auto-toolbar</span>
-    <span class="badge pending">pending</span>
+<details class="phase">
+  <summary class="phase-header">
+    <span class="chevron">▶</span>
+    <span class="name">M8 — Custom module auto-toolbar <span class="tag">modules from the document and its use&lt;&gt; files, widgets, real parameter names</span></span>
+    <span class="badge completed">completed</span>
+  </summary>
+  <div class="subtasks">
+    <div class="subtask"><span class="name">Custom toolbar section: every module in the open file and its use&lt;&gt; files, inserted as a named-argument call through the same path as the built-in tools (one ToolDefinition shape for both)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Library files watched with chokidar from the main process: editing, creating or deleting one refreshes the toolbar and re-renders</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Scoping checked against the engine: use is not transitive, so a module behind a nested use also adds the use directive the document needs; include'd files of the document are not offered (decided with Jordan)</span><span class="badge completed">completed</span></div>
+    <div class="subtask"><span class="name">Parameter panel: real parameter names instead of #1/#2/#3 (custom modules and engine-checked built-in signatures), unset parameters listed with defaults, widgets inferred from defaults (checkbox, number, angle slider, X/Y/Z, text) or from existing call sites when there is no default</span><span class="badge completed">completed</span></div>
   </div>
-</div>
+</details>
 
 <div class="phase">
   <div class="phase-header">
