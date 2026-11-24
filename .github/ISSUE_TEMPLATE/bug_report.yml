@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in ScadStudio does not work, renders wrong, or changes your file in a way it should not.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. A short `.scad` file that shows the problem is the most useful thing you can include.
+  - type: input
+    id: version
+    attributes:
+      label: ScadStudio version
+      description: The release tag you downloaded (for example beta-v0.1.1), or the commit if you built from source.
+      placeholder: beta-v0.1.1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (AppImage)
+        - Windows (portable exe)
+        - Built from source
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: OpenSCAD source
+      description: The smallest file that shows the problem. If the app changed your file, paste it before and after.
+      render: openscad
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the file above
+        2. Select the cube and drag the X arrow
+        3. ...
+  - type: textarea
+    id: openscad
+    attributes:
+      label: Desktop OpenSCAD comparison (optional)
+      description: If it renders differently in desktop OpenSCAD, which version did you compare with and what did it show?
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots or logs (optional)

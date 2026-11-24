@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest something ScadStudio should do.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the roadmap in [PLAN.md](https://github.com/TheSingularis/scadstudio/blob/main/PLAN.md) first; many features are already planned for a milestone.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task or model you are working on, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you picture it working. If it changes the .scad file, show the source you would expect the app to write.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Other options you have tried (optional)
