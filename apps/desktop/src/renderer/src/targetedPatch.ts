@@ -419,7 +419,15 @@ export interface PrimitiveArg {
 // and byte range) — works for any module_instantiation, built-in or custom,
 // since it only depends on the grammar's generic argument/argument_list
 // shape, not per-primitive knowledge of what arguments a given call expects.
-export function primitiveArgs(root: Node, node: SceneNode): { callName: string; args: PrimitiveArg[] } | null {
+export interface CallArgs {
+  callName: string;
+  args: PrimitiveArg[];
+  // Byte offset of the argument list's closing `)`, where addNamedArgument
+  // appends.
+  closeParen: number;
+}
+
+export function primitiveArgs(root: Node, node: SceneNode): CallArgs | null {
   const decomposed = decomposeNode(root, node);
   if (!decomposed) return null;
   let call = decomposed.primitiveNode;
@@ -433,7 +441,9 @@ export function primitiveArgs(root: Node, node: SceneNode): { callName: string; 
   }
   const callName = call.childForFieldName('name')?.text;
   if (!callName) return null;
-  const argsNode = call.childForFieldName('arguments')?.namedChild(0); // `arguments` node, absent if call has zero args
+  const argList = call.childForFieldName('arguments');
+  if (!argList) return null;
+  const argsNode = argList.namedChild(0); // `arguments` node, absent if call has zero args
   const args: PrimitiveArg[] = [];
   for (let i = 0; i < (argsNode?.namedChildCount ?? 0); i++) {
     const argument = argsNode!.namedChild(i);
@@ -453,7 +463,25 @@ export function primitiveArgs(root: Node, node: SceneNode): { callName: string; 
       valueEnd: value.endIndex,
     });
   }
-  return { callName, args };
+  // The list's last child is its `)`; a missing one (mid-typing) has no
+  // width, so fall back to the end of the list.
+  const last = argList.child(argList.childCount - 1);
+  const closeParen = last?.type === ')' && !last.isMissing ? last.startIndex : argList.endIndex;
+  return { callName, args, closeParen };
+}
+
+// M8: adds `name = value` to the end of the selected call's arguments, for a
+// module parameter the call doesn't pass yet (the panel lists those too).
+export function addNamedArgument(source: string, tree: Tree, node: SceneNode, name: string, valueText: string): string {
+  const call = primitiveArgs(tree.rootNode, node);
+  if (!call) return source;
+  if (call.args.some((a) => a.name === name)) return source;
+  const lastArg = call.args[call.args.length - 1];
+  const insertion = `${lastArg ? ', ' : ''}${name} = ${valueText}`;
+  // After the last argument rather than at the `)`, so a trailing newline
+  // or comment before the `)` stays where it is.
+  const at = lastArg ? lastArg.valueEnd : call.closeParen;
+  return source.slice(0, at) + insertion + source.slice(at);
 }
 
 // Minimal-diff edit of a single argument's value, identified by its position

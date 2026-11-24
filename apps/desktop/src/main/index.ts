@@ -2,7 +2,9 @@ import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { defaultLibraryDirs, renderScadToStl } from './scadRender';
+import { watch, type FSWatcher } from 'chokidar';
+import { collectDependencies, defaultLibraryDirs, renderScadToStl } from './scadRender';
+import { scanModuleSources } from './moduleSources';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -17,6 +19,38 @@ let documentDirty = false;
 // Set once the user has chosen to close despite (or after saving) unsaved
 // changes, so the second close() goes through.
 let closeConfirmed = false;
+
+// M8: watches every library file the last module scan read (and the
+// document's other use/include dependencies), so editing a library in
+// another editor refreshes the Custom toolbar and the viewport. One watcher,
+// re-pointed at the new set of paths after each scan.
+let libraryWatcher: FSWatcher | null = null;
+let watchedPaths = new Set<string>();
+let libraryChangeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function watchLibraries(paths: string[]): void {
+  const next = new Set(paths);
+  if (!libraryWatcher) {
+    if (next.size === 0) return;
+    libraryWatcher = watch([...next], { ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 120, pollInterval: 40 } });
+    libraryWatcher.on('all', () => {
+      // Editors often write a file in several steps; tell the renderer once.
+      if (libraryChangeTimer) clearTimeout(libraryChangeTimer);
+      libraryChangeTimer = setTimeout(() => {
+        libraryChangeTimer = null;
+        for (const w of BrowserWindow.getAllWindows()) w.webContents.send('modules:changed');
+      }, 150);
+    });
+    libraryWatcher.on('error', (err) => console.error('[scadstudio] library watcher', err));
+    watchedPaths = next;
+    return;
+  }
+  const removed = [...watchedPaths].filter((p) => !next.has(p));
+  const added = [...next].filter((p) => !watchedPaths.has(p));
+  if (removed.length > 0) libraryWatcher.unwatch(removed);
+  if (added.length > 0) libraryWatcher.add(added);
+  watchedPaths = next;
+}
 
 const SCAD_FILTERS = [{ name: 'OpenSCAD', extensions: ['scad'] }];
 
@@ -175,6 +209,17 @@ app.whenReady().then(() => {
       documentPath: currentDocumentPath,
       libraryDirs: defaultLibraryDirs(app.getPath('documents')),
     });
+  });
+
+  // M8: the library files that can supply Custom toolbar tools for this
+  // source (see moduleSources.ts), and start watching them.
+  ipcMain.handle('scad:scanModules', async (_event, source: string) => {
+    const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
+    const libraryDirs = defaultLibraryDirs(app.getPath('documents'));
+    const scan = await scanModuleSources(source, documentDir, libraryDirs);
+    const dependencies = await collectDependencies(source, documentDir, libraryDirs);
+    watchLibraries([...scan.watchPaths, ...dependencies.keys()]);
+    return scan.files;
   });
 
   ipcMain.handle('scad:openFile', async (event) => {
