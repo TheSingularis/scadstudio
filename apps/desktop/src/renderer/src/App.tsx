@@ -278,11 +278,16 @@ function topModuleDefinition(doc: SourceDoc, name: string) {
   return null;
 }
 
-// Both attempts said the node has no geometry (an `if` whose condition is
-// false, an empty loop): nothing to show, but nothing went wrong either.
+// Both attempts said only that the node has no geometry (an `if` whose
+// condition is false, an empty loop): nothing to show, but nothing went
+// wrong either. An unknown module is empty too, but comes with a warning
+// saying so, and that stays a failure (QC audit M4).
 function isEmptyResult(result: CachedRender): boolean {
   if ('bytes' in result) return false;
-  return [result.firstError, result.secondError].every((e) => /top level object is empty/i.test(renderErrorMessage(e)));
+  return [result.firstError, result.secondError].every((e) => {
+    const lines = renderErrorMessage(e).split('\n').map((l) => l.trim()).filter(Boolean);
+    return lines.length > 0 && lines.every((l) => /^Current top level object is empty/i.test(l));
+  });
 }
 
 function currentSet(r: ResolvedFocus | null): WorkingSet | null {
