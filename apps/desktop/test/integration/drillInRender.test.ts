@@ -117,4 +117,43 @@ describe('drilled-in isolated renders land where OpenSCAD puts the node (M9)', (
     ].join('\n');
     await expectNestedMatches(doc, [0, 0], 1, 'mirror([1, 0, 0]) translate([0, 3, 0]) cube([1, 1, 3]);');
   });
+
+  it('inside an if: a branch statement renders with the branch assignments, under its condition', async () => {
+    const doc = 'x = 3;\nif (x > 2) {\n    w = 2;\n    translate([5, 0, 0]) cube([w, 1, 1]);\n} else {\n    sphere(1);\n}\n';
+    await expectNestedMatches(doc, [0], 0, 'translate([5, 0, 0]) cube([2, 1, 1]);');
+  });
+
+  it('a statement in the branch the model does not take renders empty', async () => {
+    const doc = await docOf('x = 3;\nif (x > 2) cube(1); else translate([9, 0, 0]) sphere(1);\n');
+    const resolve = resolverFor(doc);
+    const r = resolveFocus(doc, [{ index: 0, siblings: resolveFocus(doc, [], resolve).sets[0].fingerprints }], resolve);
+    const set = r.sets[1];
+    const render = isolatedRender(set, set.nodes[1], buildSceneGraph(doc.tree, doc.text).context);
+    expect(await renderDirect(render.source)).toBeNull();
+    expect(await renderDirect(render.flatSource)).toBeNull();
+  });
+
+  it('children() inside an if inside a module body still gets the instance children', async () => {
+    await expectNestedMatches(
+      'module m(on) {\n    if (on) {\n        translate([0, 4, 0]) children();\n    } else {\n        cube(1);\n    }\n}\nm(true) translate([3, 0, 0]) cube([1, 2, 3]);\n',
+      [0, 0],
+      0,
+      'translate([0, 4, 0]) translate([3, 0, 0]) cube([1, 2, 3]);',
+    );
+  });
+
+  it('a module nested in a module body, drilled into through an if (module definitions stay out of the if)', async () => {
+    const doc = [
+      'module outer(s) {',
+      '    k = s * 2;',
+      '    module inner(t) { translate([t, 0, 0]) cube([1, k, 1]); }',
+      '    if (s > 1) {',
+      '        inner(s);',
+      '    }',
+      '}',
+      'if ($preview) { rotate([90, 0, 0]) outer(3); } else { outer(3); }',
+      '',
+    ].join('\n');
+    await expectNestedMatches(doc, [0, 1, 0, 0], 0, 'translate([3, 0, 0]) cube([1, 6, 1]);');
+  });
 });

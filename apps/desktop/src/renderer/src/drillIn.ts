@@ -78,12 +78,29 @@ export interface ModuleScope {
   childrenText: string;
 }
 
+/**
+ * The condition a statement inside an `if` needs around it to render the way
+ * it does in the full model: `if (c) { <branch assignments> <stmt> }`, or
+ * `if (!(c)) ...` for the else branch.
+ */
+export interface BranchGuard {
+  // The `if`'s condition, verbatim (no outer parentheses).
+  condition: string;
+  // True for the else branch.
+  negated: boolean;
+  // Assignments of the branch's own block, which only its statements see.
+  context: string;
+}
+
 /** What one focus level adds around the statements inside it. */
 export interface LevelEnv {
   // Non-geometry statements of the level's body: assignments, nested
   // module/function definitions.
   context: string;
   scope: ModuleScope | null;
+  // The guard of the drilled-into node in its parent set, when that node is
+  // inside an `if` branch: the whole level renders under it.
+  guard: BranchGuard | null;
 }
 
 /** Where a working set lives in its source, for inserting into it. */
@@ -94,6 +111,9 @@ export interface ContainerInfo {
   statementStart: number;
   statementEnd: number;
   body: { start: number; end: number; isBlock: boolean };
+  // What the editor leaves undimmed, when that isn't `body` (an `if`, whose
+  // inserts go into one branch but whose working set is both).
+  focus?: { start: number; end: number };
 }
 
 export interface WorkingSet {
@@ -113,8 +133,13 @@ export interface WorkingSet {
   // every call of it.
   editingModule: string | null;
   // The drilled-into call ("difference", "linear_extrude", a module name),
-  // or null for the top level or a bare block.
+  // 'if' for an if statement, or null for the top level or a bare block.
   containerCall: string | null;
+  // Per node (same order as `nodes`): the `if` branch it sits in, when this
+  // set is the inside of an if statement.
+  guards: (BranchGuard | null)[];
+  // The drilled-into if statement's condition, for the branch note.
+  condition: string | null;
 }
 
 export interface FocusEntry {
@@ -198,6 +223,8 @@ export function topLevelSet(doc: SourceDoc): WorkingSet {
     readOnly: null,
     editingModule: null,
     containerCall: null,
+    guards: nodes.map(() => null),
+    condition: null,
   };
 }
 
@@ -247,6 +274,8 @@ export function drillInto(parent: WorkingSet, index: number, resolveModule: Modu
   const node = parent.nodes[index];
   if (!node) return null;
   const root = parent.doc.tree.rootNode;
+  const top = topConcreteNode(root, node);
+  if (top?.type === 'if_statement') return drillIntoIf(parent, index, top);
   const decomposed = decomposeNode(root, node);
   if (!decomposed) return null;
   const p = decomposed.primitiveNode;
@@ -277,7 +306,7 @@ export function drillInto(parent: WorkingSet, index: number, resolveModule: Modu
     const last = p.child(p.childCount - 1);
     containerCall = name;
     const hasChildren = last?.type === 'block' || last?.type === 'statement';
-    const resolved = TRANSFORM_CALLS.has(name) || BUILTIN_WITH_CHILDREN.has(name) ? null : resolveModule(name, parent.doc);
+    const resolved = TRANSFORM_CALLS.has(name) || BUILTIN_WITH_CHILDREN.has(name) ? null : resolveCall(p, parent.doc, resolveModule);
     if (resolved) {
       const body = resolved.def.childForFieldName('body');
       const params = resolved.def.childForFieldName('parameters');
@@ -351,11 +380,162 @@ export function drillInto(parent: WorkingSet, index: number, resolveModule: Modu
       fingerprints,
       frame,
       bakedPrefix,
-      envs: [...parent.envs, { context, scope }],
+      envs: [...parent.envs, { context, scope, guard: parent.guards[index] ?? null }],
       container,
       readOnly,
       editingModule,
       containerCall,
+      guards: nodes.map(() => null),
+      condition: null,
+    },
+  };
+}
+
+/**
+ * The definition a module call resolves to, the way OpenSCAD looks it up:
+ * a module defined in an enclosing block (a module nested in another
+ * module's body, like `main_body()` inside `switch_mount()`) first, then the
+ * file's top level and the files it uses (`resolveModule`).
+ */
+export function resolveCall(call: Node, from: SourceDoc, resolveModule: ModuleResolver): { def: Node; doc: SourceDoc } | null {
+  const name = call.childForFieldName('name')?.text;
+  if (!name) return null;
+  for (let n = call.parent; n && n.type !== 'source_file'; n = n.parent) {
+    if (n.type !== 'block') continue;
+    for (const child of n.namedChildren) {
+      const def = child?.type === 'statement' ? child.child(0) : child;
+      if (def?.type === 'module_definition' && def.childForFieldName('name')?.text === name) return { def, doc: from };
+    }
+  }
+  return resolveModule(name, from);
+}
+
+/**
+ * The module definition node `index` calls, when it is a call of a module
+ * (not a built-in), for "Go to definition".
+ */
+export function callDefinition(set: WorkingSet, index: number, resolveModule: ModuleResolver): { name: string; doc: SourceDoc; start: number; end: number; nameStart: number; nameEnd: number } | null {
+  const node = set.nodes[index];
+  if (!node) return null;
+  const decomposed = decomposeNode(set.doc.tree.rootNode, node);
+  const p = decomposed?.primitiveNode;
+  if (!p || p.type !== 'module_instantiation') return null;
+  const name = p.childForFieldName('name')?.text ?? '';
+  if (TRANSFORM_CALLS.has(name) || BUILTIN_WITH_CHILDREN.has(name)) return null;
+  const resolved = resolveCall(p, set.doc, resolveModule);
+  const nameNode = resolved?.def.childForFieldName('name');
+  if (!resolved || !nameNode) return null;
+  return { name, doc: resolved.doc, start: resolved.def.startIndex, end: resolved.def.endIndex, nameStart: nameNode.startIndex, nameEnd: nameNode.endIndex };
+}
+
+function branchParts(branch: Node): { stmts: Node[]; context: string; isBlock: boolean } {
+  if (branch.type !== 'block') return { stmts: [branch], context: '', isBlock: false };
+  const stmts = branch.namedChildren.filter((c): c is Node => c?.type === 'statement');
+  const context = stmts
+    .filter((s) => !isGeometryStatement(s))
+    .map((s) => s.text)
+    .filter((t) => !t.startsWith('//') && !t.startsWith('/*'))
+    .join('\n');
+  return { stmts, context, isBlock: true };
+}
+
+/**
+ * What an `if` condition is without evaluating anything, or null when that
+ * needs the engine. `$preview` is false whenever ScadStudio renders (it
+ * renders the exported part, never OpenSCAD's F5 preview), so a
+ * `if ($preview) { <posed for viewing> } else { <the part> }` resolves to
+ * the else branch.
+ */
+export function staticCondition(condition: string): boolean | null {
+  let c = condition.replace(/\s+/g, '');
+  let negate = false;
+  for (;;) {
+    if (/^\(.*\)$/.test(c) && balanced(c.slice(1, -1))) c = c.slice(1, -1);
+    else if (c.startsWith('!')) {
+      negate = !negate;
+      c = c.slice(1);
+    } else break;
+  }
+  const value = c === '$preview' || c === 'false' ? false : c === 'true' ? true : null;
+  return value === null ? null : value !== negate;
+}
+
+function balanced(s: string): boolean {
+  let depth = 0;
+  for (const ch of s) {
+    if (ch === '(') depth++;
+    else if (ch === ')' && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/** True when the guard is known to be false, so its statement renders nothing. */
+export function guardInactive(guard: BranchGuard | null): boolean {
+  if (!guard) return false;
+  const value = staticCondition(guard.condition);
+  return value !== null && value === guard.negated;
+}
+
+export function guardText(guard: BranchGuard): string {
+  return guard.negated ? `!(${guard.condition})` : guard.condition;
+}
+
+// The inside of an if statement: the statements of both branches, each
+// rendered under its branch's condition, so the one the model doesn't take
+// renders empty (and one that is statically known not taken isn't rendered
+// at all). An `else if` is the else branch's one statement, drillable in
+// turn.
+function drillIntoIf(parent: WorkingSet, index: number, ifNode: Node): DrillTarget | null {
+  const conditionNode = ifNode.childForFieldName('condition');
+  const consequence = ifNode.childForFieldName('consequence');
+  const alternative = ifNode.childForFieldName('alternative');
+  if (!conditionNode || !consequence) return null;
+  const condition = conditionNode.text;
+  const doc = parent.doc;
+  const branches = [{ node: consequence, negated: false }];
+  if (alternative) branches.push({ node: alternative, negated: true });
+  const stmts: Node[] = [];
+  const guards: BranchGuard[] = [];
+  for (const branch of branches) {
+    const parts = branchParts(branch.node);
+    for (const stmt of parts.stmts) {
+      if (!isGeometryStatement(stmt)) continue;
+      stmts.push(stmt);
+      guards.push({ condition, negated: branch.negated, context: parts.context });
+    }
+  }
+  const { nodes, fingerprints } = makeNodes(stmts, doc);
+  if (nodes.length === 0) return null;
+
+  // Inserts go into the branch the model takes when that is known (the
+  // else of `if ($preview)`), else into the if branch.
+  const value = staticCondition(condition);
+  const insertBranch = value === false && alternative ? alternative : consequence;
+  const container: ContainerInfo | null =
+    doc.kind === 'document'
+      ? {
+          statementStart: ifNode.startIndex,
+          statementEnd: ifNode.endIndex,
+          body: { start: insertBranch.startIndex, end: insertBranch.endIndex, isBlock: insertBranch.type === 'block' },
+          focus: { start: ifNode.startIndex, end: ifNode.endIndex },
+        }
+      : null;
+  const shown = condition.replace(/\s+/g, ' ');
+  return {
+    label: `If (${shown.length > 24 ? `${shown.slice(0, 23)}…` : shown}) #${index + 1}`,
+    set: {
+      doc,
+      nodes,
+      fingerprints,
+      frame: parent.frame,
+      bakedPrefix: parent.bakedPrefix,
+      envs: [...parent.envs, { context: '', scope: null, guard: parent.guards[index] ?? null }],
+      container,
+      readOnly: parent.readOnly,
+      editingModule: parent.editingModule,
+      containerCall: 'if',
+      guards,
+      condition,
     },
   };
 }
@@ -422,6 +602,7 @@ export function isolatedRender(set: WorkingSet, node: SceneNode, documentContext
   const text = set.doc.text;
   let primitive: string;
   let transform: NodeTransform;
+  const guard = set.guards[node.index] ?? null;
   if (set.bakedPrefix === '') {
     primitive = text.slice(decomposed?.primitiveStart ?? node.startIndex, node.endIndex);
     transform = decomposed?.transform ?? IDENTITY_TRANSFORM;
@@ -432,8 +613,9 @@ export function isolatedRender(set: WorkingSet, node: SceneNode, documentContext
     primitive = `${set.bakedPrefix}{\n${text.slice(start, node.endIndex)}\n}`;
     transform = { ...IDENTITY_TRANSFORM, color: decomposed?.transform.color ?? null };
   }
+  const inScopeAt = (depth: number) => set.envs.slice(0, depth + 1).some((e) => e.scope !== null);
   const wrap = (inner: string) => {
-    let body = inner;
+    let body = guarded(guard, inner, 'node', inScopeAt(set.envs.length - 1));
     for (let depth = set.envs.length - 1; depth >= 0; depth--) {
       const env = set.envs[depth];
       if (env.context) body = `${env.context}\n${body}`;
@@ -441,6 +623,9 @@ export function isolatedRender(set: WorkingSet, node: SceneNode, documentContext
         const name = `__scadstudio_scope_${depth + 1}`;
         body = `module ${name}${env.scope.paramsText} {\n${body}\n}\n${name}${env.scope.argsText}${env.scope.childrenText}`;
       }
+      // The guard is evaluated where the drilled-into statement sits: in
+      // the parent level's scope, so outside this level's own context.
+      body = guarded(env.guard, body, String(depth + 1), inScopeAt(depth - 1));
     }
     return `${documentContext}\n${body}`;
   };
@@ -450,6 +635,19 @@ export function isolatedRender(set: WorkingSet, node: SceneNode, documentContext
     transform,
     transformEditable: set.bakedPrefix === '',
   };
+}
+
+// `if (c) { <branch assignments> <body> }`, except that OpenSCAD only
+// allows module definitions at the top level, in a bare block or in a
+// module body, and the body may hold the scope wrappers above. So the body
+// goes in a module defined where the if statement sits (same lexical scope)
+// and only its call is guarded. Inside a module scope the call passes the
+// scope's children on, so children() in the body still sees them.
+function guarded(guard: BranchGuard | null, body: string, suffix: string, inScope: boolean): string {
+  if (!guard) return body;
+  const name = `__scadstudio_branch_${suffix}`;
+  const context = guard.context ? `${guard.context}\n` : '';
+  return `module ${name}() {\n${context}${body}\n}\nif (${guardText(guard)}) ${name}()${inScope ? ' children();' : ';'}`;
 }
 
 export function nodeModifier(set: WorkingSet, node: SceneNode) {
@@ -535,4 +733,29 @@ function decomposeRigid(m: Matrix4): { origin: [number, number, number]; rotatio
   const clean = (v: number) => Math.round(v * 1000) / 1000 + 0;
   const r = quaternionToRotateDeg(q);
   return { origin: [clean(t.x), clean(t.y), clean(t.z)], rotationDeg: [clean(r[0]), clean(r[1]), clean(r[2])] };
+}
+
+/**
+ * "Show parts": the focus path from node `index` of the top level down
+ * through every level that holds just one statement the model actually
+ * uses, stopping at the first level with several (the parts). Files that
+ * build everything inside one module and call it once at the end (often
+ * through `if ($preview) ... else ...`) otherwise show as one blob until
+ * drilled into by hand, level by level. Returns the drilled-through
+ * indices, outermost first; empty when `index` can't be drilled into.
+ */
+export function partPath(top: WorkingSet, index: number, resolveModule: ModuleResolver, maxDepth = 12): number[] {
+  const path: number[] = [];
+  let set = top;
+  let at = index;
+  while (path.length < maxDepth) {
+    const target = drillInto(set, at, resolveModule);
+    if (!target) break;
+    path.push(at);
+    set = target.set;
+    const live = set.nodes.filter((n) => !guardInactive(set.guards[n.index] ?? null) && nodeModifier(set, n) !== '*');
+    if (live.length !== 1 || !drillInto(set, live[0].index, resolveModule)) break;
+    at = live[0].index;
+  }
+  return path;
 }

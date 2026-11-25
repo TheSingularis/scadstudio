@@ -42,8 +42,12 @@ import {
 } from './targetedPatch';
 import { appendSketchPolygon, appendStatement, sketchPolygonStatement } from './primitives';
 import {
+  callDefinition,
   canDrill,
   drillLabel,
+  guardInactive,
+  partPath,
+  staticCondition,
   frameIsRigid,
   frameToWorld,
   insertIntoContainer,
@@ -264,6 +268,18 @@ function topModuleDefinition(doc: SourceDoc, name: string) {
   return null;
 }
 
+// Both attempts said only that the node has no geometry (an `if` whose
+// condition is false, an empty loop): nothing to show, but nothing went
+// wrong either. An unknown module is empty too, but comes with a warning
+// saying so, and that stays a failure (QC audit M4).
+function isEmptyResult(result: CachedRender): boolean {
+  if ('bytes' in result) return false;
+  return [result.firstError, result.secondError].every((e) => {
+    const lines = renderErrorMessage(e).split('\n').map((l) => l.trim()).filter(Boolean);
+    return lines.length > 0 && lines.every((l) => /^Current top level object is empty/i.test(l));
+  });
+}
+
 function currentSet(r: ResolvedFocus | null): WorkingSet | null {
   return r ? r.sets[r.sets.length - 1] : null;
 }
@@ -278,6 +294,11 @@ export function App() {
   // Viewport's fitToken, so the camera re-fits on an explicit request too,
   // not just on opening a new file.
   const [resetViewToken, setResetViewToken] = useState(0);
+  // Set when a file is opened: the camera fits once that file's first
+  // render has landed. Fitting on the new path alone framed whatever was
+  // on screen before the render (the previous document), so a large part
+  // opened with the camera inside it.
+  const fitAfterRenderRef = useRef(false);
   // M7.5: null outside sketch mode. See Viewport.tsx's ActiveSketchPlane/
   // SketchController for the camera-lock/animate-to-plane behavior this
   // drives. Generalized (slice 3) from a fixed XY/XZ/YZ enum to an arbitrary
@@ -508,6 +529,11 @@ export function App() {
           // Isolated per-node renders, sequential, each through the cache.
           const meshes: NodeMesh[] = [];
           let disabledCount = 0;
+          // Nodes that render nothing in the model as it stands: inside an
+          // if branch it doesn't take (`if ($preview)` is skipped without
+          // asking the engine), or an `if (flag)` that is false. Not
+          // failures, so they don't count against "Rendered".
+          let emptyCount = 0;
           // First node that failed both render attempts, shown in the status
           // bar so a failure says which node and why (QC audit M4).
           let firstFailure: string | null = null;
@@ -523,6 +549,10 @@ export function App() {
             const modifier = nodeModifier(set, node);
             if (modifier === '*') {
               disabledCount++;
+              continue;
+            }
+            if (guardInactive(set.guards[node.index] ?? null)) {
+              emptyCount++;
               continue;
             }
             // Only the bare primitive goes to WASM — translate/rotate/scale
@@ -541,6 +571,8 @@ export function App() {
                 frame: set.frame,
                 transformEditable: job.transformEditable,
               });
+            } else if (isEmptyResult(result)) {
+              emptyCount++;
             } else {
               console.error(`[scadstudio] node ${node.index} render failed`, result.firstError, result.secondError);
               // A 2D node's first error is only "not a 3D object"; its
@@ -587,6 +619,7 @@ export function App() {
               if (node.index === r.focus[depth].index) continue;
               const modifier = nodeModifier(level, node);
               if (modifier === '*' || modifier === '%') continue;
+              if (guardInactive(level.guards[node.index] ?? null)) continue;
               const job = isolatedRender(level, node, graph.context);
               const result = await renderCached(job.source, job.flatSource);
               if ('bytes' in result) {
@@ -602,11 +635,19 @@ export function App() {
             }
           }
           setContextMeshes(context);
+          if (isCurrent && fitAfterRenderRef.current) {
+            fitAfterRenderRef.current = false;
+            setResetViewToken((t) => t + 1);
+          }
           renderStats().workingMeshes = meshes.length;
           renderStats().contextMeshes = context.length;
 
-          const expected = set.nodes.length - disabledCount;
-          const disabledSuffix = disabledCount > 0 ? ` (${disabledCount} disabled)` : '';
+          const expected = set.nodes.length - disabledCount - emptyCount;
+          const suffixParts = [
+            ...(disabledCount > 0 ? [`${disabledCount} disabled`] : []),
+            ...(emptyCount > 0 ? [`${emptyCount} empty`] : []),
+          ];
+          const disabledSuffix = suffixParts.length > 0 ? ` (${suffixParts.join(', ')})` : '';
           const lostPrefix = r.lost ? 'Left drill-in (that node no longer exists). ' : '';
           setStatus(
             lostPrefix +
@@ -792,6 +833,7 @@ export function App() {
     setFilePath(result.filePath);
     setSavedSource(result.contents);
     setDocumentToken((t) => t + 1);
+    fitAfterRenderRef.current = true;
     setSource(result.contents);
     runRender(result.contents);
   }, [runRender, handleSave, setSource]);
@@ -1356,14 +1398,22 @@ export function App() {
   // what was on screen stays as dimmed context until the render lands (with
   // the cache, usually at once), instead of the viewport blinking empty.
   const sketching = activeSketchPlane !== null || pickingFace;
+  // A path (from "Show parts") drills through several levels at once.
   const handleDrill = useCallback(
-    (index: number) => {
+    (indexOrPath: number | number[]) => {
       const r = resolvedRef.current;
       const tree = treeRef.current;
       const set = currentSet(r);
       if (!r || !tree || !set || activeSketchPlane || pickingFace) return;
-      if (!canDrill(set, index, resolveModule)) return;
-      focusRef.current = [...r.focus, { index, siblings: set.fingerprints }];
+      const path = typeof indexOrPath === 'number' ? [indexOrPath] : indexOrPath;
+      if (path.length === 0 || !canDrill(set, path[0], resolveModule)) return;
+      let focus = [...r.focus, { index: path[0], siblings: set.fingerprints }];
+      for (const index of path.slice(1)) {
+        const step = resolveFocus({ kind: 'document', path: filePathRef.current, text: sourceRef.current, tree }, focus, resolveModule);
+        if (step.lost) break;
+        focus = [...step.focus, { index, siblings: currentSet(step)!.fingerprints }];
+      }
+      focusRef.current = focus;
       focusEpochRef.current++;
       selectionAnchor.current = null;
       setSelectedIndices([]);
@@ -1445,10 +1495,67 @@ export function App() {
     if (!workingSet || primarySelectedIndex === null || selectedIndices.length !== 1) return null;
     return drillLabel(workingSet, primarySelectedIndex, resolveModule);
   }, [workingSet, primarySelectedIndex, selectedIndices.length, resolveModule]);
+  // "Show parts": for the selected node, or the last statement of a top
+  // level with nothing selected, the path down through every level with a
+  // single statement in use (partPath). Offered when that is more than one
+  // level, i.e. more than "Open ... ▸" already does.
+  const showParts = useMemo(() => {
+    if (!workingSet || resolved === null || selectedIndices.length > 1) return null;
+    const target = primarySelectedIndex ?? (focusDepth === 0 && workingSet.nodes.length > 0 ? workingSet.nodes.length - 1 : null);
+    if (target === null) return null;
+    const path = partPath(workingSet, target, resolveModule);
+    if (path.length < 2) return null;
+    const doc = workingSet.doc;
+    if (doc.kind !== 'document') return null;
+    const deeper = resolveFocus(doc, [...resolved.focus], resolveModule);
+    let focus = deeper.focus;
+    let crumbs = deeper.crumbs;
+    for (const index of path) {
+      const step = resolveFocus(doc, focus, resolveModule);
+      focus = [...step.focus, { index, siblings: currentSet(step)!.fingerprints }];
+      crumbs = resolveFocus(doc, focus, resolveModule).crumbs;
+    }
+    const added = crumbs.slice(-path.length).map((c) => c.label.replace(/ #\d+$/, ''));
+    const named = [...added].reverse().find((l) => /^[A-Za-z_$][\w$]*\(\)$/.test(l));
+    return { path, label: named ?? added[added.length - 1] };
+  }, [workingSet, resolved, primarySelectedIndex, selectedIndices.length, focusDepth, resolveModule]);
+  // "Go to definition" for a selected call of a module defined in the
+  // document (at the top level or nested inside another module).
+  const selectedDefinition = useMemo(() => {
+    if (!workingSet || readOnly || primarySelectedIndex === null || selectedIndices.length !== 1) return null;
+    const def = callDefinition(workingSet, primarySelectedIndex, resolveModule);
+    return def && def.doc.kind === 'document' ? def : null;
+  }, [workingSet, readOnly, primarySelectedIndex, selectedIndices.length, resolveModule]);
+  const [revealRequest, setRevealRequest] = useState<{ start: number; end: number; token: number } | null>(null);
+  // The note on an `if ($preview) ... else ...`: which branch is the part.
+  // Shown at that level and every level inside it ("Show parts" goes
+  // straight through it).
+  const branchNote = useMemo(() => {
+    if (!resolved) return null;
+    for (let depth = resolved.sets.length - 1; depth >= 1; depth--) {
+      const set = resolved.sets[depth];
+      const condition = set.containerCall === 'if' ? set.condition : null;
+      if (!condition || !condition.includes('$preview')) continue;
+      const value = staticCondition(condition);
+      if (value === null) continue;
+      if (depth === resolved.sets.length - 1) {
+        return value
+          ? 'if ($preview): the if branch is the part as rendered and exported. The else branch only applies in OpenSCAD\'s F5 preview.'
+          : 'if ($preview): the else branch is the part as rendered and exported ($preview is false there). The if branch only poses it for OpenSCAD\'s F5 preview.';
+      }
+      // Deeper: say which branch the path went through.
+      const taken = resolved.sets[depth].guards[resolved.focus[depth].index];
+      const viaElse = taken?.negated ?? false;
+      return viaElse === !value
+        ? `Inside the ${viaElse ? 'else' : 'if'} branch of if ($preview): the part as rendered and exported.`
+        : `Inside the ${viaElse ? 'else' : 'if'} branch of if ($preview), which only applies in OpenSCAD's F5 preview: nothing here is rendered.`;
+    }
+    return null;
+  }, [resolved]);
   const visibleCustomTools = workingSet?.editingModule ? customTools.filter((t) => t.callName !== workingSet.editingModule) : customTools;
 
   const breadcrumb =
-    focusDepth > 0 || selectedCanDrill ? (
+    focusDepth > 0 || selectedCanDrill || showParts || selectedDefinition ? (
       <div
         style={{
           position: 'absolute',
@@ -1524,14 +1631,40 @@ export function App() {
             Placed by a computed transform: move/rotate/scale are off here, parameters still edit.
           </div>
         )}
-        {selectedCanDrill && !sketching && (
-          <button
-            onClick={() => primarySelectedIndex !== null && handleDrill(primarySelectedIndex)}
-            title="Edit what's inside: its children become the working set (or double-click the shape)"
-            style={{ alignSelf: 'flex-start', pointerEvents: 'auto' }}
-          >
-            Open {selectedCanDrill} ▸
-          </button>
+        {branchNote && (
+          <div role="status" data-testid="branch-note" style={{ background: 'rgba(20,45,60,0.92)', padding: '4px 8px', borderRadius: 4 }}>
+            {branchNote}
+          </div>
+        )}
+        {!sketching && (selectedCanDrill || showParts || selectedDefinition) && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignSelf: 'flex-start', pointerEvents: 'auto' }}>
+            {selectedCanDrill && (
+              <button
+                onClick={() => primarySelectedIndex !== null && handleDrill(primarySelectedIndex)}
+                title="Edit what's inside: its children become the working set (or double-click the shape)"
+              >
+                Open {selectedCanDrill} ▸
+              </button>
+            )}
+            {showParts && (
+              <button
+                onClick={() => handleDrill(showParts.path)}
+                title="Open every level that holds just one statement, down to the first level with several parts"
+              >
+                Show parts of {showParts.label} ▸▸
+              </button>
+            )}
+            {selectedDefinition && (
+              <button
+                onClick={() =>
+                  setRevealRequest((prev) => ({ start: selectedDefinition.nameStart, end: selectedDefinition.nameEnd, token: (prev?.token ?? 0) + 1 }))
+                }
+                title="Show where this module is defined in the editor"
+              >
+                Go to {selectedDefinition.name}() definition
+              </button>
+            )}
+          </div>
         )}
       </div>
     ) : null;
@@ -1899,9 +2032,10 @@ export function App() {
             nodes={readOnly ? [] : sceneNodes}
             focusRange={
               !readOnly && workingSet?.container
-                ? { start: workingSet.container.body.start, end: workingSet.container.body.end }
+                ? workingSet.container.focus ?? { start: workingSet.container.body.start, end: workingSet.container.body.end }
                 : null
             }
+            revealRequest={revealRequest}
             selectedIndex={readOnly ? null : primarySelectedIndex}
             onSelectNode={(index) => handleSelect(index, 'replace')}
             documentKey={documentToken}

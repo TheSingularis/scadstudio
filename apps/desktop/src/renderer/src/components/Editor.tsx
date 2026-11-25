@@ -19,9 +19,12 @@ interface EditorProps {
   // M9: while drilled in, the drilled-into node's body; everything outside
   // it is dimmed, the editor's version of the viewport's dimmed context.
   focusRange?: { start: number; end: number } | null;
+  // "Go to definition": select this range and scroll it into view, once
+  // per new token.
+  revealRequest?: { start: number; end: number; token: number } | null;
 }
 
-export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, documentKey, focusRange = null }: EditorProps) {
+export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, documentKey, focusRange = null, revealRequest = null }: EditorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const decorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
@@ -200,6 +203,23 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, do
         })),
     );
   }, [focusRange?.start, focusRange?.end, value]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || !revealRequest) return;
+    const range = monaco.Range.fromPositions(model.getPositionAt(revealRequest.start), model.getPositionAt(revealRequest.end));
+    // Not a click: the viewport keeps the selected call while the editor
+    // shows its definition.
+    applyingValueRef.current = true;
+    try {
+      editor.setSelection(range);
+    } finally {
+      applyingValueRef.current = false;
+    }
+    editor.revealRangeInCenter(range);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealRequest?.token]);
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
 }
