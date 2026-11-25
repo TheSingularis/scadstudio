@@ -126,8 +126,19 @@ describe('decomposeNode (M4/M5)', () => {
   });
 
   it('returns null for non-instantiation statements', async () => {
-    const d = await decompose('for (i = [0:2]) translate([i*10,0,0]) cube(1);');
+    const d = await decompose('if (true) cube(1);');
     expect(d).toBeNull();
+  });
+
+  it('M11: a for loop is its own primitive, so the gizmo can move it', async () => {
+    const source = 'for (i = [0:2]) translate([i*10,0,0]) cube(1);';
+    const { tree, node } = await nodeAt(source, 0);
+    const d = decomposeNode(tree.rootNode, node)!;
+    expect(d.primitiveNode.type).toBe('for_statement');
+    expect(d.transform).toEqual(IDENTITY_TRANSFORM);
+    const moved = patchTransform(source, tree, node, { ...IDENTITY_TRANSFORM, translate: [5, 0, 0] });
+    expect(moved).toBe('translate([5, 0, 0])\n    for (i = [0:2]) translate([i*10,0,0]) cube(1);');
+    await expectCleanParse(moved);
   });
 
   it(audit('H2', 'translate(v) { ... } is not double-applied (block body)'), async () => {

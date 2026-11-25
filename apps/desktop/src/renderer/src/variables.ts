@@ -196,7 +196,12 @@ export function readVariables(root: Node): VariableInfo[] {
     const prev = children[i - 1];
     const next = children[i + 1];
     const description =
-      prev?.type === 'comment' && prev.text.startsWith('//') && prev.endPosition.row === child.startPosition.row - 1 && groupName(prev.text) === null
+      prev?.type === 'comment' &&
+      prev.text.startsWith('//') &&
+      prev.endPosition.row === child.startPosition.row - 1 &&
+      groupName(prev.text) === null &&
+      // Not the previous assignment's trailing annotation.
+      (i < 2 || children[i - 2].endPosition.row < prev.startPosition.row)
         ? prev.text.replace(/^\/\/\s?/, '').trim()
         : null;
     const trailing = next?.type === 'comment' && next.startPosition.row === child.endPosition.row && next.text.startsWith('//') ? next.text : null;
@@ -394,6 +399,12 @@ export function deleteVariable(source: string, root: Node, variable: VariableInf
   if (source.slice(lineStart, start).trim() === '' && source.slice(end, lineEnd).trim() === '') {
     start = lineStart;
     end = lineEnd;
+    // The last variable of a block at the top of the file: take the blank
+    // line that separated it from the rest too.
+    const before = source.slice(0, start);
+    const atTop = before.trim() === '' || /\n\s*\n$/.test(before);
+    const nextNl = source.indexOf('\n', end);
+    if (atTop && nextNl >= 0 && source.slice(end, nextNl).trim() === '') end = nextNl + 1;
   }
   edits.push({ start, end, text: '' });
   return applyEdits(source, edits);

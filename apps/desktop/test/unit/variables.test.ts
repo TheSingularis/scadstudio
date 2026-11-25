@@ -40,6 +40,8 @@ describe('M11 variables: reading', () => {
     expect(by.width.group).toBe('Parameters');
     expect(by.hole_d.annotation).toEqual({ kind: 'slider', min: 1, step: 0.5, max: 10 });
     expect(by.hole_d.group).toBe('Holes');
+    // A trailing annotation on the line above is not a description.
+    expect(by.style.description).toBeNull();
     expect(by.style.annotation).toEqual({ kind: 'choice', options: [{ value: 'round', label: 'Round' }, { value: 'square', label: 'Square' }] });
     expect(by.count.annotation).toEqual({ kind: 'choice', options: ['2', '4', '6'].map((v) => ({ value: v, label: v })) });
     expect(by.label.annotation).toEqual({ kind: 'maxLength', length: 8 });

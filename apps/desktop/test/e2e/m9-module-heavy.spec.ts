@@ -134,7 +134,10 @@ test.describe('module-heavy files (rack mount fixture)', () => {
     expect((await stats(scad)).workingMeshes).toBe(5);
     const cutters = await highlightedPixels(scad);
     await clickEditorText(scad, 'all_rack_holes();');
-    expect(await highlightedPixels(scad)).toBeGreaterThan(cutters + 2000);
+    // M11: the switch_mount frame is now an evaluated translate, so the
+    // Position fields show and the viewport is shorter (about 1,100 px here
+    // against 2,500 before M11, the same highlight drawn smaller).
+    expect(await highlightedPixels(scad)).toBeGreaterThan(cutters + 700);
     await expect(scad.button('Go to all_rack_holes() definition')).toBeVisible();
     await shot(scad, '7-rack-holes-selected');
   });

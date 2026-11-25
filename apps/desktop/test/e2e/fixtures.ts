@@ -146,7 +146,7 @@ export class ScadApp {
 
   /** The toolbar's Position X/Y/Z fields for the selected node. */
   positionInputs() {
-    return this.page.locator('input[type=number]');
+    return this.page.locator('input[aria-label^="Position "]');
   }
 
   /** Click on a line of the editor (1-based), which selects the node there. */

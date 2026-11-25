@@ -238,7 +238,9 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   // a brace-form wrap like `translate(v) { ... }` leaves behind once a gizmo
   // drag returns it to identity). It has no wraps of its own; the block is
   // its own primitive, so it can still be moved and wrapped.
-  if (top.type === 'block') {
+  // M11: a for loop (a pattern) likewise is its own primitive, so the gizmo
+  // can move the whole pattern by giving it a translate().
+  if (top.type === 'block' || top.type === 'for_statement') {
     return {
       transform: { ...IDENTITY_TRANSFORM },
       primitiveStart: top.startIndex,

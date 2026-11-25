@@ -279,6 +279,8 @@ export function drillInto(parent: WorkingSet, index: number, resolveModule: Modu
   const decomposed = decomposeNode(root, node);
   if (!decomposed) return null;
   const p = decomposed.primitiveNode;
+  // A for body's statements depend on the loop variable: not drillable.
+  if (p.type === 'for_statement') return null;
   const text = parent.doc.text;
 
   let doc = parent.doc;
