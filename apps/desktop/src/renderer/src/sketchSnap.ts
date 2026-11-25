@@ -175,7 +175,7 @@ const ON_PLANE_EPSILON = 5e-3;
 // every off-plane silhouette a snap target the drawn polygon can't actually
 // touch.
 export function extractOnPlaneGeometry(
-  shapes: { geometry: BufferGeometry; transform: NodeTransform }[],
+  shapes: { geometry: BufferGeometry; transform: NodeTransform; frame?: number[] }[],
   plane: { origin: [number, number, number]; rotationDeg: [number, number, number] },
 ): PlaneSnapGeometry {
   const inverse = transformToQuaternion(plane.rotationDeg).invert();
@@ -194,10 +194,12 @@ export function extractOnPlaneGeometry(
   const matrix = new Matrix4();
   const a = new Vector3();
   const b = new Vector3();
-  for (const { geometry, transform } of shapes) {
+  for (const { geometry, transform, frame } of shapes) {
     // Same T·R·S composition NodeModel's pivot group applies, so these are
-    // the exact world positions the shape is drawn at.
+    // the exact world positions the shape is drawn at — inside its working
+    // set's frame when drilled in (M9).
     matrix.compose(new Vector3(...transform.translate), transformToQuaternion(transform.rotateDeg), new Vector3(...transform.scale));
+    if (frame) matrix.premultiply(new Matrix4().fromArray(frame));
     const pos = featureEdgePositions(geometry);
     for (let i = 0; i + 5 < pos.length; i += 6) {
       toLocal(a.set(pos[i], pos[i + 1], pos[i + 2]).applyMatrix4(matrix));

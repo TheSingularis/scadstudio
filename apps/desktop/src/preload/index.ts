@@ -28,6 +28,8 @@ export interface ModuleSourceFile {
 const api = {
   renderScad: (source: string): Promise<Uint8Array> => ipcRenderer.invoke('scad:render', source),
   openFile: (): Promise<OpenFileResult | OpenFileSaveFirst | null> => ipcRenderer.invoke('scad:openFile'),
+  // M9: open a known file (a library module's source) without a dialog.
+  openPath: (filePath: string): Promise<OpenFileResult | OpenFileSaveFirst | null> => ipcRenderer.invoke('scad:openPath', filePath),
   // Resolves to the path written, or null if the user cancelled.
   saveFile: (request: SaveFileRequest): Promise<string | null> => ipcRenderer.invoke('scad:saveFile', request),
   setDirty: (dirty: boolean): void => ipcRenderer.send('scad:setDirty', dirty),

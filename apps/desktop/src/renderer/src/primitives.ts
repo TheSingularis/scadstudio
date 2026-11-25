@@ -49,6 +49,16 @@ export function appendSketchPolygon(
   rotationDeg: [number, number, number],
   loops: SketchPoint[][],
 ): string {
+  return appendStatement(source, sketchPolygonStatement(origin, rotationDeg, loops));
+}
+
+// The statement appendSketchPolygon appends; M9 also inserts it into a
+// drilled-into container instead (drillIn.ts insertIntoContainer).
+export function sketchPolygonStatement(
+  origin: [number, number, number],
+  rotationDeg: [number, number, number],
+  loops: SketchPoint[][],
+): string {
   // One loop writes the plain polygon(points=[...]) it always has; several
   // add paths=, which OpenSCAD fills even-odd (a loop inside another is a
   // hole). See profilesToPolygon.
@@ -59,5 +69,5 @@ export function appendSketchPolygon(
   if (origin.some((v) => v !== 0)) {
     statement = `translate([${origin.map(formatNumber).join(', ')}]) ${statement}`;
   }
-  return appendStatement(source, statement);
+  return statement;
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef, type RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentRef, type ReactNode, type RefObject } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges, Html } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
@@ -26,6 +26,15 @@ const GHOST_OPACITY = 0.35;
 // M7.5 on-plane editing: the sketch being edited stays visible as a faint
 // "before" reference behind its live handles.
 const EDITING_REFERENCE_OPACITY = 0.2;
+// M9 drill-in: everything outside the current working set is drawn dimmed
+// (and can't be clicked), so the focused statements stand out.
+const CONTEXT_MESH_COLOR = '#8a8f98';
+const CONTEXT_OPACITY = 0.14;
+// The confirm-flash after a typed edit (PLAN.md risk 5): the still-selected
+// node glows briefly, so a selection that followed the wrong node shows.
+const FLASH_MS = 600;
+const FLASH_EMISSIVE = '#ffffff';
+const SEE_THROUGH_BASE_OPACITY = 0.45;
 // Handle colors while sketching — idle points keep the existing sketch
 // preview amber; the hovered/dragged one turns white so it's obvious which
 // point a drag will move.
@@ -97,6 +106,15 @@ export interface NodeMesh {
   // call entirely) for disabled nodes, same as real OpenSCAD not evaluating
   // disabled geometry — so this is only ever '#' | '!' | '%' | null.
   modifier: Modifier | null;
+  // M9: column-major world matrix of the working set this node belongs to
+  // (its parent's placement when drilled in; absent/identity at the top
+  // level). The node's own transform above is local to it.
+  frame?: number[];
+  // False when the frame couldn't be expressed as a matrix and the parent's
+  // transforms are baked into `bytes` instead (drillIn.ts): no gizmo then.
+  transformEditable?: boolean;
+  // Unique key for context (dimmed) meshes, which have no working-set index.
+  key?: string;
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
@@ -178,6 +196,64 @@ interface ViewportProps {
   // M7.5 snap-while-drawing: which snap sources are on (App.tsx's sketch
   // toolbar owns them).
   snapSettings: SnapSettings;
+  // M9 drill-in. The dimmed, unclickable rest of the design around the
+  // working set; a double-click on a working-set shape asks to drill into
+  // it; flashToken changes to flash the selected shapes; `overlay` (the
+  // breadcrumb) is drawn over the viewport; `editable` false (a library
+  // module, view-only) hides the gizmo.
+  contextMeshes?: NodeMesh[];
+  onDrill?: (index: number) => void;
+  flashToken?: number;
+  overlay?: ReactNode;
+  editable?: boolean;
+  // Drilled into a difference(): its first child (the base) is drawn
+  // see-through and a click that passes through it picks the cutter behind
+  // it, so subtracted shapes inside the base can be seen and selected.
+  cuttersFirst?: boolean;
+}
+
+// M9: places a working set's nodes in their parent's frame. A plain group
+// with its matrix set directly (no position/rotation/scale props), so the
+// pivot groups inside keep holding just the node's own local transform,
+// which is what a gizmo drag commits.
+function FrameGroup({ frame, children }: { frame?: number[]; children: ReactNode }) {
+  const ref = useRef<Group>(null);
+  useLayoutEffect(() => {
+    const g = ref.current;
+    if (!g) return;
+    if (frame) g.matrix.fromArray(frame);
+    else g.matrix.identity();
+    g.matrixWorldNeedsUpdate = true;
+  }, [frame]);
+  return (
+    <group ref={ref} matrixAutoUpdate={false}>
+      {children}
+    </group>
+  );
+}
+
+// M9: a mesh outside the working set, drawn faint and never hit-tested.
+function ContextModel({ mesh, shading }: { mesh: NodeMesh; shading: ShadingMode }) {
+  const geometry = useMemo(() => geometryFor(mesh.bytes), [mesh.bytes]);
+  const quaternion = useMemo(() => transformToQuaternion(mesh.transform.rotateDeg), [mesh.transform.rotateDeg]);
+  if (mesh.modifier === '%') return null;
+  return (
+    <FrameGroup frame={mesh.frame}>
+      <group position={mesh.transform.translate} quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]} scale={mesh.transform.scale}>
+        <mesh geometry={geometry} raycast={() => null} renderOrder={-1}>
+          <meshStandardMaterial
+            color={CONTEXT_MESH_COLOR}
+            side={2}
+            transparent
+            opacity={CONTEXT_OPACITY}
+            depthWrite={false}
+            visible={shading !== 'wireframe'}
+          />
+          {shading !== 'shaded' && <Edges threshold={EDGE_THRESHOLD_DEG} color={CONTEXT_MESH_COLOR} transparent opacity={0.35} />}
+        </mesh>
+      </group>
+    </FrameGroup>
+  );
 }
 
 type SelectionRole = 'none' | 'base' | 'operand';
@@ -192,10 +268,17 @@ function NodeModel({
   onPickFace,
   editing,
   shading,
+  onDrill,
+  flashToken,
+  cuttersFirst = false,
 }: {
   mesh: NodeMesh;
+  cuttersFirst?: boolean;
   role: SelectionRole;
   shading: ShadingMode;
+  onDrill?: (index: number) => void;
+  // Changes to flash this node (only passed for selected nodes).
+  flashToken?: number;
   onSelect: (index: number, mode: SelectMode) => void;
   onGroupRef: (index: number, group: Group | null) => void;
   // M7.5 slice 2: existing shapes stop intercepting clicks while sketching,
@@ -244,6 +327,22 @@ function NodeModel({
   // persistent "ghost reference" state, not something selecting the node
   // should visually override.
   const isGhost = mesh.modifier === '%' || editing;
+  // See ViewportProps.cuttersFirst.
+  const seeThroughBase = cuttersFirst && mesh.index === 0 && role === 'none';
+  // The working-set index a click on this mesh means: the base hands a
+  // click on to a cutter behind it.
+  const clickedIndex = (e: ThreeEvent<MouseEvent>) => {
+    if (!cuttersFirst || mesh.index !== 0) return mesh.index;
+    const cutter = e.intersections.find((i) => typeof i.object.userData.scadIndex === 'number' && i.object.userData.scadIndex > 0);
+    return cutter ? (cutter.object.userData.scadIndex as number) : mesh.index;
+  };
+  const [flashing, setFlashing] = useState(false);
+  useEffect(() => {
+    if (!flashToken) return;
+    setFlashing(true);
+    const timer = setTimeout(() => setFlashing(false), FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [flashToken]);
 
   return (
     <group
@@ -280,15 +379,23 @@ function NodeModel({
           }
           // metaKey covers Cmd on macOS, where ctrl-click is reserved for
           // the OS's own right-click emulation.
-          onSelect(mesh.index, e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace');
+          onSelect(clickedIndex(e), e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : 'replace');
         }}
+        onDoubleClick={(e: ThreeEvent<MouseEvent>) => {
+          if (sketchActive || pickingFace || !onDrill) return;
+          e.stopPropagation();
+          onDrill(clickedIndex(e));
+        }}
+        userData={{ scadIndex: mesh.index }}
       >
         <meshStandardMaterial
           color={materialColor}
+          emissive={flashing ? FLASH_EMISSIVE : '#000000'}
+          emissiveIntensity={flashing ? 0.55 : 0}
           side={2}
-          transparent={isGhost || colorAlpha < 1}
-          opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : colorAlpha}
-          depthWrite={!editing}
+          transparent={isGhost || colorAlpha < 1 || seeThroughBase}
+          opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : seeThroughBase ? SEE_THROUGH_BASE_OPACITY : colorAlpha}
+          depthWrite={!editing && !seeThroughBase}
           // Hidden surface still raycasts (only drawing is skipped, same
           // split as SketchDrawingPlane's material) — shapes stay clickable
           // in wireframe mode.
@@ -983,6 +1090,12 @@ export function Viewport({
   onDeleteSketchPoint,
   editingNodeIndex,
   snapSettings,
+  contextMeshes = [],
+  onDrill,
+  flashToken,
+  overlay,
+  editable = true,
+  cuttersFirst = false,
 }: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
   // render entirely when any statement is marked. Nothing stops marking more
@@ -1001,12 +1114,14 @@ export function Viewport({
   const snapGeometry = useMemo(() => {
     if (!activeSketchPlane || !snapSettings.geometry) return EMPTY_PLANE_SNAP_GEOMETRY;
     return extractOnPlaneGeometry(
-      visibleMeshes
-        .filter((m) => m.index !== editingNodeIndex)
-        .map((m) => ({ geometry: geometryFor(m.bytes), transform: m.transform })),
+      [...visibleMeshes.filter((m) => m.index !== editingNodeIndex), ...contextMeshes].map((m) => ({
+        geometry: geometryFor(m.bytes),
+        transform: m.transform,
+        frame: m.frame,
+      })),
       activeSketchPlane,
     );
-  }, [activeSketchPlane, snapSettings.geometry, visibleMeshes, editingNodeIndex]);
+  }, [activeSketchPlane, snapSettings.geometry, visibleMeshes, contextMeshes, editingNodeIndex]);
   const [snapHover, setSnapHover] = useState<SnapResult | null>(null);
   // The gizmo only ever targets one object — the most recently selected one.
   const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
@@ -1190,22 +1305,29 @@ export function Viewport({
           <SketchController activeSketchPlane={activeSketchPlane} />
           <ViewController apiRef={viewApiRef} />
           <Center>
+            {contextMeshes.map((mesh) => (
+              <ContextModel key={mesh.key ?? `ctx-${mesh.index}`} mesh={mesh} shading={shading} />
+            ))}
             {visibleMeshes.map((mesh) => {
               const selPos = selectedIndices.indexOf(mesh.index);
               const role: SelectionRole = selPos === -1 ? 'none' : selPos === 0 ? 'base' : 'operand';
               return (
-                <NodeModel
-                  key={mesh.index}
-                  mesh={mesh}
-                  role={role}
-                  onSelect={onSelect}
-                  onGroupRef={handleGroupRef}
-                  sketchActive={activeSketchPlane !== null}
-                  pickingFace={pickingFace}
-                  onPickFace={onPickFace}
-                  shading={shading}
-                  editing={mesh.index === editingNodeIndex}
-                />
+                <FrameGroup key={mesh.index} frame={mesh.frame}>
+                  <NodeModel
+                    mesh={mesh}
+                    role={role}
+                    onSelect={onSelect}
+                    onGroupRef={handleGroupRef}
+                    sketchActive={activeSketchPlane !== null}
+                    pickingFace={pickingFace}
+                    onPickFace={onPickFace}
+                    shading={shading}
+                    editing={mesh.index === editingNodeIndex}
+                    onDrill={onDrill}
+                    flashToken={role === 'none' ? undefined : flashToken}
+                    cuttersFirst={cuttersFirst}
+                  />
+                </FrameGroup>
               );
             })}
           </Center>
@@ -1247,7 +1369,7 @@ export function Viewport({
             }}
           />
         )}
-        {transformTarget && !activeSketchPlane && (
+        {transformTarget && !activeSketchPlane && editable && meshes.find((m) => m.index === primaryIndex)?.transformEditable !== false && (
           <TransformControls
             object={transformTarget}
             mode={gizmoMode}
@@ -1334,6 +1456,7 @@ export function Viewport({
             {glyph}
           </button>
         ))}
+      {overlay}
       <select
         aria-label="Shading mode"
         value={shading}

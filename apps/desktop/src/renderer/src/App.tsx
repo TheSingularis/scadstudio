@@ -39,8 +39,25 @@ import {
   type Modifier,
   type ColorVector,
 } from './targetedPatch';
-import { appendSketchPolygon } from './primitives';
-import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, builtinTool, insertTool, type ToolDefinition } from './tools';
+import { appendSketchPolygon, appendStatement, sketchPolygonStatement } from './primitives';
+import {
+  canDrill,
+  drillLabel,
+  frameIsRigid,
+  frameToWorld,
+  insertIntoContainer,
+  isolatedRender,
+  nodeModifier,
+  resolveFocus,
+  worldToFrame,
+  type FocusEntry,
+  type ModuleResolver,
+  type ResolvedFocus,
+  type SourceDoc,
+  type WorkingSet,
+} from './drillIn';
+import { remapIndices, type NodeFingerprint } from './nodeIdentity';
+import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, addUseDirective, builtinTool, type ToolDefinition } from './tools';
 import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleIntrospection';
 import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
 
@@ -222,6 +239,45 @@ function renderErrorMessage(err: unknown): string {
   return text.replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
 }
 
+// M9 per-node render cache (PLAN.md "Per-node selection & manipulation
+// strategy", point 2; risk 2). Keyed on the exact source sent to the engine
+// (the node's primitive plus everything it can see), so an edit to one node
+// re-renders only that node: its siblings' sources are unchanged and come
+// from here, and so does everything when stepping in and out of a drill-in.
+// Cleared when a used/included file changes on disk or the document moves
+// (relative paths resolve differently), the two ways the same text can mean
+// different geometry.
+type CachedRender = { bytes: Uint8Array } | { firstError: unknown; secondError: unknown };
+const RENDER_CACHE_LIMIT = 500;
+
+// Test hook: counts engine calls and cache hits, so e2e tests can check that
+// an edit re-renders only what it changed.
+interface RenderStats {
+  engineCalls: number;
+  cacheHits: number;
+  flashes: number;
+  // Meshes in the working set and in the dimmed context after the last render.
+  workingMeshes: number;
+  contextMeshes: number;
+}
+function renderStats(): RenderStats {
+  const w = window as unknown as { __scadstudioRenderStats?: RenderStats };
+  w.__scadstudioRenderStats ??= { engineCalls: 0, cacheHits: 0, flashes: 0, workingMeshes: 0, contextMeshes: 0 };
+  return w.__scadstudioRenderStats;
+}
+
+function topModuleDefinition(doc: SourceDoc, name: string) {
+  for (const stmt of doc.tree.rootNode.children) {
+    const def = stmt?.type === 'statement' ? stmt.child(0) : stmt;
+    if (def?.type === 'module_definition' && def.childForFieldName('name')?.text === name) return def;
+  }
+  return null;
+}
+
+function currentSet(r: ResolvedFocus | null): WorkingSet | null {
+  return r ? r.sets[r.sets.length - 1] : null;
+}
+
 export function App() {
   const [source, setSourceState] = useState(DEFAULT_SOURCE);
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -313,6 +369,63 @@ export function App() {
   const [libraryVersion, setLibraryVersion] = useState(0);
   const [customFilter, setCustomFilter] = useState('');
 
+  // M9 drill-in. `focusRef` is the path of drilled-into nodes (empty at the
+  // top level), kept in step with sourceRef like treeRef is; `resolvedRef`
+  // is that path resolved against the current text (the working sets), and
+  // `resolved` its copy for rendering the breadcrumb and toolbar.
+  const focusRef = useRef<FocusEntry[]>([]);
+  const resolvedRef = useRef<ResolvedFocus | null>(null);
+  const [resolved, setResolved] = useState<ResolvedFocus | null>(null);
+  // Bumped by every explicit drill in/out: selection is remapped across a
+  // render only within one epoch (an explicit step sets its own selection).
+  const focusEpochRef = useRef(0);
+  const prevSetRef = useRef<{ epoch: number; fingerprints: NodeFingerprint[] } | null>(null);
+  const [contextMeshes, setContextMeshes] = useState<NodeMesh[]>([]);
+  const renderCache = useRef(new Map<string, CachedRender>());
+  // The confirm-flash after a typed edit (PLAN.md risk 5).
+  const [flashToken, setFlashToken] = useState(0);
+  const lastTypedSourceRef = useRef<string | null>(null);
+  const selectedRef = useRef<number[]>([]);
+  selectedRef.current = selectedIndices;
+  // Parsed library files (`use`d by the document), for drilling into a
+  // module defined in one. View-only: see drillIn.ts.
+  const libraryDocsRef = useRef(new Map<string, SourceDoc>());
+  const filePathRef = useRef<string | null>(null);
+  filePathRef.current = filePath;
+
+  const resolveModule: ModuleResolver = useCallback((name, from) => {
+    const own = topModuleDefinition(from, name);
+    if (own) return { def: own, doc: from };
+    // A library module sees only its own file here; the document sees every
+    // file it uses (matching the Custom toolbar's lookup order).
+    if (from.kind !== 'document') return null;
+    for (const lib of libraryDocsRef.current.values()) {
+      const def = topModuleDefinition(lib, name);
+      if (def) return { def, doc: lib };
+    }
+    return null;
+  }, []);
+
+  // Resolves the focus path against `tree` (the parse of `text`) and makes
+  // it current. Called with every new text, so edit handlers always splice
+  // offsets from the working set that matches what's in the editor.
+  //
+  // The followed path is only stored (`commit`) by a render, not on every
+  // keystroke: halfway through typing a statement above the drilled-into
+  // node the parse is often something else entirely, and remapping from
+  // each half-typed text would compound guesses. Leaving a level because
+  // its node is gone is only stored for text that parses cleanly, so the
+  // drill-in survives a statement being typed.
+  const deriveFocus = useCallback(
+    (tree: Tree, text: string, commit: 'no' | 'yes' | 'unless-lost' = 'no'): ResolvedFocus => {
+      const doc: SourceDoc = { kind: 'document', path: filePathRef.current, text, tree };
+      const r = resolveFocus(doc, focusRef.current, resolveModule);
+      if (commit === 'yes' || (commit === 'unless-lost' && !r.lost)) focusRef.current = r.focus;
+      return r;
+    },
+    [resolveModule],
+  );
+
   // Every source change goes through here, typed or visual. It keeps
   // sourceRef, treeRef and sceneNodesRef describing the *same* text at all
   // times, synchronously, so an edit handler never splices byte offsets
@@ -331,9 +444,47 @@ export function App() {
     const parsed = parseScadSync(next);
     if (parsed) {
       treeRef.current = parsed;
-      sceneNodesRef.current = buildSceneGraph(parsed, next).nodes;
+      const r = deriveFocus(parsed, next);
+      resolvedRef.current = r;
+      sceneNodesRef.current = currentSet(r)!.nodes;
     }
     setSourceState(next);
+  }, [deriveFocus]);
+
+  // One isolated render through the cache: the normal attempt, then M7's
+  // flat (2D) retry; both outcomes are cached.
+  const renderCached = useCallback(async (source: string, flatSource: string): Promise<CachedRender> => {
+    const cache = renderCache.current;
+    const stats = renderStats();
+    const hit = cache.get(source);
+    if (hit) {
+      stats.cacheHits++;
+      cache.delete(source);
+      cache.set(source, hit);
+      return hit;
+    }
+    let result: CachedRender;
+    try {
+      stats.engineCalls++;
+      result = { bytes: await window.scadstudio.renderScad(source) };
+    } catch (firstError) {
+      // M7: a pure-2D node (bare square/circle/polygon, a 2D boolean, ...)
+      // fails here every time — real OpenSCAD can't STL-export 2D geometry.
+      // Retry once wrapped in a hairline linear_extrude (see
+      // wrapAsThinExtrude) before giving up, so 2D shapes are at least
+      // visible/selectable instead of silently missing from the viewport.
+      // Context stays outside the wrapper — see wrapAsThinExtrude's
+      // 2026-09-21 comment for the real bug this fixed.
+      try {
+        stats.engineCalls++;
+        result = { bytes: await window.scadstudio.renderScad(flatSource) };
+      } catch (secondError) {
+        result = { firstError, secondError };
+      }
+    }
+    cache.set(source, result);
+    if (cache.size > RENDER_CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+    return result;
   }, []);
 
   const runRender = useMemo(
@@ -342,24 +493,31 @@ export function App() {
         setStatus('Rendering...');
         try {
           const { tree: parsedTree, errorCount } = await parseScad(src);
+          const isCurrent = src === sourceRef.current;
           // Only adopt this parse for edit handlers if it is still the
           // current text; otherwise setSource has already parsed newer text.
-          if (src === sourceRef.current) treeRef.current = parsedTree;
+          if (isCurrent) treeRef.current = parsedTree;
           setTree(parsedTree);
           setParseErrorCount(errorCount);
           const graph = buildSceneGraph(parsedTree, src);
-          if (src === sourceRef.current) sceneNodesRef.current = graph.nodes;
-          setSceneNodes(graph.nodes);
+          // M9: the working set is the top level, or the inside of the
+          // drilled-into node (resolveFocus follows it through the edit).
+          const r = isCurrent
+            ? deriveFocus(parsedTree, src, errorCount === 0 ? 'yes' : 'unless-lost')
+            : resolveFocus({ kind: 'document', path: filePathRef.current, text: src, tree: parsedTree }, focusRef.current, resolveModule);
+          if (isCurrent) resolvedRef.current = r;
+          const set = currentSet(r)!;
+          if (isCurrent) sceneNodesRef.current = set.nodes;
+          setSceneNodes(set.nodes);
+          setResolved(r);
 
-          // Isolated per-node renders (M3 scope: one call per top-level
-          // statement, sequential — see PLAN.md M3 build notes on why this
-          // stays simple rather than the full render-worker job queue).
+          // Isolated per-node renders, sequential, each through the cache.
           const meshes: NodeMesh[] = [];
           let disabledCount = 0;
           // First node that failed both render attempts, shown in the status
           // bar so a failure says which node and why (QC audit M4).
           let firstFailure: string | null = null;
-          for (const node of graph.nodes) {
+          for (const node of set.nodes) {
             // `*` (disable) — real OpenSCAD never evaluates disabled
             // geometry at all, so skip the WASM call entirely rather than
             // rendering it and hiding it after the fact. The node stays
@@ -368,68 +526,106 @@ export function App() {
             // shape as a node whose render call fails below, but tracked
             // separately so the status line doesn't read a deliberate
             // disable as a render failure.
-            const modifier = readModifier(parsedTree.rootNode, node);
+            const modifier = nodeModifier(set, node);
             if (modifier === '*') {
               disabledCount++;
               continue;
             }
-            const primitiveText = primitiveOnlySlice(parsedTree.rootNode, node, src);
-            const source = `${graph.context}\n${primitiveText}`;
-            try {
-              // Only the bare primitive goes to WASM — translate/rotate/
-              // scale are applied as a real three.js transform on the pivot
-              // group instead of being baked into the rendered geometry (see
-              // targetedPatch.ts's decomposeNode for why).
-              const bytes = await window.scadstudio.renderScad(source);
-              const transform = decomposeNode(parsedTree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
-              meshes.push({ index: node.index, bytes, transform, modifier });
-            } catch (err) {
-              // M7: a pure-2D node (bare square/circle/polygon, a 2D
-              // boolean, ...) fails here every time — real OpenSCAD can't
-              // STL-export 2D geometry. Retry once wrapped in a hairline
-              // linear_extrude (see wrapAsThinExtrude) before giving up, so
-              // 2D shapes are at least visible/selectable instead of
-              // silently missing from the viewport. Context stays outside
-              // the wrapper (passed separately) — see wrapAsThinExtrude's
-              // 2026-09-21 comment for the real bug this fixed.
-              try {
-                const bytes = await window.scadstudio.renderScad(wrapAsThinExtrude(graph.context, primitiveText));
-                const transform = decomposeNode(parsedTree.rootNode, node)?.transform ?? IDENTITY_TRANSFORM;
-                meshes.push({ index: node.index, bytes, transform, modifier });
-              } catch (err2) {
-                console.error(`[scadstudio] node ${node.index} render failed`, err, err2);
-                // A 2D node's first error is only "not a 3D object"; its
-                // real reason is in the retry's error. For anything else the
-                // first attempt's error is the real one.
-                const firstMessage = renderErrorMessage(err);
-                const reason = /not a 3D object/i.test(firstMessage) ? renderErrorMessage(err2) : firstMessage;
-                firstFailure ??= `node ${node.index + 1} (${node.label.trim()}): ${reason.split('\n')[0]}`;
-              }
+            // Only the bare primitive goes to WASM — translate/rotate/scale
+            // are applied as a real three.js transform on the pivot group
+            // instead of being baked into the rendered geometry (see
+            // targetedPatch.ts's decomposeNode for why), inside the working
+            // set's frame when drilled in (drillIn.ts).
+            const job = isolatedRender(set, node, graph.context);
+            const result = await renderCached(job.source, job.flatSource);
+            if ('bytes' in result) {
+              meshes.push({
+                index: node.index,
+                bytes: result.bytes,
+                transform: job.transform,
+                modifier,
+                frame: set.frame,
+                transformEditable: job.transformEditable,
+              });
+            } else {
+              console.error(`[scadstudio] node ${node.index} render failed`, result.firstError, result.secondError);
+              // A 2D node's first error is only "not a 3D object"; its
+              // real reason is in the retry's error. For anything else the
+              // first attempt's error is the real one.
+              const firstMessage = renderErrorMessage(result.firstError);
+              const reason = /not a 3D object/i.test(firstMessage) ? renderErrorMessage(result.secondError) : firstMessage;
+              firstFailure ??= `node ${node.index + 1} (${node.label.trim()}): ${reason.split('\n')[0]}`;
             }
           }
           setNodeMeshes(meshes);
+
+          // Selection. An insertion or merge says where its result is;
+          // otherwise the selection follows its nodes through the edit
+          // (nodeIdentity.ts), within one drill-in epoch.
+          const prev = prevSetRef.current;
           if (pendingSelectLast.current) {
             pendingSelectLast.current = false;
-            setSelectedIndices(graph.nodes.length > 0 ? [graph.nodes.length - 1] : []);
+            setSelectedIndices(set.nodes.length > 0 ? [set.nodes.length - 1] : []);
           } else if (pendingSelectAfterEdit.current !== null) {
             const idx = pendingSelectAfterEdit.current;
             pendingSelectAfterEdit.current = null;
-            setSelectedIndices(idx < graph.nodes.length ? [idx] : []);
+            setSelectedIndices(idx < set.nodes.length ? [idx] : []);
+          } else if (prev && prev.epoch === focusEpochRef.current) {
+            const next = remapIndices(prev.fingerprints, set.fingerprints, selectedRef.current);
+            setSelectedIndices(next);
+            // The confirm-flash: after a typed edit, show which node the
+            // selection is now on, so a wrong guess is visible.
+            if (src === lastTypedSourceRef.current && next.length > 0) {
+              renderStats().flashes++;
+              setFlashToken((t) => t + 1);
+            }
           } else {
-            setSelectedIndices((prev) => prev.filter((i) => i < graph.nodes.length));
+            setSelectedIndices((p) => p.filter((i) => i < set.nodes.length));
           }
-          const expected = graph.nodes.length - disabledCount;
+          if (isCurrent) prevSetRef.current = { epoch: focusEpochRef.current, fingerprints: set.fingerprints };
+
+          // M9: the dimmed context, after the working set so that one is
+          // interactive first: every other node at each level above it.
+          const context: NodeMesh[] = [];
+          for (let depth = 0; depth < r.focus.length; depth++) {
+            const level = r.sets[depth];
+            for (const node of level.nodes) {
+              if (node.index === r.focus[depth].index) continue;
+              const modifier = nodeModifier(level, node);
+              if (modifier === '*' || modifier === '%') continue;
+              const job = isolatedRender(level, node, graph.context);
+              const result = await renderCached(job.source, job.flatSource);
+              if ('bytes' in result) {
+                context.push({
+                  index: -1,
+                  key: `${depth}:${node.index}`,
+                  bytes: result.bytes,
+                  transform: job.transform,
+                  modifier,
+                  frame: level.frame,
+                });
+              }
+            }
+          }
+          setContextMeshes(context);
+          renderStats().workingMeshes = meshes.length;
+          renderStats().contextMeshes = context.length;
+
+          const expected = set.nodes.length - disabledCount;
           const disabledSuffix = disabledCount > 0 ? ` (${disabledCount} disabled)` : '';
+          const lostPrefix = r.lost ? 'Left drill-in (that node no longer exists). ' : '';
           setStatus(
-            meshes.length === expected
-              ? `Rendered${disabledSuffix}`
-              : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}${firstFailure ? ` — ${firstFailure}` : ''}`,
+            lostPrefix +
+              (meshes.length === expected
+                ? `Rendered${disabledSuffix}`
+                : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}${firstFailure ? ` — ${firstFailure}` : ''}`),
           );
         } catch (err) {
           setStatus(`Render failed: ${(err as Error).message}`);
           console.error('[scadstudio] render failed', err);
         }
       }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
@@ -466,6 +662,7 @@ export function App() {
       window.scadstudio.onModulesChanged(() => {
         // A used file changed: its modules may have, and so may the
         // geometry of every call into it.
+        renderCache.current.clear();
         setLibraryVersion((v) => v + 1);
         runRender(sourceRef.current);
       }),
@@ -502,6 +699,40 @@ export function App() {
     return toolsFromAnalyzed(analyzed);
   }, [tree, libraryFiles]);
 
+  // M9: library files parsed for drill-in (kept, unlike the toolbar's
+  // throwaway parses above, since a drilled-in working set points into
+  // them). A changed file means re-resolving the focus.
+  useEffect(() => {
+    const docs = libraryDocsRef.current;
+    const live = new Set<string>();
+    let changed = false;
+    for (const file of libraryFiles) {
+      live.add(file.path);
+      const existing = docs.get(file.path);
+      if (existing && existing.text === file.contents) continue;
+      const parsed = parseScadSync(file.contents);
+      if (!parsed) continue;
+      docs.set(file.path, { kind: 'library', path: file.path, text: file.contents, tree: parsed });
+      changed = true;
+    }
+    for (const path of [...docs.keys()]) {
+      if (!live.has(path)) {
+        docs.delete(path);
+        changed = true;
+      }
+    }
+    if (changed && focusRef.current.length > 0) {
+      setSource(sourceRef.current);
+      runRender(sourceRef.current);
+    }
+  }, [libraryFiles, runRender, setSource]);
+
+  // The document moved (Open, Save As): relative use/include paths now
+  // resolve from somewhere else.
+  useEffect(() => {
+    renderCache.current.clear();
+  }, [filePath]);
+
   useEffect(() => {
     runRender(source);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -528,6 +759,7 @@ export function App() {
   const handleSourceChange = useCallback(
     (next: string) => {
       setSource(next);
+      lastTypedSourceRef.current = next;
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       debounceTimer.current = setTimeout(() => runRender(next), RENDER_DEBOUNCE_MS);
     },
@@ -550,20 +782,30 @@ export function App() {
     [filePath],
   );
 
-  const handleOpen = useCallback(async () => {
-    let result = await window.scadstudio.openFile();
+  const openWith = useCallback(async (open: () => ReturnType<Window['scadstudio']['openFile']>) => {
+    let result = await open();
     if (result && 'saveFirst' in result) {
       if (!(await handleSave(false))) return;
-      result = await window.scadstudio.openFile();
+      result = await open();
     }
     if (!result || 'saveFirst' in result) return;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    // A new document starts at its top level.
+    focusRef.current = [];
+    focusEpochRef.current++;
+    filePathRef.current = result.filePath;
+    setSelectedIndices([]);
     setFilePath(result.filePath);
     setSavedSource(result.contents);
     setDocumentToken((t) => t + 1);
     setSource(result.contents);
     runRender(result.contents);
   }, [runRender, handleSave, setSource]);
+
+  const handleOpen = useCallback(() => openWith(() => window.scadstudio.openFile()), [openWith]);
+  // M9: the explicit, labeled way to edit a library module (it is view-only
+  // when drilled into from a document that uses it).
+  const handleOpenLibrary = useCallback((path: string) => openWith(() => window.scadstudio.openPath(path)), [openWith]);
 
   // Keep the main process's copy of the dirty flag current (it asks before
   // closing the window or opening over unsaved changes), and show it in the
@@ -776,7 +1018,16 @@ export function App() {
   const handleFinishSketch = useCallback(() => {
     const loops = committableProfiles(sketchRef.current);
     if (!activeSketchPlane || loops.length === 0) return;
-    const next = appendSketchPolygon(sourceRef.current, activeSketchPlane.origin, activeSketchPlane.rotationDeg, loops);
+    // M9: drilled in, the sketch becomes a child of the focused node, its
+    // plane written in that node's local frame.
+    const set = currentSet(resolvedRef.current);
+    let next: string;
+    if (set?.container) {
+      const local = worldToFrame(set.frame, activeSketchPlane.origin, activeSketchPlane.rotationDeg);
+      next = insertIntoContainer(sourceRef.current, set.container, sketchPolygonStatement(local.origin, local.rotationDeg, loops));
+    } else {
+      next = appendSketchPolygon(sourceRef.current, activeSketchPlane.origin, activeSketchPlane.rotationDeg, loops);
+    }
     pendingSelectLast.current = true;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     setSource(next);
@@ -803,7 +1054,12 @@ export function App() {
   // work here too, so a hole can be added to an existing sketch.
   const handleEditSketch = useCallback(() => {
     if (primarySelectedIndex === null || !selectedSketchProfile) return;
-    setActiveSketchPlane(sketchPlaneFromTransform(selectedSketchProfile.origin, selectedSketchProfile.rotationDeg));
+    // M9: a nested sketch's plane is local to its working set's frame.
+    const frame = currentSet(resolvedRef.current)?.frame;
+    const world = frame
+      ? frameToWorld(frame, selectedSketchProfile.origin, selectedSketchProfile.rotationDeg)
+      : { origin: selectedSketchProfile.origin, rotationDeg: selectedSketchProfile.rotationDeg };
+    setActiveSketchPlane(sketchPlaneFromTransform(world.origin, world.rotationDeg));
     setPickingFace(false);
     setEditingSketchIndex(primarySelectedIndex);
     resetSketch({ profiles: selectedSketchProfile.loops, open: [] }, 'edit');
@@ -1050,7 +1306,13 @@ export function App() {
   // M8: one path for built-in and Custom tools alike (tools.ts insertTool).
   const handleInsertTool = useCallback(
     (tool: ToolDefinition) => {
-      const next = insertTool(sourceRef.current, tool);
+      // M9: drilled in, a new statement joins the working set (the focused
+      // node's children) instead of going to the end of the file.
+      const set = currentSet(resolvedRef.current);
+      const placed = set?.container
+        ? insertIntoContainer(sourceRef.current, set.container, tool.statement)
+        : appendStatement(sourceRef.current, tool.statement);
+      const next = tool.useDirective ? addUseDirective(placed, tool.useDirective) : placed;
       pendingSelectLast.current = true;
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(next);
@@ -1094,6 +1356,191 @@ export function App() {
     setSource(next);
     runRender(next);
   }, [primarySelectedIndex, runRender]);
+
+  // M9 drill-in: make node `index`'s children the working set. Re-derived
+  // synchronously, so the edit handlers work on the new set right away;
+  // what was on screen stays as dimmed context until the render lands (with
+  // the cache, usually at once), instead of the viewport blinking empty.
+  const sketching = activeSketchPlane !== null || pickingFace;
+  const handleDrill = useCallback(
+    (index: number) => {
+      const r = resolvedRef.current;
+      const tree = treeRef.current;
+      const set = currentSet(r);
+      if (!r || !tree || !set || activeSketchPlane || pickingFace) return;
+      if (!canDrill(set, index, resolveModule)) return;
+      focusRef.current = [...r.focus, { index, siblings: set.fingerprints }];
+      focusEpochRef.current++;
+      selectionAnchor.current = null;
+      setSelectedIndices([]);
+      setContextMeshes((ctx) => [...ctx, ...nodeMeshes.map((m) => ({ ...m, index: -1, key: `prev:${m.index}` }))]);
+      setNodeMeshes([]);
+      const next = deriveFocus(tree, sourceRef.current, 'unless-lost');
+      resolvedRef.current = next;
+      sceneNodesRef.current = currentSet(next)!.nodes;
+      setSceneNodes(sceneNodesRef.current);
+      setResolved(next);
+      runRender(sourceRef.current);
+    },
+    // selectionAnchor is a ref declared below; stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeSketchPlane, pickingFace, resolveModule, deriveFocus, runRender, nodeMeshes],
+  );
+
+  // Back out to working set `depth` (0 = the top level), selecting the node
+  // that was drilled into there, the way Figma and Onshape step out.
+  const handleStepOut = useCallback(
+    (depth: number) => {
+      const r = resolvedRef.current;
+      const tree = treeRef.current;
+      if (!r || !tree || depth >= r.focus.length || activeSketchPlane || pickingFace) return;
+      const cameFrom = r.focus[depth].index;
+      focusRef.current = r.focus.slice(0, depth);
+      focusEpochRef.current++;
+      selectionAnchor.current = cameFrom;
+      setSelectedIndices([cameFrom]);
+      setNodeMeshes([]);
+      const next = deriveFocus(tree, sourceRef.current, 'unless-lost');
+      resolvedRef.current = next;
+      sceneNodesRef.current = currentSet(next)!.nodes;
+      setSceneNodes(sceneNodesRef.current);
+      setResolved(next);
+      runRender(sourceRef.current);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeSketchPlane, pickingFace, deriveFocus, runRender],
+  );
+
+  // Escape steps out one level: out of a sketch that has nothing to lose
+  // (a pending tool click is dropped first), out of Pick Face, else out of
+  // one drill-in level. Not while typing in the editor or a field.
+  const escapeRef = useRef<() => void>(() => {});
+  escapeRef.current = () => {
+    if (pickingFace) {
+      setPickingFace(false);
+      return;
+    }
+    if (activeSketchPlane) {
+      if (toolAnchors.length > 0) setToolAnchors([]);
+      else if (sketchHistory.length === 0) handleExitSketch();
+      else setStatus('Escape: Finish/Save or Exit/Cancel the sketch first (it has changes)');
+      return;
+    }
+    const depth = resolvedRef.current?.focus.length ?? 0;
+    if (depth > 0) handleStepOut(depth - 1);
+  };
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('.monaco-editor, input, textarea, select, [contenteditable="true"]')) return;
+      escapeRef.current();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const workingSet = currentSet(resolved);
+  const focusDepth = resolved?.focus.length ?? 0;
+  const readOnly = workingSet?.readOnly ?? null;
+  // Transform edits need the working set's frame as a matrix (drillIn.ts);
+  // sketches also need it rigid, since a sketch plane can't be scaled.
+  const transformEditable = !readOnly && (workingSet?.bakedPrefix ?? '') === '';
+  const sketchAllowed = transformEditable && (!workingSet || frameIsRigid(workingSet.frame));
+  const selectedCanDrill = useMemo(() => {
+    if (!workingSet || primarySelectedIndex === null || selectedIndices.length !== 1) return null;
+    return drillLabel(workingSet, primarySelectedIndex, resolveModule);
+  }, [workingSet, primarySelectedIndex, selectedIndices.length, resolveModule]);
+  const visibleCustomTools = workingSet?.editingModule ? customTools.filter((t) => t.callName !== workingSet.editingModule) : customTools;
+
+  const breadcrumb =
+    focusDepth > 0 || selectedCanDrill ? (
+      <div
+        style={{
+          position: 'absolute',
+          left: 8,
+          bottom: 8,
+          maxWidth: '70%',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          fontSize: 12,
+          fontFamily: 'sans-serif',
+          color: '#ddd',
+          pointerEvents: 'none',
+        }}
+      >
+        {focusDepth > 0 && resolved && (
+          <nav
+            aria-label="Breadcrumb"
+            data-testid="breadcrumb"
+            style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 4, background: 'rgba(30,30,30,0.85)', padding: '4px 8px', borderRadius: 4, pointerEvents: 'auto' }}
+          >
+            {resolved.crumbs.map((crumb, i) => {
+              const last = i === resolved.crumbs.length - 1;
+              return (
+                <span key={crumb.depth} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  {i > 0 && <span style={{ opacity: 0.5 }}>›</span>}
+                  {last && !sketching ? (
+                    <span aria-current="location" style={{ fontWeight: 'bold' }}>
+                      {crumb.label}
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => handleStepOut(crumb.depth)}
+                      disabled={sketching}
+                      title={sketching ? 'Finish or exit the sketch first' : `Back to ${crumb.label}`}
+                      style={{ background: 'none', border: 'none', color: '#6cb6ff', cursor: 'pointer', padding: 0, fontSize: 12, textDecoration: 'underline' }}
+                    >
+                      {crumb.label}
+                    </button>
+                  )}
+                </span>
+              );
+            })}
+            {sketching && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ opacity: 0.5 }}>›</span>
+                <span aria-current="location" style={{ fontWeight: 'bold' }}>
+                  Sketch
+                </span>
+              </span>
+            )}
+            <span style={{ opacity: 0.55, marginLeft: 6 }}>Esc: step out</span>
+          </nav>
+        )}
+        {readOnly && (
+          <div
+            role="status"
+            style={{ background: 'rgba(60,45,20,0.92)', padding: '4px 8px', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 8, pointerEvents: 'auto' }}
+          >
+            <span>
+              {readOnly.moduleName}() comes from {readOnly.path.split(/[\\/]/).pop()}, a library: view-only here.
+            </span>
+            <button onClick={() => void handleOpenLibrary(readOnly.path)}>Open {readOnly.path.split(/[\\/]/).pop()} to edit</button>
+          </div>
+        )}
+        {!readOnly && workingSet?.editingModule && (
+          <div role="status" style={{ background: 'rgba(40,30,60,0.9)', padding: '4px 8px', borderRadius: 4 }}>
+            Editing module {workingSet.editingModule}(): changes apply to every {workingSet.editingModule}() call.
+          </div>
+        )}
+        {!readOnly && focusDepth > 0 && !transformEditable && (
+          <div role="status" style={{ background: 'rgba(30,30,30,0.85)', padding: '4px 8px', borderRadius: 4 }}>
+            Placed by a computed transform: move/rotate/scale are off here, parameters still edit.
+          </div>
+        )}
+        {selectedCanDrill && !sketching && (
+          <button
+            onClick={() => primarySelectedIndex !== null && handleDrill(primarySelectedIndex)}
+            title="Edit what's inside: its children become the working set (or double-click the shape)"
+            style={{ alignSelf: 'flex-start', pointerEvents: 'auto' }}
+          >
+            Open {selectedCanDrill} ▸
+          </button>
+        )}
+      </div>
+    ) : null;
 
   // M7.5 snap-while-drawing controls, shown in both draw and edit-sketch
   // modes (point drags snap too). Hold Alt to bypass for a single click/drag.
@@ -1174,6 +1621,8 @@ export function App() {
           borderBottom: '1px solid #333',
         }}
       >
+        {readOnly && <span style={{ opacity: 0.7 }}>Viewing a library module (read-only)</span>}
+        {!readOnly && (
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Insert:
           {INSERT_TOOLS.map((tool) => (
@@ -1182,6 +1631,8 @@ export function App() {
             </button>
           ))}
         </span>
+        )}
+        {!readOnly && (
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Extrude{primarySelectedIndex !== null ? ' (selected)' : ''}:
           {EXTRUDE_TOOLS.map((tool) => (
@@ -1190,24 +1641,25 @@ export function App() {
             </button>
           ))}
         </span>
-        {customTools.length > 0 && (
+        )}
+        {!readOnly && visibleCustomTools.length > 0 && (
           <span
             role="group"
             aria-label="Custom modules"
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 6px', borderLeft: '2px solid #c586c0' }}
           >
             Custom:
-            {customTools.length > CUSTOM_TOOL_LIMIT && (
+            {visibleCustomTools.length > CUSTOM_TOOL_LIMIT && (
               <input
                 type="search"
                 aria-label="Filter custom modules"
-                placeholder={`Filter ${customTools.length} modules`}
+                placeholder={`Filter ${visibleCustomTools.length} modules`}
                 value={customFilter}
                 onChange={(e) => setCustomFilter(e.target.value)}
                 size={14}
               />
             )}
-            {customTools
+            {visibleCustomTools
               .filter((t) => t.label.toLowerCase().includes(customFilter.trim().toLowerCase()))
               .slice(0, CUSTOM_TOOL_LIMIT)
               .map((tool) => (
@@ -1222,6 +1674,7 @@ export function App() {
               ))}
           </span>
         )}
+        {(sketchAllowed || sketching) && (
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           {pickingFace ? (
             <>
@@ -1304,6 +1757,8 @@ export function App() {
             </>
           )}
         </span>
+        )}
+        {transformEditable && (
         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Gizmo:
           {GIZMO_MODE_BUTTONS.map(({ mode, label }) => (
@@ -1316,7 +1771,8 @@ export function App() {
             </button>
           ))}
         </span>
-        {gizmoMode === 'rotate' && (
+        )}
+        {transformEditable && gizmoMode === 'rotate' && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Space:
             {ROTATE_SPACE_BUTTONS.map(({ space, label }) => (
@@ -1330,7 +1786,7 @@ export function App() {
             ))}
           </span>
         )}
-        {primarySelectedIndex !== null && (
+        {transformEditable && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             {MIRROR_AXIS_BUTTONS.map(({ axis, label }) => (
               <button key={axis} onClick={() => handleMirrorAxis(axis)}>
@@ -1339,7 +1795,7 @@ export function App() {
             ))}
           </span>
         )}
-        {primarySelectedIndex !== null && (
+        {!readOnly && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Modifier:
             {MODIFIER_BUTTONS.map(({ modifier, label }) => (
@@ -1353,7 +1809,7 @@ export function App() {
             ))}
           </span>
         )}
-        {primarySelectedIndex !== null && (
+        {transformEditable && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Position:
             {(['X', 'Y', 'Z'] as const).map((label, axis) => {
@@ -1379,7 +1835,7 @@ export function App() {
             })}
           </span>
         )}
-        {primarySelectedIndex !== null && (
+        {transformEditable && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Color:
             <input
@@ -1392,7 +1848,7 @@ export function App() {
             )}
           </span>
         )}
-        {selectedIndices.length >= 2 && (
+        {!readOnly && selectedIndices.length >= 2 && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Boolean ({selectedIndices.length} selected —
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
@@ -1435,6 +1891,7 @@ export function App() {
             <ParamField
               key={`${i}-${field.label}-${field.valueText}`}
               field={field}
+              disabled={!!readOnly}
               onCommit={(text) => (field.argIndex !== null ? handleArgCommit(field.argIndex, text) : handleAddArg(field.label, text))}
             />
           ))}
@@ -1445,8 +1902,13 @@ export function App() {
           <Editor
             value={source}
             onChange={handleSourceChange}
-            nodes={sceneNodes}
-            selectedIndex={primarySelectedIndex}
+            nodes={readOnly ? [] : sceneNodes}
+            focusRange={
+              !readOnly && workingSet?.container
+                ? { start: workingSet.container.body.start, end: workingSet.container.body.end }
+                : null
+            }
+            selectedIndex={readOnly ? null : primarySelectedIndex}
             onSelectNode={(index) => handleSelect(index, 'replace')}
             documentKey={documentToken}
           />
@@ -1474,6 +1936,12 @@ export function App() {
             onSketchDragStart={handleSketchDragStart}
             onDeleteSketchPoint={handleDeleteSketchPoint}
             editingNodeIndex={editingSketchIndex}
+            contextMeshes={contextMeshes}
+            onDrill={handleDrill}
+            flashToken={flashToken}
+            overlay={breadcrumb}
+            editable={!readOnly}
+            cuttersFirst={workingSet?.containerCall === 'difference'}
           />
         </div>
       </div>
@@ -1485,7 +1953,7 @@ export function App() {
 // default (or the argument's own literal; see paramPanel.ts). Every widget
 // commits OpenSCAD source text, so a commit is the same targeted argument
 // patch whichever widget made it.
-function ParamField({ field, onCommit }: { field: PanelField; onCommit: (valueText: string) => void }) {
+function ParamField({ field, onCommit, disabled = false }: { field: PanelField; onCommit: (valueText: string) => void; disabled?: boolean }) {
   const unset = field.valueText === null;
   const shown = field.valueText ?? field.param?.defaultText ?? '';
   const label = `Parameter ${field.label}`;
@@ -1610,11 +2078,15 @@ function ParamField({ field, onCommit }: { field: PanelField; onCommit: (valueTe
       );
   }
   return (
+    // A fieldset disables every input of the widget at once (read-only
+    // library modules, M9).
+    <fieldset disabled={disabled} style={{ display: 'contents' }}>
     <span style={{ display: 'flex', alignItems: 'center', gap: 4, opacity: unset ? 0.75 : 1 }} title={title}>
       <span style={{ opacity: 0.6, fontStyle: unset ? 'italic' : 'normal', color: field.param?.required ? '#e8a05a' : undefined }}>
         {field.label}:
       </span>
       {control}
     </span>
+    </fieldset>
   );
 }
