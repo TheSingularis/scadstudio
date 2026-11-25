@@ -3,7 +3,9 @@ import {
   deleteVariable,
   insertVariable,
   makeVariable,
+  moduleAt,
   nameAvailable,
+  readModuleVariables,
   parseAnnotation,
   readVariables,
   renameVariable,
@@ -129,5 +131,53 @@ describe('M11 variables: editing', () => {
     expect(nameAvailable(tree.rootNode, 'gap')).toBe(false);
     expect(nameAvailable(tree.rootNode, 'for')).toBe(false);
     expect(nameAvailable(tree.rootNode, 'width')).toBe(true);
+  });
+});
+
+describe('M11 variables: visible scopes', () => {
+  const SRC = `w = 10;\nmodule box(size = 5, h) {\n    w = size * 2;\n    gap = 1; // [0:5]\n    if (h) { gap = 3; cube(gap); }\n    translate([gap, 0, 0]) cube([w, size, h]);\n}\nbox(3, 4);\ncube(w);\n`;
+
+  it('reads a module body as its own scope, with its parameters', async () => {
+    const tree = await parse(SRC);
+    const def = moduleAt(tree.rootNode, SRC.indexOf('gap = 1'))!;
+    expect(def.childForFieldName('name')?.text).toBe('box');
+    expect(moduleAt(tree.rootNode, SRC.indexOf('box(3'))).toBeNull();
+    const m = readModuleVariables(tree.rootNode, def)!;
+    expect(m.name).toBe('box');
+    expect(m.parameters).toEqual([
+      { name: 'size', defaultText: '5', line: 1 },
+      { name: 'h', defaultText: null, line: 1 },
+    ]);
+    expect(m.variables.map((v) => v.name)).toEqual(['w', 'gap']);
+    const [w, gap] = m.variables;
+    // Reads the parameter: no value to show. Not a Customizer variable.
+    expect(w.display).toBeNull();
+    expect(w.inCustomizer).toBe(false);
+    expect(w.group).toBe('Local');
+    expect(gap.display).toBe('1');
+    expect(gap.annotation).toEqual({ kind: 'slider', min: 0, step: null, max: 5 });
+    // The if block's own gap shadows it there: one use, in translate.
+    expect(gap.uses.map((u) => u.line)).toEqual([5]);
+    expect(w.uses.map((u) => u.line)).toEqual([5]);
+    // The file's w is not read inside box(), which assigns its own.
+    expect(readVariables(tree.rootNode)[0].uses.map((u) => u.line)).toEqual([8]);
+  });
+
+  it('renames and deletes inside a module without touching the file scope', async () => {
+    const tree = await parse(SRC);
+    const def = moduleAt(tree.rootNode, SRC.indexOf('gap = 1'))!;
+    const body = def.childForFieldName('body')!;
+    const renamed = renameVariable(SRC, tree.rootNode, 'w', 'width', body);
+    expect(renamed).toContain('w = 10;');
+    expect(renamed).toContain('    width = size * 2;');
+    expect(renamed).toContain('cube([width, size, h])');
+    expect(renamed).toContain('cube(w);');
+    await expectCleanParse(renamed);
+    const gap = readModuleVariables(tree.rootNode, def)!.variables[1];
+    const inlined = deleteVariable(SRC, tree.rootNode, gap, true, body);
+    expect(inlined).not.toContain('gap = 1;');
+    expect(inlined).toContain('translate([1, 0, 0])');
+    expect(inlined).toContain('{ gap = 3; cube(gap); }');
+    await expectCleanParse(inlined);
   });
 });

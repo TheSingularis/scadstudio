@@ -7,7 +7,7 @@ import { collectDependencies, collectFontDependencies, defaultLibraryDirs } from
 import { BUNDLED_FONT_FACES, SystemFontIndex, fontFilesWanted, readFontFileFaces, type FontFace } from './fonts';
 import { SettingsStore, type AppSettings } from './settings';
 import { RenderHost, type RenderChild } from './renderHost';
-import { scanModuleSources } from './moduleSources';
+import { scanIncludes, scanModuleSources } from './moduleSources';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -310,6 +310,12 @@ app.whenReady().then(() => {
     const dependencies = await collectDependencies(source, documentDir, libraryDirs);
     watchLibraries([...scan.watchPaths, ...dependencies.keys()]);
     return scan.files;
+  });
+
+  // M11: the document's included files, for their variables.
+  ipcMain.handle('scad:scanIncludes', async (_event, source: string) => {
+    const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
+    return scanIncludes(source, documentDir, defaultLibraryDirs(app.getPath('documents')));
   });
 
   ipcMain.handle('scad:openFile', async (event) => {

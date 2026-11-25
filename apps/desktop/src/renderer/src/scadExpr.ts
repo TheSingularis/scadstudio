@@ -99,7 +99,7 @@ function functionDef(def: Node, scope: Scope): [string, FunctionDef] | null {
   return [name, { params: parameterList(def.childForFieldName('parameters')), body, scope }];
 }
 
-function parameterList(list: Node | null): { name: string; defaultNode: Node | null }[] {
+export function parameterList(list: Node | null): { name: string; defaultNode: Node | null }[] {
   const decls = list?.namedChildren.find((c) => c?.type === 'parameter_declarations');
   const out: { name: string; defaultNode: Node | null }[] = [];
   for (const decl of decls?.namedChildren ?? []) {

@@ -1,7 +1,8 @@
 // M11 directional constraints in the running app: the variables panel,
 // Make variable, the Distance/Align/Pattern tool panel, and expression axes
 // in the Position fields and gizmo. Real clicks and typing throughout.
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, expect, type ScadApp } from './fixtures';
 
@@ -160,5 +161,42 @@ test.describe('M11 directional constraints', () => {
       await vars.getByLabel('New name for wall').press('Enter');
     });
     expect(await scad.source()).toBe('// Wall thickness\nwall_t = 2; // [1:0.5:5]\nshape = "round"; // [round, square]\n/* [Hidden] */\nfn = 32;\n\ncube([10, 10, wall_t]);\n');
+  });
+
+  test('Visible scopes: a module\'s own variables, and an included file\'s', async ({ scad }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'scadstudio-m11-scopes-'));
+    writeFileSync(join(dir, 'sizes.scad'), '// Wall thickness\nwall = 2;\nside = 12;\n');
+    const doc = join(dir, 'box.scad');
+    writeFileSync(doc, 'include <sizes.scad>\n\nside = 20;\n\nmodule box(h = 5) {\n    inner = side - 2 * wall;\n    lid = 1;\n    difference() { cube([side, side, h]); translate([wall, wall, lid]) cube([inner, inner, h]); }\n}\n\nbox();\n');
+    await scad.stubDialogs({ open: doc });
+    await scad.rendersAfter(() => scad.button('Open .scad file...').click());
+    const vars = scad.page.getByRole('complementary', { name: 'Variables' });
+    // The included file's variables, read-only, with the override called out.
+    const included = vars.getByRole('region', { name: 'Variables from sizes.scad' });
+    await expect(included.getByTestId('variable-wall')).toContainText('used on lines');
+    await expect(included.getByLabel('Variable wall', { exact: true })).toBeDisabled();
+    await expect(included.getByTestId('variable-side')).toContainText('Assigned again in this file (line 3)');
+    await expect(vars.getByRole('region', { name: 'Variables inside box()' })).toHaveCount(0);
+
+    // The cursor inside box(): its parameter and local variables appear.
+    await scad.clickEditorLine(7);
+    const inside = vars.getByRole('region', { name: 'Variables inside box()' });
+    await expect(inside.getByTestId('parameter-h')).toContainText('5');
+    await expect(inside.getByTestId('variable-inner')).toContainText('used on line 8');
+    await scad.resetView();
+    await shot(scad, '9-scopes');
+    await scad.rendersAfter(async () => {
+      await inside.getByLabel('Variable lid', { exact: true }).fill('2');
+      await inside.getByLabel('Variable lid', { exact: true }).press('Enter');
+    });
+    expect(await scad.source()).toContain('    lid = 2;\n');
+    // Renaming a local touches only the module.
+    await inside.getByRole('button', { name: 'inner' }).click();
+    await scad.rendersAfter(async () => {
+      await inside.getByLabel('New name for inner').fill('hollow');
+      await inside.getByLabel('New name for inner').press('Enter');
+    });
+    expect(await scad.source()).toContain('    hollow = side - 2 * wall;');
+    expect(await scad.source()).toContain('cube([hollow, hollow, h])');
   });
 });

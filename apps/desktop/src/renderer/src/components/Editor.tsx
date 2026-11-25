@@ -25,6 +25,9 @@ interface EditorProps {
   // M15 Settings > Fonts: the editor's font ('' = Monaco's default) and size.
   fontFamily?: string;
   fontSize?: number;
+  // M11: where the cursor is (a user move), for the variables panel's
+  // module scope.
+  onCursorOffset?: (offset: number) => void;
 }
 
 // Monaco's own default stack, used when no font is chosen and as the
@@ -46,6 +49,7 @@ export function Editor({
   revealRequest = null,
   fontFamily = '',
   fontSize = 13,
+  onCursorOffset,
 }: EditorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -55,6 +59,8 @@ export function Editor({
   onChangeRef.current = onChange;
   const onSelectNodeRef = useRef(onSelectNode);
   onSelectNodeRef.current = onSelectNode;
+  const onCursorOffsetRef = useRef(onCursorOffset);
+  onCursorOffsetRef.current = onCursorOffset;
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
   // True while this component itself is writing `value` into the model, so
@@ -138,6 +144,7 @@ export function Editor({
       const indentEnd = model.getLineFirstNonWhitespaceColumn(e.position.lineNumber);
       const position = indentEnd > 0 && e.position.column < indentEnd ? { lineNumber: e.position.lineNumber, column: indentEnd } : e.position;
       const offset = model.getOffsetAt(position);
+      onCursorOffsetRef.current?.(offset);
       const hit = nodesRef.current.find((n) => offset >= n.startIndex && offset < n.endIndex);
       onSelectNodeRef.current(hit ? hit.index : null);
     });

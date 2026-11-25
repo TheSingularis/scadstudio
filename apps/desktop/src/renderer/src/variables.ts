@@ -1,6 +1,6 @@
 import type { Node } from 'web-tree-sitter';
 import { textShape, type ValueShape } from './moduleIntrospection';
-import { documentScope, formatValue, tryEvaluate } from './scadExpr';
+import { documentScope, formatValue, parameterList, scopeAt, tryEvaluate } from './scadExpr';
 
 // M11: the document's variables, the values its top-level assignments name,
 // for the variables panel, "Make variable" and the relate/pattern tools.
@@ -141,10 +141,10 @@ function isReference(id: Node): boolean {
   }
 }
 
-// Whether an enclosing scope binds `name`, so `id` doesn't read the
-// top-level variable.
-function shadowed(id: Node, name: string): boolean {
-  for (let n: Node | null = id.parent; n; n = n.parent) {
+// Whether a scope between `id` and `container` binds `name`, so `id`
+// doesn't read the container's variable.
+function shadowed(id: Node, name: string, container: Node | null = null): boolean {
+  for (let n: Node | null = id.parent; n && !(container && n.equals(container)); n = n.parent) {
     switch (n.type) {
       case 'module_definition':
       case 'function_definition': {
@@ -169,22 +169,34 @@ function shadowed(id: Node, name: string): boolean {
   return false;
 }
 
-/** Every place in the document that reads the top-level variable `name`. */
-export function variableReferences(root: Node, name: string): Node[] {
-  return root.descendantsOfType('identifier').filter((id): id is Node => id !== null && id.text === name && isReference(id) && !shadowed(id, name));
+/**
+ * Every place that reads the variable `name` assigned in `container`: the
+ * file's top level (the root, the default) or a module body's block.
+ */
+export function variableReferences(root: Node, name: string, container: Node = root): Node[] {
+  const top = container.equals(root);
+  return container
+    .descendantsOfType('identifier')
+    .filter((id): id is Node => id !== null && id.text === name && isReference(id) && !shadowed(id, name, top ? null : container));
 }
 
-export function readVariables(root: Node): VariableInfo[] {
+/**
+ * The variables assigned directly in `container`: the file's top level (the
+ * default), or a module body's block (M11 scopes: no Customizer groups, and
+ * values that read the module's parameters show no result).
+ */
+export function readVariables(root: Node, container: Node = root): VariableInfo[] {
+  const top = container.equals(root);
   const scope = documentScope(root);
   const out: VariableInfo[] = [];
-  const children = root.children.filter((c): c is Node => c !== null);
-  let group = 'Parameters';
+  const children = container.children.filter((c): c is Node => c !== null);
+  let group = top ? 'Parameters' : 'Local';
   let pastCustomizerLimit = false;
   const seen = new Map<string, VariableInfo>();
   children.forEach((child, i) => {
     if (child.type === 'comment') {
       const g = groupName(child.text);
-      if (g !== null) group = g;
+      if (g !== null && top) group = g;
       return;
     }
     const stmt = concrete(child);
@@ -205,7 +217,7 @@ export function readVariables(root: Node): VariableInfo[] {
         ? prev.text.replace(/^\/\/\s?/, '').trim()
         : null;
     const trailing = next?.type === 'comment' && next.startPosition.row === child.endPosition.row && next.text.startsWith('//') ? next.text : null;
-    const evaluated = tryEvaluate(valueNode, scope);
+    const evaluated = tryEvaluate(valueNode, top ? scope : scopeAt(valueNode));
     const literal = isLiteral(valueNode);
     const info: VariableInfo = {
       name: nameNode.text,
@@ -222,7 +234,7 @@ export function readVariables(root: Node): VariableInfo[] {
       annotation: trailing ? parseAnnotation(trailing) : null,
       group,
       hidden: group.toLowerCase() === 'hidden',
-      inCustomizer: literal && !pastCustomizerLimit && group.toLowerCase() !== 'hidden',
+      inCustomizer: top && literal && !pastCustomizerLimit && group.toLowerCase() !== 'hidden',
       uses: [],
       reassigned: false,
     };
@@ -235,7 +247,7 @@ export function readVariables(root: Node): VariableInfo[] {
     out.push(info);
   });
   for (const v of out) {
-    v.uses = variableReferences(root, v.name).map((id) => ({ start: id.startIndex, end: id.endIndex, line: id.startPosition.row }));
+    v.uses = variableReferences(root, v.name, container).map((id) => ({ start: id.startIndex, end: id.endIndex, line: id.startPosition.row }));
   }
   return out;
 }
@@ -352,17 +364,17 @@ export function setVariableValue(source: string, variable: VariableInfo, valueTe
   return applyEdits(source, [{ start: variable.valueStart, end: variable.valueEnd, text: valueText }]);
 }
 
-export function renameVariable(source: string, root: Node, oldName: string, newName: string): string {
+export function renameVariable(source: string, root: Node, oldName: string, newName: string, container: Node = root): string {
   if (!isValidName(newName) || oldName === newName) return source;
   const edits: TextEdit[] = [];
-  for (const child of root.children) {
+  for (const child of container.children) {
     const stmt = concrete(child);
     if (stmt?.type !== 'assignment_statement') continue;
     const n = stmt.childForFieldName('name');
     if (n?.text === oldName) edits.push({ start: n.startIndex, end: n.endIndex, text: newName });
   }
   if (edits.length === 0) return source;
-  for (const id of variableReferences(root, oldName)) edits.push({ start: id.startIndex, end: id.endIndex, text: newName });
+  for (const id of variableReferences(root, oldName, container)) edits.push({ start: id.startIndex, end: id.endIndex, text: newName });
   return applyEdits(source, edits);
 }
 
@@ -378,14 +390,14 @@ export function nameAvailable(root: Node, name: string): boolean {
  * the value's text first, in parentheses when it needs them; without, a
  * used variable is left alone (the caller asks first).
  */
-export function deleteVariable(source: string, root: Node, variable: VariableInfo, inline: boolean): string {
-  const refs = variableReferences(root, variable.name);
+export function deleteVariable(source: string, root: Node, variable: VariableInfo, inline: boolean, container: Node = root): string {
+  const refs = variableReferences(root, variable.name, container);
   if (refs.length > 0 && !inline) return source;
   const value = needsParens(variable.valueText) ? `(${variable.valueText})` : variable.valueText;
   const edits: TextEdit[] = refs
     .filter((id) => id.startIndex < variable.statementStart || id.endIndex > variable.statementEnd)
     .map((id) => ({ start: id.startIndex, end: id.endIndex, text: value }));
-  const stmt = root.children.find((c) => c?.startIndex === variable.statementStart) ?? null;
+  const stmt = container.children.find((c) => c?.startIndex === variable.statementStart) ?? null;
   let start = variable.statementStart;
   let end = variable.statementEnd;
   const next = stmt?.nextSibling;
@@ -402,10 +414,49 @@ export function deleteVariable(source: string, root: Node, variable: VariableInf
     // The last variable of a block at the top of the file: take the blank
     // line that separated it from the rest too.
     const before = source.slice(0, start);
-    const atTop = before.trim() === '' || /\n\s*\n$/.test(before);
+    const atTop = container.equals(root) && (before.trim() === '' || /\n\s*\n$/.test(before));
     const nextNl = source.indexOf('\n', end);
     if (atTop && nextNl >= 0 && source.slice(end, nextNl).trim() === '') end = nextNl + 1;
   }
   edits.push({ start, end, text: '' });
   return applyEdits(source, edits);
+}
+
+/** A module whose variables the panel shows as their own scope. */
+export interface ModuleVariables {
+  name: string;
+  // The module body's block: the container its variables live in.
+  body: Node;
+  // Parameters with their default's text (null: no default). Callers set
+  // them, so the panel shows them read-only.
+  parameters: { name: string; defaultText: string | null; line: number }[];
+  variables: VariableInfo[];
+  definitionStart: number;
+  line: number;
+}
+
+/** The innermost module definition with a `{ }` body around `offset`. */
+export function moduleAt(root: Node, offset: number): Node | null {
+  for (let n: Node | null = root.descendantForIndex(offset); n; n = n.parent) {
+    if (n.type === 'module_definition' && n.childForFieldName('body')?.type === 'block') return n;
+  }
+  return null;
+}
+
+export function readModuleVariables(root: Node, definition: Node): ModuleVariables | null {
+  const body = definition.childForFieldName('body');
+  const name = definition.childForFieldName('name')?.text;
+  if (!body || body.type !== 'block' || !name) return null;
+  return {
+    name,
+    body,
+    parameters: parameterList(definition.childForFieldName('parameters')).map((p) => ({
+      name: p.name,
+      defaultText: p.defaultNode?.text ?? null,
+      line: (p.defaultNode ?? definition).startPosition.row,
+    })),
+    variables: readVariables(root, body),
+    definitionStart: definition.startIndex,
+    line: definition.startPosition.row,
+  };
 }

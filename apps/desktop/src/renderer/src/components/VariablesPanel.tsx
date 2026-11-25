@@ -1,21 +1,61 @@
 import { useState } from 'react';
-import type { VariableInfo } from '../variables';
+import type { ModuleVariables, VariableInfo } from '../variables';
 
 // M11: the variables sidebar (PLAN.md M11 decisions 1, 2 and 7). Lists the
 // file's top-level variables grouped by their Customizer tab, each with a
 // widget for its value (a Customizer slider or dropdown when the file
 // declares one), where it's used, rename and delete. Expressions show what
 // they come to and edit as text.
+//
+// Scopes are visible (Jordan, 2026-11-25): the file's own variables, the
+// variables of the module the cursor or drill-in is inside (its parameters
+// read-only, since callers set them), and variables from included files
+// (read-only here; open the file to edit them).
+
+// Which assignment block a variable lives in: the file's top level, or a
+// module body (by the definition's start offset in the document).
+export type VariableScope = { kind: 'file' } | { kind: 'module'; definitionStart: number };
+
+export interface ModuleSection extends Omit<ModuleVariables, 'body'> {
+  // A library module (drilled into from a call): shown, not editable.
+  file: string | null;
+}
+
+export interface IncludedSection {
+  path: string;
+  via: string;
+  variables: VariableInfo[];
+  // Names this file assigns again (OpenSCAD keeps the last assignment), by
+  // the line (zero-based) of the document's assignment.
+  overridden: Map<string, number>;
+}
 
 export interface VariablesPanelProps {
   variables: VariableInfo[];
+  module: ModuleSection | null;
+  included: IncludedSection[];
   readOnly: boolean;
-  onSetValue: (variable: VariableInfo, valueText: string) => void;
+  onSetValue: (variable: VariableInfo, valueText: string, scope: VariableScope) => void;
   onAdd: (name: string, valueText: string) => string | null;
-  onRename: (variable: VariableInfo, newName: string) => string | null;
-  onDelete: (variable: VariableInfo, inline: boolean) => void;
+  onRename: (variable: VariableInfo, newName: string, scope: VariableScope) => string | null;
+  onDelete: (variable: VariableInfo, inline: boolean, scope: VariableScope) => void;
   onReveal: (start: number, end: number) => void;
+  onOpenFile: (path: string) => void;
   onClose: () => void;
+}
+
+const FILE_SCOPE: VariableScope = { kind: 'file' };
+
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
+}
+
+function SectionTitle({ children, title }: { children: React.ReactNode; title?: string }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4, textTransform: 'uppercase', fontSize: 10, letterSpacing: 1, opacity: 0.75, marginTop: 10, color: '#c8a96e' }} title={title}>
+      {children}
+    </div>
+  );
 }
 
 const row: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' };
@@ -87,7 +127,17 @@ function ValueControl({ v, disabled, onCommit }: { v: VariableInfo; disabled: bo
   return text;
 }
 
-function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps }) {
+interface RowOptions {
+  scope: VariableScope;
+  // Shown only (an included file's, or a library module's).
+  locked: boolean;
+  // An included file: its line button opens the file instead.
+  file?: string;
+  note?: string | null;
+}
+
+function VariableRow({ v, props, opts }: { v: VariableInfo; props: VariablesPanelProps; opts: RowOptions }) {
+  const readOnly = props.readOnly || opts.locked;
   const [renaming, setRenaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -105,7 +155,7 @@ function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps
             onBlur={(e) => {
               setRenaming(false);
               const next = e.target.value.trim();
-              if (next !== v.name && next !== '') setError(props.onRename(v, next));
+              if (next !== v.name && next !== '') setError(props.onRename(v, next, opts.scope));
             }}
             onKeyDown={commitOnEnter}
           />
@@ -113,7 +163,7 @@ function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps
           <button
             className="variable-name"
             title={`Rename ${v.name} (and every use of it)`}
-            disabled={props.readOnly}
+            disabled={readOnly}
             onClick={() => setRenaming(true)}
             style={{ fontFamily: 'monospace', fontWeight: 'bold', background: 'none', border: 'none', color: '#9cdcfe', padding: 0, cursor: 'text' }}
           >
@@ -121,7 +171,7 @@ function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps
           </button>
         )}
         <span style={{ opacity: 0.6 }}>=</span>
-        <ValueControl key={v.valueText} v={v} disabled={props.readOnly} onCommit={(t) => props.onSetValue(v, t)} />
+        <ValueControl key={v.valueText} v={v} disabled={readOnly} onCommit={(t) => props.onSetValue(v, t, opts.scope)} />
         {!v.literal && v.display !== null && (
           <span style={{ opacity: 0.7 }} title="What the expression comes to">
             = {v.display}
@@ -129,14 +179,17 @@ function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps
         )}
       </div>
       {v.description && <div style={{ opacity: 0.6, fontSize: 11 }}>{v.description}</div>}
+      {opts.note && <div style={{ color: '#e8a05a', fontSize: 11 }}>{opts.note}</div>}
       <div style={{ ...row, fontSize: 11, opacity: 0.8 }}>
-        <button
-          onClick={() => props.onReveal(v.statementStart, v.statementEnd)}
-          title="Show the assignment in the editor"
-          style={{ fontSize: 11 }}
-        >
-          Line {v.line + 1}
-        </button>
+        {opts.file ? (
+          <button onClick={() => props.onOpenFile(opts.file!)} title={`Open ${baseName(opts.file)} to edit this variable`} style={{ fontSize: 11 }}>
+            {baseName(opts.file)}:{v.line + 1}
+          </button>
+        ) : (
+          <button onClick={() => props.onReveal(v.statementStart, v.statementEnd)} title="Show the assignment in the editor" style={{ fontSize: 11 }}>
+            Line {v.line + 1}
+          </button>
+        )}
         {usedIn.length > 0 ? (
           <span>
             used on line{usedIn.length > 1 ? 's' : ''}{' '}
@@ -153,8 +206,8 @@ function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps
           <span style={{ opacity: 0.6 }}>not used</span>
         )}
         {v.reassigned && <span style={{ color: '#e8a05a' }} title="OpenSCAD uses the last assignment of a name">assigned twice</span>}
-        {!props.readOnly && (
-          <button style={{ fontSize: 11, marginLeft: 'auto' }} title={`Delete ${v.name}`} onClick={() => (v.uses.length > 0 ? setConfirmDelete(true) : props.onDelete(v, false))}>
+        {!readOnly && (
+          <button style={{ fontSize: 11, marginLeft: 'auto' }} title={`Delete ${v.name}`} onClick={() => (v.uses.length > 0 ? setConfirmDelete(true) : props.onDelete(v, false, opts.scope))}>
             Delete
           </button>
         )}
@@ -165,7 +218,7 @@ function VariableRow({ v, props }: { v: VariableInfo; props: VariablesPanelProps
           <button
             onClick={() => {
               setConfirmDelete(false);
-              props.onDelete(v, true);
+              props.onDelete(v, true, opts.scope);
             }}
             title={`Replace each use with ${v.valueText}, then delete it`}
           >
@@ -241,6 +294,7 @@ export function VariablesPanel(props: VariablesPanelProps) {
           </button>
         </span>
       </div>
+      {(props.module || props.included.length > 0) && <SectionTitle>This file</SectionTitle>}
       {props.variables.length === 0 && (
         <div style={{ opacity: 0.6 }}>No variables yet. Add one, or use "Make variable" next to a number in the parameter panel.</div>
       )}
@@ -252,10 +306,62 @@ export function VariablesPanel(props: VariablesPanelProps) {
             </div>
           )}
           {vars.map((v) => (
-            <VariableRow key={`${v.name}:${v.statementStart}`} v={v} props={props} />
+            <VariableRow key={`${v.name}:${v.statementStart}`} v={v} props={props} opts={{ scope: FILE_SCOPE, locked: false }} />
           ))}
         </section>
       ))}
+      {props.module && <ModuleScopeSection section={props.module} props={props} />}
+      {props.included.map((inc) => (
+        <section key={inc.path} aria-label={`Variables from ${baseName(inc.path)}`}>
+          <SectionTitle title={`Brought in by include <${inc.via}>: read-only here`}>
+            From {baseName(inc.path)}
+            <button style={{ fontSize: 10, textTransform: 'none', letterSpacing: 0, marginLeft: 'auto' }} onClick={() => props.onOpenFile(inc.path)}>
+              Open
+            </button>
+          </SectionTitle>
+          {inc.variables.length === 0 && <div style={{ opacity: 0.6 }}>No variables.</div>}
+          {inc.variables.map((v) => {
+            const line = inc.overridden.get(v.name);
+            return (
+              <VariableRow
+                key={`${v.name}:${v.statementStart}`}
+                v={v}
+                props={props}
+                opts={{ scope: FILE_SCOPE, locked: true, file: inc.path, note: line !== undefined ? `Assigned again in this file (line ${line + 1}); OpenSCAD uses the last assignment.` : null }}
+              />
+            );
+          })}
+        </section>
+      ))}
     </aside>
+  );
+}
+
+function ModuleScopeSection({ section, props }: { section: ModuleSection; props: VariablesPanelProps }) {
+  const scope: VariableScope = { kind: 'module', definitionStart: section.definitionStart };
+  const locked = section.file !== null;
+  return (
+    <section aria-label={`Variables inside ${section.name}()`}>
+      <SectionTitle title="Only this module sees these">
+        Inside {section.name}()
+        {section.file && <span style={{ textTransform: 'none', letterSpacing: 0, opacity: 0.8 }}>· {baseName(section.file)}</span>}
+      </SectionTitle>
+      {section.parameters.map((p) => (
+        <div key={`param:${p.name}`} data-testid={`parameter-${p.name}`} style={{ ...row, padding: '3px 0', borderBottom: '1px solid #2d2d2d' }} title="A parameter: each call sets it, so it is edited at the call">
+          <span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#9cdcfe' }}>{p.name}</span>
+          {p.defaultText !== null && (
+            <>
+              <span style={{ opacity: 0.6 }}>=</span>
+              <span style={{ fontFamily: 'monospace' }}>{p.defaultText}</span>
+            </>
+          )}
+          <span style={{ opacity: 0.6, fontSize: 11, marginLeft: 'auto' }}>parameter{p.defaultText !== null ? ', default' : ''}</span>
+        </div>
+      ))}
+      {section.variables.map((v) => (
+        <VariableRow key={`${v.name}:${v.statementStart}`} v={v} props={props} opts={{ scope, locked, file: section.file ?? undefined }} />
+      ))}
+      {section.parameters.length === 0 && section.variables.length === 0 && <div style={{ opacity: 0.6 }}>No parameters or variables.</div>}
+    </section>
   );
 }

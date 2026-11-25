@@ -69,7 +69,7 @@ import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleI
 import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
 import { findOption, fontGroups, isFontAvailable, type FontEntry } from './fontOptions';
 import { SettingsDialog, type EditorFontSettings } from './components/SettingsDialog';
-import { VariablesPanel } from './components/VariablesPanel';
+import { VariablesPanel, type IncludedSection, type ModuleSection, type VariableScope } from './components/VariablesPanel';
 import { ToolPanel, type ToolState } from './components/ToolPanel';
 import {
   applyEdits,
@@ -77,11 +77,14 @@ import {
   insertVariable,
   isValidName,
   makeVariable,
+  moduleAt,
   nameAvailable,
+  readModuleVariables,
   readVariables,
   renameVariable,
   setVariableValue,
   uniqueName,
+  variableReferences,
   type VariableInfo,
 } from './variables';
 import { currentOffset, planRelate } from './relate';
@@ -407,6 +410,10 @@ export function App() {
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>('translate');
   // M11: the variables sidebar, the Distance/Align/Pattern tool panel and
   // the Make variable name prompt.
+  // M11: the editor cursor's offset (a user move), for the module scope.
+  const [cursorOffset, setCursorOffset] = useState<number | null>(null);
+  // M11: files the document includes, for their variables.
+  const [includedFiles, setIncludedFiles] = useState<{ path: string; contents: string; via: string }[]>([]);
   // M11: the variables sidebar remembers whether it was last shown.
   const [variablesOpen, setVariablesOpenState] = useState(() => {
     try {
@@ -781,6 +788,21 @@ export function App() {
       cancelled = true;
     };
   }, [useKey, filePath, libraryVersion]);
+  // M11: the included files, rescanned on the same triggers.
+  useEffect(() => {
+    if (useKey === null) return;
+    let cancelled = false;
+    window.scadstudio
+      .scanIncludes(sourceRef.current)
+      .then((files) => {
+        if (!cancelled) setIncludedFiles(files);
+      })
+      .catch((err) => console.error('[scadstudio] include scan failed', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [useKey, filePath, libraryVersion]);
+  useEffect(() => setCursorOffset(null), [filePath]);
   useEffect(
     () =>
       window.scadstudio.onModulesChanged(() => {
@@ -1536,16 +1558,58 @@ export function App() {
 
   // M11: the document's variables, from the last rendered parse.
   const variables = useMemo(() => (tree ? readVariables(tree.rootNode) : []), [tree]);
-  // The same variable in the current text (it may have moved since).
-  const liveVariable = useCallback((v: VariableInfo): VariableInfo | null => {
+  // M11 visible scopes: variables from included files, read-only. Their
+  // uses are this document's reads of them (none once it assigns the name
+  // again, since OpenSCAD keeps the last assignment).
+  const includedParsed = useMemo(
+    () =>
+      includedFiles.flatMap((file) => {
+        const parsed = parseScadSync(file.contents);
+        if (!parsed) return [];
+        const vars = readVariables(parsed.rootNode).map((v) => ({ ...v, uses: [] as VariableInfo['uses'] }));
+        parsed.delete();
+        return [{ path: file.path, via: file.via, variables: vars }];
+      }),
+    [includedFiles],
+  );
+  const includedSections = useMemo((): IncludedSection[] => {
+    if (!tree) return [];
+    const assigned = new Map(variables.map((v) => [v.name, v.line]));
+    return includedParsed.map((file) => {
+      const overridden = new Map<string, number>();
+      const vars = file.variables.map((v) => {
+        const line = assigned.get(v.name);
+        if (line !== undefined) {
+          overridden.set(v.name, line);
+          return v;
+        }
+        return { ...v, uses: variableReferences(tree.rootNode, v.name).map((id) => ({ start: id.startIndex, end: id.endIndex, line: id.startPosition.row })) };
+      });
+      return { path: file.path, via: file.via, variables: vars, overridden };
+    });
+  }, [tree, variables, includedParsed]);
+  // The assignment block a scope names, in the current text.
+  const scopeContainer = useCallback((scope: VariableScope) => {
     const t = treeRef.current;
     if (!t) return null;
-    const all = readVariables(t.rootNode).filter((x) => x.name === v.name);
-    return all.find((x) => x.line === v.line) ?? all[all.length - 1] ?? null;
+    if (scope.kind === 'file') return t.rootNode;
+    const def = moduleAt(t.rootNode, scope.definitionStart);
+    return def && def.startIndex === scope.definitionStart ? def.childForFieldName('body') : null;
   }, []);
+  // The same variable in the current text (it may have moved since).
+  const liveVariable = useCallback(
+    (v: VariableInfo, scope: VariableScope = { kind: 'file' }): VariableInfo | null => {
+      const t = treeRef.current;
+      const container = scopeContainer(scope);
+      if (!t || !container) return null;
+      const all = readVariables(t.rootNode, container).filter((x) => x.name === v.name);
+      return all.find((x) => x.line === v.line) ?? all[all.length - 1] ?? null;
+    },
+    [scopeContainer],
+  );
   const handleVariableSet = useCallback(
-    (v: VariableInfo, valueText: string) => {
-      const live = liveVariable(v);
+    (v: VariableInfo, valueText: string, scope: VariableScope = { kind: 'file' }) => {
+      const live = liveVariable(v, scope);
       if (!live) return;
       if (!isExpression(valueText)) {
         setStatus(`Not an OpenSCAD expression: ${valueText}`);
@@ -1568,24 +1632,26 @@ export function App() {
     [commitEdit],
   );
   const handleVariableRename = useCallback(
-    (v: VariableInfo, newName: string): string | null => {
+    (v: VariableInfo, newName: string, scope: VariableScope = { kind: 'file' }): string | null => {
       const t = treeRef.current;
-      if (!t) return 'The file is still loading.';
+      const container = scopeContainer(scope);
+      if (!t || !container) return 'The file is still loading.';
       if (!isValidName(newName)) return 'A name starts with a letter or _ and has only letters, digits and _.';
       if (!nameAvailable(t.rootNode, newName)) return `${newName} is already used in this file.`;
-      commitEdit(renameVariable(sourceRef.current, t.rootNode, v.name, newName));
+      commitEdit(renameVariable(sourceRef.current, t.rootNode, v.name, newName, container));
       return null;
     },
-    [commitEdit],
+    [commitEdit, scopeContainer],
   );
   const handleVariableDelete = useCallback(
-    (v: VariableInfo, inline: boolean) => {
+    (v: VariableInfo, inline: boolean, scope: VariableScope = { kind: 'file' }) => {
       const t = treeRef.current;
-      const live = liveVariable(v);
-      if (!t || !live) return;
-      commitEdit(deleteVariable(sourceRef.current, t.rootNode, live, inline));
+      const container = scopeContainer(scope);
+      const live = liveVariable(v, scope);
+      if (!t || !live || !container) return;
+      commitEdit(deleteVariable(sourceRef.current, t.rootNode, live, inline, container));
     },
-    [liveVariable, commitEdit],
+    [liveVariable, commitEdit, scopeContainer],
   );
   const handleReveal = useCallback((start: number, end: number) => {
     setRevealRequest((prev) => ({ start, end, token: (prev?.token ?? 0) + 1 }));
@@ -1967,6 +2033,27 @@ export function App() {
   const workingSet = currentSet(resolved);
   const focusDepth = resolved?.focus.length ?? 0;
   const readOnly = workingSet?.readOnly ?? null;
+
+  // M11 visible scopes: the module the drill-in or the editor cursor is
+  // inside. Drilled into a library module, its variables show read-only.
+  const variablesModule = useMemo((): ModuleSection | null => {
+    if (!tree) return null;
+    const container = workingSet?.container ?? null;
+    if (workingSet && container && workingSet.doc.kind === 'library') {
+      const def = moduleAt(workingSet.doc.tree.rootNode, container.body.start);
+      const info = def ? readModuleVariables(workingSet.doc.tree.rootNode, def) : null;
+      if (!info) return null;
+      const { body: _body, ...rest } = info;
+      return { ...rest, file: workingSet.doc.path };
+    }
+    const offset = workingSet?.editingModule && container ? container.body.start : cursorOffset;
+    if (offset === null) return null;
+    const def = moduleAt(tree.rootNode, offset);
+    const info = def ? readModuleVariables(tree.rootNode, def) : null;
+    if (!info) return null;
+    const { body: _body, ...rest } = info;
+    return { ...rest, file: null };
+  }, [tree, workingSet, cursorOffset]);
   // Transform edits need the working set's frame as a matrix (drillIn.ts);
   // sketches also need it rigid, since a sketch plane can't be scaled.
   const transformEditable = !readOnly && (workingSet?.bakedPrefix ?? '') === '';
@@ -2660,6 +2747,9 @@ export function App() {
             onRename={handleVariableRename}
             onDelete={handleVariableDelete}
             onReveal={handleReveal}
+            onOpenFile={handleOpenLibrary}
+            module={variablesModule}
+            included={includedSections}
             onClose={() => setVariablesOpen(false)}
           />
         )}
@@ -2678,6 +2768,7 @@ export function App() {
             fontSize={settings.editorFontSize}
             selectedIndex={readOnly ? null : primarySelectedIndex}
             onSelectNode={(index) => handleSelect(index, 'replace')}
+            onCursorOffset={setCursorOffset}
             documentKey={documentToken}
           />
         </div>
