@@ -242,6 +242,21 @@ app.whenReady().then(() => {
     return { filePath, contents };
   });
 
+  // M9: "Open <library> to edit" from a view-only drilled-in library module.
+  // Same unsaved-changes question as File > Open, then opens that exact file
+  // (no dialog): the user already chose it by clicking the labeled action.
+  ipcMain.handle('scad:openPath', async (event, filePath: string) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (documentDirty) {
+      const choice = await confirmDiscard(win, 'opening the library file');
+      if (choice === 'cancel') return null;
+      if (choice === 'save') return { saveFirst: true } as const;
+    }
+    const contents = await readFile(filePath, 'utf8');
+    currentDocumentPath = filePath;
+    return { filePath, contents };
+  });
+
   // Save / Save As (QC audit H5). Writes the renderer's current text to
   // `filePath`, or asks for a path when there is none yet or saveAs is set.
   // Resolves to the path written, or null if the user cancelled the dialog.

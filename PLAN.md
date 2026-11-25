@@ -133,7 +133,7 @@ Two distinct kinds of constraint, handled very differently, both persisting into
 - **M14 — Customizable keybinds (stretch goal, not v1)**: a settings UI to rebind viewport/editor shortcuts (selection modifiers, gizmo-mode switches, boolean ops, etc.) away from their hardcoded defaults, with persistence and conflict detection. Deliberately deferred — low-priority relative to the v1 milestones, and only worth the settings-UI/persistence/conflict-resolution investment once there's a larger fixed set of bindings to make customizable than exists today (2026-09-14, discussed with Jordan while fixing M6's selection modifiers below; renumbered from M13 to M14 on 2026-09-15 when M9 — drill-in navigation — was inserted before Polish).
 - **M15 — `text()` and font support (v1, added 2026-10-16)**: `text()` is the one 2D primitive that cannot render today, because the `openscad-wasm@0.0.4` bundle in use doesn't ship fonts (see "M0 spike results", engine-integration finding 2). Needs a spike first: either an `openscad-wasm` build that bundles a font set, or another way to register fonts in its virtual filesystem; then a Text tool in the toolbar and the sketch toolset. Scope and open questions in "v1 scope detail" below.
 
-**Build order from here (reordered 2026-10-16, numbers unchanged to avoid another renumbering):** ~~finish M7.5 (richer sketch tools and several profiles per sketch)~~ done 2026-11-22 → ~~M8 custom-module toolbar~~ done 2026-11-24 → M9 drill-in navigation → M15 text/fonts (its spike can run any time earlier, since it only touches the engine) → M11 directional constraints → M13 BOSL2 fillets/chamfers → M10 polish last, so it can triage the whole UX backlog at once. M12 (solver constraints) stays post-v1 and M14 (keybinds) stays a stretch goal. **v1 = M0–M11 + M13 + M15.**
+**Build order from here (reordered 2026-10-16, numbers unchanged to avoid another renumbering):** ~~finish M7.5 (richer sketch tools and several profiles per sketch)~~ done 2026-11-22 → ~~M8 custom-module toolbar~~ done 2026-11-24 → ~~M9 drill-in navigation~~ done 2026-11-25 → M15 text/fonts (its spike can run any time earlier, since it only touches the engine) → M11 directional constraints → M13 BOSL2 fillets/chamfers → M10 polish last, so it can triage the whole UX backlog at once. M12 (solver constraints) stays post-v1 and M14 (keybinds) stays a stretch goal. **v1 = M0–M11 + M13 + M15.**
 
 ## Fillets/chamfers (v1, M13): BOSL2 integration
 
@@ -160,7 +160,7 @@ Jordan asked (2026-09-15) whether the app could get something like a CAD timelin
 
 **Why sequenced M9 (after M8, before Polish)**: after M8 specifically, because by then every kind of nested/child content the app will ever produce (boolean children from M6, extrusion children from M7, module internals from M8) already exists — building drill-in earlier would mean solving it once for booleans and re-solving it again for each subsequent block type as it's added, rather than building the general mechanism once against the full set. Before Polish, because this is substantial, load-bearing interaction-model scope in its own right, not a polish-pass item — and the Polish backlog's other pending idea (the Onshape-style tool-first operation panel, below) would likely want this same breadcrumb/focus-mode affordance anyway, so drill-in existing first is the better order.
 
-**Status**: not started, scoped 2026-09-15.
+**Status**: done 2026-11-25 (scoped 2026-09-15). See "M9 build notes" below.
 
 ## Sketch mode (M7.5): plane-based parametric sketching
 
@@ -235,8 +235,8 @@ Fixed by the 2026-11-22 QC fix PR, listed so the history is clear: renders now p
 - **Raw `monaco-editor`**, not `@monaco-editor/react`.
 - **openscad-wasm is bundled from `node_modules`** (inside `app.asar`), not shipped as loose `extraResources`.
 - **Parsing is not incremental.** Each edit re-parses the whole document with the loaded parser (fast enough so far); `tree.edit()` is not wired in.
-- **Selection is positional**, not the stable-ID fingerprinting the architecture describes (M3 note).
-- **The scene graph models top-level statements only**; nested nodes are M9.
+- **Selection is positional within a working set**, carried across edits by text matching (`nodeIdentity.ts`, M9) rather than the stable-ID fingerprinting the architecture describes.
+- **Nested nodes are reached by drilling in** (M9): the scene graph is still one level at a time (the top level, or the children of the drilled-into node), not one tree of every nested node.
 
 ## Critical first files
 
@@ -609,6 +609,30 @@ Last M7.5 slice, the "richer sketch tools and several profiles per sketch" item 
 **Finding for M13: BOSL2 only works through `include`.** `use <BOSL2/std.scad>` lists BOSL2's modules, but every call fails in the engine ("Ignoring unknown variable \"$anchor_override\""): BOSL2 relies on top-level variables and constants, which `use` does not import, and its own docs say to `include` it. With the "only `use`d modules" decision, a file that does `include <BOSL2/std.scad>` gets no BOSL2 tools. M13 (BOSL2 fillets/chamfers) will need either an exception for known include-style libraries or its own BOSL2 tool set.
 
 **Not in M8.** Nested-module internals (drill-in is M9). Insertion still appends at the end of the document (as M5). A library file with grammar errors still yields the modules the parser can read, including ones inside a top-level error node.
+
+## M9 build notes (2026-11-25) — drill-in navigation
+
+**What shipped.** Select a boolean, a group block, an extrusion, a transform with a block, or a call of a module defined in the document or a `use`d file, then click "Open Difference #2 ▸" (or double-click it in the viewport). Its children become the working set: they are the only selectable, gizmo-able nodes, the rest of the model is drawn dim grey and see-through, and the editor dims the text outside the focused statement. A breadcrumb at the bottom left ("Assembly › bracket() #1 › Difference #1") links back to every level, the last crumb is the current location, and Escape steps out one level (and reselects the node you came from). Inside a difference the base is drawn see-through, and a click on it passes through to a cutter behind it, so cutters can be picked.
+
+**Code.** `drillIn.ts` holds the model. A `WorkingSet` is the nodes of one level plus what an isolated render of one of them needs: the frame (the ancestors' literal translate/rotate/scale/mirror/multmatrix as one matrix), the context of each level (assignments and nested module definitions in a block body), and for a module body a scope. `drillInto` builds the next level, `resolveFocus` re-derives every level after each parse, and `isolatedRender` builds the engine source for one node. App.tsx renders the working set first, then the dimmed context, through a per-node render cache keyed by the exact source sent to the engine (LRU, 500 entries; cleared when a `use`d file changes on disk or the open file changes). Editing one child therefore costs one engine call: its siblings and the context hit the cache (checked by the e2e through `window.__scadstudioRenderStats`).
+
+**Module bodies render in their real scope.** A node inside `module bracket(w=20, h=10)` is rendered as `module __scadstudio_scope_1(w=20, h=10) { <body assignments>; <node> } __scadstudio_scope_1(<the call's own args>) <the call's children>`, so parameters, defaults, `children()` and body variables all evaluate as in the full model. `drillInRender.test.ts` checks each case (boolean child, module args, block assignments, 2D extrude child, `children()`, a mirrored two-level case, a baked frame) against the engine's own full render by bounding box.
+
+**Computed transforms are baked, not guessed.** When an ancestor's transform isn't a literal (`translate([w/2, 0, 0])`, a `for` variable), the frame stops there and the rest of the ancestor chain is prepended to the render source as text instead. The geometry is right, but the gizmo and the Position/Rotate/Mirror controls are off in that set (a banner says why); the parameter panel still edits.
+
+**Library modules are view-only** (Jordan's decision). Drilling into a module from a `use`d file shows its internals with the editor read-only, the toolbar's editing groups hidden and the parameter panel disabled, and a banner with an explicit "Open parts.scad to edit" button that opens the library file (with the unsaved-changes check). Drilling into a module defined in the document edits its definition, with a banner that the change applies to every call.
+
+**Node identity (risk 5).** `nodeIdentity.ts` carries a selection or a focus level across an edit: an LCS over the set's statement texts pins what didn't change, and a changed node is paired inside its gap by text similarity (character-pair Dice), the same call name, and the same offset. A focus level whose node is gone is left, with "Left drill-in (that node no longer exists)" in the status. A half-typed parse never moves the focus: only a clean parse commits a remap. After a typed edit the still-selected meshes glow for 600 ms (the confirm-flash), so a wrong guess shows.
+
+**Structural edits at any depth (risk 4).** `wrapInBoolean`, `wrapInExtrude`, `patchTransform` and the new `insertIntoContainer` now follow the file's own indentation (4 spaces, 2 spaces or tabs) at any nesting depth. `insertIntoContainer` adds a toolbar insert or a finished sketch inside the focused node: after the last child at the children's indentation, opening a one-line `{ ... }`, or turning a single-statement body (`union() cube(1);`) into a block. `structuralEdits.property.test.ts` (fast-check, 120 runs by default, `PROPERTY_RUNS` to raise it) generates documents with nested booleans, blocks, transforms, modifiers, comments and a module, and checks every edit on every reachable working set: a clean parse, the intended read-back, nothing outside the edited statement changed. It found one real bug, fixed: inserting into a module body took its indentation from the call site instead of the definition. (Wrap-in-boolean's old top-level-only indentation was rewritten for nesting before the property tests existed.)
+
+**Render latency (risk 2).** Drill-in adds no engine calls when nothing changed (every level is a cache hit), and an edit inside a set re-renders only the edited node. Entering a module for the first time costs one call per body statement plus the context; the 12-part boolean budget test still passes.
+
+**Sketch mode reuses the focus.** Starting a sketch while drilled in shows "› Sketch" as one more crumb, and Finish Sketch writes the polygon into the focused node, converted into its frame (`worldToFrame`); Edit Sketch on a nested sketch converts back (`frameToWorld`). Escape leaves an untouched sketch; with changes it only says to Finish/Save or Exit/Cancel first, so nothing is lost.
+
+**The M6 stopgap.** There was nothing to remove: M6's per-child selection was rescoped into M9 before a stopgap was built.
+
+**Known limitations.** `for`/`if` bodies and `children()` targets can't be drilled into. A library module's own top-level variables aren't visible inside the scope wrapper, so a library body that reads them renders wrong while drilled in (the full model is unaffected). A baked outer transform that names a variable shadowed by a module parameter of the same name would resolve to the parameter. `rotate_extrude` profiles are drawn in XY, not swept. Typing inside the editor moves the cursor, which drives selection as before.
 
 ## CI/CD: AppImage builds (2026-09-07)
 

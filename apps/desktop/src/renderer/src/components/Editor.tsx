@@ -16,12 +16,16 @@ interface EditorProps {
   // the editor's undo history reset; every other `value` change is a visual
   // edit, applied as an undoable edit on top of the existing history.
   documentKey?: string | number;
+  // M9: while drilled in, the drilled-into node's body; everything outside
+  // it is dimmed, the editor's version of the viewport's dimmed context.
+  focusRange?: { start: number; end: number } | null;
 }
 
-export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, documentKey }: EditorProps) {
+export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, documentKey, focusRange = null }: EditorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const decorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
+  const focusDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const onSelectNodeRef = useRef(onSelectNode);
@@ -56,6 +60,7 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, do
     });
     editorRef.current = editor;
     decorationsRef.current = editor.createDecorationsCollection();
+    focusDecorationsRef.current = editor.createDecorationsCollection();
     // Raw Monaco instance, exposed for ad-hoc manual debugging via devtools.
     // SCADSTUDIO_TEST_EDIT (main/index.ts) used to script edits through this
     // (`__testEditor.setValue(...)`), but that relied on
@@ -101,7 +106,12 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, do
       if (e.reason === monaco.editor.CursorChangeReason.ContentFlush || applyingValueRef.current) return;
       const model = editor.getModel();
       if (!model) return;
-      const offset = model.getOffsetAt(e.position);
+      // A click in a line's indentation means that line's statement (M9:
+      // drilled-in statements are indented, and clicking at the start of
+      // their line should select them).
+      const indentEnd = model.getLineFirstNonWhitespaceColumn(e.position.lineNumber);
+      const position = indentEnd > 0 && e.position.column < indentEnd ? { lineNumber: e.position.lineNumber, column: indentEnd } : e.position;
+      const offset = model.getOffsetAt(position);
       const hit = nodesRef.current.find((n) => offset >= n.startIndex && offset < n.endIndex);
       onSelectNodeRef.current(hit ? hit.index : null);
     });
@@ -167,6 +177,29 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, do
     decorations.set([{ range, options: { className: 'scad-selected-node', isWholeLine: false } }]);
     editor.revealRangeInCenterIfOutsideViewport(range);
   }, [selectedIndex, nodes]);
+
+  useEffect(() => {
+    const model = editorRef.current?.getModel();
+    const decorations = focusDecorationsRef.current;
+    if (!model || !decorations) return;
+    if (!focusRange) {
+      decorations.set([]);
+      return;
+    }
+    const length = model.getValueLength();
+    const ranges: [number, number][] = [
+      [0, Math.min(focusRange.start, length)],
+      [Math.min(focusRange.end, length), length],
+    ];
+    decorations.set(
+      ranges
+        .filter(([a, b]) => b > a)
+        .map(([a, b]) => ({
+          range: monaco.Range.fromPositions(model.getPositionAt(a), model.getPositionAt(b)),
+          options: { inlineClassName: 'scad-out-of-focus' },
+        })),
+    );
+  }, [focusRange?.start, focusRange?.end, value]);
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
 }

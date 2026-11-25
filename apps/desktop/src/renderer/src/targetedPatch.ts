@@ -65,20 +65,53 @@ function formatVector(v: readonly number[]): string {
   return `[${v.map(formatNumber).join(', ')}]`;
 }
 
-interface VectorCall {
+export interface VectorCall {
   name: string;
   xyz: [number, number, number];
   // Fourth component when the vector has exactly four (color's alpha).
   w: number | null;
 }
 
-function topConcreteNode(root: Node, node: SceneNode): Node | null {
-  for (let i = 0; i < root.childCount; i++) {
-    const stmt = root.child(i);
-    if (!stmt || stmt.startIndex !== node.startIndex || stmt.endIndex !== node.endIndex) continue;
-    return stmt.type === 'statement' ? stmt.child(0) : stmt;
+// The concrete statement node (module_instantiation, block, ...) whose
+// `statement` wrapper spans exactly `node`'s byte range — at any depth, not
+// just the top level (M9: drill-in makes nested statements, a boolean's
+// children or a module body's statements, scene nodes too). Every edit
+// below is a byte-range patch against this node, so they all work unchanged
+// one level (or several) deeper.
+export function topConcreteNode(root: Node, node: SceneNode): Node | null {
+  // From the leaf at the start, climb through every ancestor that starts
+  // there; the outermost one with exactly this range is the statement.
+  let n: Node | null = root.descendantForIndex(node.startIndex, node.startIndex);
+  let match: Node | null = null;
+  while (n && n.type !== 'source_file') {
+    if (n.startIndex === node.startIndex && n.endIndex === node.endIndex) match = n;
+    else if (n.startIndex < node.startIndex || n.endIndex > node.endIndex) break;
+    n = n.parent;
   }
-  return null;
+  if (!match) return null;
+  return match.type === 'statement' ? match.child(0) : match;
+}
+
+// Leading whitespace of the line `offset` sits on, up to the first
+// non-blank character: the indentation a statement starting there has.
+export function lineIndentAt(source: string, offset: number): string {
+  const lineStart = source.lastIndexOf('\n', offset - 1) + 1;
+  const m = /^[ \t]*/.exec(source.slice(lineStart, offset));
+  return m ? m[0] : '';
+}
+
+// `text` (a statement's own source, whose first line starts mid-line) with
+// `fromIndent` removed from the start of every following line and `toIndent`
+// put on every line instead — moving a statement one level deeper or
+// shallower keeps its inner layout.
+export function reindent(text: string, fromIndent: string, toIndent: string): string {
+  return text
+    .split('\n')
+    .map((line, i) => {
+      const stripped = i > 0 && line.startsWith(fromIndent) ? line.slice(fromIndent.length) : i > 0 ? line.trimStart() : line;
+      return stripped.length > 0 ? toIndent + stripped : stripped;
+    })
+    .join('\n');
 }
 
 // A negative literal like `-95.406` doesn't parse as a plain `number` node —
@@ -98,7 +131,7 @@ function readNumber(n: Node | null): number | null {
   return null;
 }
 
-function readVectorCall(call: Node): VectorCall | null {
+export function readVectorCall(call: Node): VectorCall | null {
   const name = call.childForFieldName('name')?.text;
   if (!name) return null;
   const args = call.childForFieldName('arguments')?.namedChild(0); // `arguments` node
@@ -350,9 +383,12 @@ const MIRROR_AXIS_VECTORS: [number, number, number][] = [
   [0, 0, 1],
 ];
 
-const WRAP_SEPARATOR = '\n    ';
 
-function formatTransformPrefix(t: NodeTransform): string {
+// `baseIndent` is the indentation of the line the wrapped statement starts
+// on, so a nested statement's wraps continue one level in from *it*, not
+// from column 0 (M9: statements inside a boolean or a module body).
+function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
+  const WRAP_SEPARATOR = `\n${baseIndent}    `;
   let prefix = '';
   if (t.color) prefix += `color(${formatVector(t.color)})${WRAP_SEPARATOR}`;
   if (t.translate.some((v) => v !== 0)) prefix += `translate(${formatVector(t.translate)})${WRAP_SEPARATOR}`;
@@ -383,11 +419,13 @@ function formatTransformPrefix(t: NodeTransform): string {
 export function patchTransform(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): string {
   const decomposed = decomposeNode(tree.rootNode, node);
   if (!decomposed) return source;
-  let prefix = formatTransformPrefix(transform);
+  const baseIndent = lineIndentAt(source, decomposed.wrapStart);
+  const separator = `\n${baseIndent}    `;
+  let prefix = formatTransformPrefix(transform, baseIndent);
   // Brace form keeps its brace on the wrap's own line:
   // `translate([40, 0, 0]) { ... }`, not a `{` alone on the next line.
-  if (decomposed.primitiveNode.type === 'block' && prefix.endsWith(WRAP_SEPARATOR)) {
-    prefix = `${prefix.slice(0, -WRAP_SEPARATOR.length)} `;
+  if (decomposed.primitiveNode.type === 'block' && prefix.endsWith(separator)) {
+    prefix = `${prefix.slice(0, -separator.length)} `;
   }
   // A modifier can only prefix a module call, not a bare `{ ... }`, so an
   // identity transform on a modified brace body keeps a no-op call to hang
@@ -500,12 +538,6 @@ export function patchArgument(source: string, tree: Tree, node: SceneNode, argIn
 
 export type BooleanOp = 'union' | 'difference' | 'intersection';
 
-function indent(text: string, spaces: string): string {
-  return text
-    .split('\n')
-    .map((line) => spaces + line)
-    .join('\n');
-}
 
 // Wraps two or more top-level nodes' verbatim source into a single new
 // `union()`/`difference()`/`intersection() { ... }` block, removing them
@@ -542,16 +574,28 @@ export function wrapInBoolean(source: string, nodesInSelectionOrder: SceneNode[]
   const byDocOrder = [...nodesInSelectionOrder].sort((a, b) => a.startIndex - b.startIndex);
   const first = byDocOrder[0];
   const endOf = (n: SceneNode) => trailingCommentEnd(source, n.endIndex);
+  // M9: the new block sits where the first node was, at its indentation, and
+  // each child moves one level in from there — so wrapping two children of a
+  // module body or of another boolean reads as nested code, not column 0.
+  const baseIndent = lineIndentAt(source, first.startIndex);
+  const childIndent = `${baseIndent}    `;
 
   const body = nodesInSelectionOrder
-    .map((n) => indent(source.slice(n.startIndex, endOf(n)).trim(), '    '))
+    .map((n) => childIndent + reindent(source.slice(n.startIndex, endOf(n)).trim(), lineIndentAt(source, n.startIndex), childIndent).trimStart())
     .join('\n');
-  const block = `${op}() {\n${body}\n}`;
+  const block = `${op}() {\n${body}\n${baseIndent}}`;
 
   let result = '';
   let cursor = 0;
   for (const node of byDocOrder) {
-    result += source.slice(cursor, node.startIndex);
+    // A removed statement alone on its line takes its indentation with it,
+    // or the next line would inherit it.
+    let start = node.startIndex;
+    if (node !== first) {
+      const indentStart = start - lineIndentAt(source, start).length;
+      if (indentStart >= cursor && (indentStart === 0 || source[indentStart - 1] === '\n')) start = indentStart;
+    }
+    result += source.slice(cursor, start);
     result += node === first ? block : '';
     cursor = endOf(node);
     if (node !== first && source[cursor] === '\n') cursor++;
@@ -596,9 +640,11 @@ export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: W
   const decomposed = decomposeNode(root, node);
   const wrapStart = decomposed ? decomposed.wrapStart : node.startIndex;
   const primitiveStart = decomposed ? decomposed.primitiveStart : node.startIndex;
-  const prefix = decomposed ? formatTransformPrefix(decomposed.transform) : '';
-  const body = indent(source.slice(primitiveStart, node.endIndex).trim(), '    ');
-  const block = `${prefix}${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n}`;
+  const baseIndent = lineIndentAt(source, wrapStart);
+  const prefix = decomposed ? formatTransformPrefix(decomposed.transform, baseIndent) : '';
+  const childIndent = `${baseIndent}    `;
+  const body = childIndent + reindent(source.slice(primitiveStart, node.endIndex).trim(), baseIndent, childIndent).trimStart();
+  const block = `${prefix}${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n${baseIndent}}`;
   return source.slice(0, wrapStart) + block + source.slice(node.endIndex);
 }
 
