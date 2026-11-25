@@ -49,12 +49,33 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
       on() {}
     }
     const app = { whenReady: () => Promise.resolve(), on() {}, quit() {}, getPath: () => '/tmp' };
+    // The render process (src/main/renderWorker.ts) runs in-process here:
+    // the real request handler, minus the process boundary. RenderHost's
+    // own process handling (crash, restart, recycle) has unit tests with a
+    // fake child (test/unit/renderHost.test.ts), and the e2e suite runs the
+    // real utility process.
+    class InProcessRenderChild {
+      private listeners: Record<string, ((arg: unknown) => void)[]> = {};
+      on(event: string, fn: (arg: unknown) => void) {
+        (this.listeners[event] ??= []).push(fn);
+        return this;
+      }
+      postMessage(request: unknown) {
+        void import('../../src/main/renderWorker')
+          .then((m) => m.handleRenderRequest(request as Parameters<typeof m.handleRenderRequest>[0]))
+          .then((reply) => this.listeners['message']?.forEach((fn) => fn(reply)));
+      }
+      kill() {
+        return true;
+      }
+    }
+    const utilityProcess = { fork: () => new InProcessRenderChild() };
     const ipcMain = {
       handle: (channel: string, fn: IpcHandler) => handlers.set(channel, fn),
       on: (channel: string, fn: IpcHandler) => handlers.set(channel, fn),
       removeHandler: (channel: string) => handlers.delete(channel),
     };
-    const fake = { app, BrowserWindow: FakeBrowserWindow, dialog, ipcMain, Menu: { setApplicationMenu() {}, buildFromTemplate: () => ({}) } };
+    const fake = { app, BrowserWindow: FakeBrowserWindow, dialog, ipcMain, utilityProcess, Menu: { setApplicationMenu() {}, buildFromTemplate: () => ({}) } };
     return { ...fake, default: fake };
   });
 
