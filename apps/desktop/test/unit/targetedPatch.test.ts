@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { Quaternion } from 'three';
 import { audit } from '../helpers/audit';
-import { expectCleanParse, nodeAt, parseWithGraph } from '../helpers/parse';
+import { expectCleanParse, nodeAt, parse, parseWithGraph } from '../helpers/parse';
 import {
   IDENTITY_TRANSFORM,
   decomposeNode,
@@ -19,6 +19,7 @@ import {
   primitiveArgs,
   primitiveOnlySlice,
   quaternionToRotateDeg,
+  readVectorCall,
   readModifier,
   readSketchProfile,
   transformToQuaternion,
@@ -100,10 +101,23 @@ describe('decomposeNode (M4/M5)', () => {
     expect(d?.transform.color).toEqual([1, 0.5, 0]);
   });
 
-  it('leaves non-literal vectors alone (stops walking)', async () => {
-    const source = 'x = 3;\ntranslate([x, 0, 0]) cube(1);';
+  it('leaves vectors it cannot evaluate alone (stops walking)', async () => {
+    const source = 'translate([$t, 0, 0]) cube(1);';
     const d = await decompose(source);
     expect(d?.transform).toEqual(IDENTITY_TRANSFORM);
+  });
+
+  it('M11: reads expression components that use top-level variables, keeping their text', async () => {
+    const d = await decompose('x = 3;\ngap = 2;\ntranslate([x + gap, 0, 0]) rotate([0, 0, x * 10]) cube(1);');
+    expect(d?.transform.translate).toEqual([5, 0, 0]);
+    expect(d?.transform.rotateDeg).toEqual([0, 0, 30]);
+    expect(d?.transform.exprs).toEqual({ translate: ['x + gap', null, null], rotateDeg: [null, null, 'x * 10'], scale: [null, null, null] });
+  });
+
+  it('M11: a module parameter shadows a top-level variable, so that expression is not evaluated', async () => {
+    const tree = await parse('w = 100;\nmodule m(w = 5) { translate([w, 0, 0]) cube(1); }\nm();\n');
+    const call = tree.rootNode.descendantsOfType('module_instantiation').find((n) => n?.childForFieldName('name')?.text === 'translate')!;
+    expect(readVectorCall(call)).toBeNull();
   });
 
   it('does not treat a diagonal mirror as an axis flip', async () => {
@@ -462,5 +476,52 @@ describe('brace-body wraps and color alpha (audit H2 / M2 follow-ups)', () => {
   it('a five-component vector is not mistaken for a color', async () => {
     const d = await decompose('color([1,0,0,0.5,9]) cube(1);');
     expect(d?.transform.color).toBeNull();
+  });
+});
+
+describe('M11 expression components through patchTransform', () => {
+  const ctx = 'w = 10;\ngap = 2;\n';
+  async function commit(statement: string, change: (t: NodeTransform) => NodeTransform) {
+    const source = `${ctx}${statement}`;
+    const { tree, node } = await nodeAt(source, 0);
+    const current = decomposeNode(tree.rootNode, node)!.transform;
+    const next = patchTransform(source, tree, node, change(current));
+    await expectCleanParse(next);
+    return next.slice(ctx.length);
+  }
+
+  it('a gizmo drag (no exprs passed) moves the literal axes and keeps the expression text', async () => {
+    const out = await commit('translate([w + gap, 0, 5]) cube(1);', (t) => ({ ...t, exprs: undefined, translate: [99, 3, 7] }));
+    expect(out).toBe('translate([w + gap, 3, 7])\n    cube(1);');
+  });
+
+  it('keeps a wrap whose expression comes to the identity value', async () => {
+    const out = await commit('translate([gap - 2, 0, 0]) rotate([0, 0, w - 10]) cube(1);', (t) => ({ ...t, exprs: undefined }));
+    expect(out).toBe('translate([gap - 2, 0, 0])\n    rotate([0, 0, w - 10])\n    cube(1);');
+  });
+
+  it('explicit exprs set an expression on a literal axis, or detach one back to a number', async () => {
+    const set = await commit('translate([3, 0, 0]) cube(1);', (t) => ({
+      ...t,
+      translate: [12, 0, 0],
+      exprs: { translate: ['w + gap', null, null], rotateDeg: [null, null, null], scale: [null, null, null] },
+    }));
+    expect(set).toBe('translate([w + gap, 0, 0])\n    cube(1);');
+    const detached = await commit('translate([w + gap, 0, 0]) cube(1);', (t) => ({
+      ...t,
+      exprs: { translate: [null, null, null], rotateDeg: [null, null, null], scale: [null, null, null] },
+    }));
+    expect(detached).toBe('translate([12, 0, 0])\n    cube(1);');
+  });
+
+  it('mirroring an expression scale writes mirror() and keeps the expression', async () => {
+    const out = await commit('scale([w / 5, 1, 1]) cube(1);', (t) => ({ ...t, scale: [-t.scale[0], 1, 1] }));
+    expect(out).toBe('mirror([1, 0, 0])\n    scale([w / 5, 1, 1])\n    cube(1);');
+  });
+
+  it('an expression color() or mirror() stops the walk (they are rewritten from numbers)', async () => {
+    const source = `${ctx}color([w / 10, 0, 0]) translate([1, 0, 0]) cube(1);`;
+    const { tree, node } = await nodeAt(source, 0);
+    expect(decomposeNode(tree.rootNode, node)!.transform.color).toBeNull();
   });
 });

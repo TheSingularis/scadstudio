@@ -81,7 +81,7 @@ test.describe('module-heavy files (rack mount fixture)', () => {
     await expect(showParts).toBeVisible();
 
     await scad.rendersAfter(() => showParts.click());
-    expect(await crumbs(scad)).toBe('Assembly›If ($preview) #1›switch_mount() #2›Translate #1');
+    expect(await crumbs(scad)).toBe('Assembly›If ($preview) #1›switch_mount() #2›Group #1');
     await expect(scad.page.getByTestId('branch-note')).toHaveText('Inside the else branch of if ($preview): the part as rendered and exported.');
     expect(await scad.status()).toBe('Rendered');
     expect((await stats(scad)).workingMeshes).toBe(2);
@@ -101,7 +101,7 @@ test.describe('module-heavy files (rack mount fixture)', () => {
 
     await clickEditorText(scad, 'difference() {');
     await scad.rendersAfter(() => scad.button('Open Difference #1 ▸').click());
-    expect(await crumbs(scad)).toBe('Assembly›If ($preview) #1›switch_mount() #2›Translate #1›Difference #1');
+    expect(await crumbs(scad)).toBe('Assembly›If ($preview) #1›switch_mount() #2›Group #1›Difference #1');
     const before = await highlightedPixels(scad);
 
     await clickEditorText(scad, 'main_body();');
@@ -119,7 +119,7 @@ test.describe('module-heavy files (rack mount fixture)', () => {
     await shot(scad, '5-go-to-definition');
 
     await scad.rendersAfter(() => scad.button('Open main_body() #1 ▸').click());
-    expect(await crumbs(scad)).toBe('Assembly›If ($preview) #1›switch_mount() #2›Translate #1›Difference #1›main_body() #1');
+    expect(await crumbs(scad)).toBe('Assembly›If ($preview) #1›switch_mount() #2›Group #1›Difference #1›main_body() #1');
     await expect(scad.page.getByText('Editing module main_body(): changes apply to every main_body() call.')).toBeVisible();
     expect(await scad.status()).toBe('Rendered');
     await shot(scad, '6-inside-main-body');

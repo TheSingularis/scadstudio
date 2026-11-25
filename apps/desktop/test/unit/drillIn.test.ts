@@ -81,13 +81,22 @@ describe('drillInto (M9)', () => {
     expect(frameIsRigid((await focusAt('scale([2, 1, 1]) union() { cube(1); }\n', [0])).resolved.sets[1].frame)).toBe(false);
   });
 
-  it('a non-literal transform becomes baked text, and so does everything below it', async () => {
-    const { resolved } = await focusAt('w = 2;\ntranslate([w, 0, 0]) {\n    translate([1, 0, 0]) union() { cube(1); }\n}\n', [0, 0]);
-    expect(resolved.sets[1].bakedPrefix).toBe('translate([w, 0, 0]) ');
-    expect(resolved.sets[2].bakedPrefix).toBe('translate([w, 0, 0]) translate([1, 0, 0]) ');
-    const r = isolatedRender(resolved.sets[2], resolved.sets[2].nodes[0], 'w = 2;');
+  it('a transform it cannot evaluate becomes baked text, and so does everything below it', async () => {
+    // $t is a special variable: its value isn't known until OpenSCAD runs.
+    const { resolved } = await focusAt('translate([$t * 10, 0, 0]) {\n    translate([1, 0, 0]) union() { cube(1); }\n}\n', [0, 0]);
+    expect(resolved.sets[1].bakedPrefix).toBe('translate([$t * 10, 0, 0]) ');
+    expect(resolved.sets[2].bakedPrefix).toBe('translate([$t * 10, 0, 0]) translate([1, 0, 0]) ');
+    const r = isolatedRender(resolved.sets[2], resolved.sets[2].nodes[0], '');
     expect(r.transformEditable).toBe(false);
-    expect(r.source).toContain('translate([w, 0, 0]) translate([1, 0, 0]) {\ncube(1);\n}');
+    expect(r.source).toContain('translate([$t * 10, 0, 0]) translate([1, 0, 0]) {\ncube(1);\n}');
+  });
+
+  it('M11: a transform that reads top-level variables is evaluated into the frame', async () => {
+    const { resolved } = await focusAt('w = 2;\ntranslate([w, 0, 0]) {\n    translate([1, 0, 0]) union() { cube(1); }\n}\n', [0, 0]);
+    expect(resolved.sets[1].bakedPrefix).toBe('');
+    expect(resolved.sets[2].bakedPrefix).toBe('');
+    expect(resolved.sets[2].frame[12]).toBe(3);
+    expect(isolatedRender(resolved.sets[2], resolved.sets[2].nodes[0], 'w = 2;').transformEditable).toBe(true);
   });
 
   it("a module body renders inside a copy of the module, called with the instance's own arguments", async () => {

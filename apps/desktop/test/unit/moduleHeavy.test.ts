@@ -108,7 +108,7 @@ describe('drilling into if statements', () => {
 describe('modules defined inside a module (rack mount fixture)', () => {
   it('resolve by name, drill in, and Go to definition finds them', async () => {
     const { resolved, resolve } = await focusAt(RACK, [0, 1, 0, 0]);
-    expect(resolved.crumbs.map((c) => c.label)).toEqual(['Assembly', 'If ($preview) #1', 'switch_mount() #2', 'Translate #1', 'Difference #1']);
+    expect(resolved.crumbs.map((c) => c.label)).toEqual(['Assembly', 'If ($preview) #1', 'switch_mount() #2', 'Group #1', 'Difference #1']);
     const difference = resolved.sets[4];
     expect(nodeTexts(difference).map((t) => t.split('\n')[0])).toEqual(['main_body();', 'union() {']);
     const def = callDefinition(difference, 0, resolve)!;
@@ -138,11 +138,13 @@ describe('modules defined inside a module (rack mount fixture)', () => {
     const path = partPath(top, 0, resolve);
     expect(path).toEqual([0, 1, 0]);
     const { resolved } = await focusAt(RACK, path);
-    expect(resolved.crumbs.map((c) => c.label)).toEqual(['Assembly', 'If ($preview) #1', 'switch_mount() #2', 'Translate #1']);
+    expect(resolved.crumbs.map((c) => c.label)).toEqual(['Assembly', 'If ($preview) #1', 'switch_mount() #2', 'Group #1']);
     const parts = resolved.sets[3];
     expect(nodeTexts(parts).map((t) => t.split('\n')[0])).toEqual(['difference() {', 'if (keystones) {']);
-    // The translate's vector is computed, so the frame is baked text.
-    expect(parts.bakedPrefix).toBe('translate([-rack_width/2, -height/2, 0]) ');
+    // M11: the translate's vector reads only top-level variables, so it is
+    // evaluated (scadExpr.ts) and the frame is a real matrix, not baked text.
+    expect(parts.bakedPrefix).toBe('');
+    expect(parts.frame[12]).toBeCloseTo(-127);
     // Nothing to show parts of in a leaf.
     expect(partPath(top, 5, resolve)).toEqual([]);
   });
