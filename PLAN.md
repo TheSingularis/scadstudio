@@ -202,6 +202,8 @@ Onshape (and most real CAD tools) use the opposite model: *tool-first*. You clic
 
 **Floating parameter panel (Jordan's suggestion, 2026-09-11).** Move the M5 parameter panel out of its current toolbar row and into a floating panel anchored near the selected object in the viewport — more Onshape-like, and reads its own context (which object, which args) from proximity instead of needing the `callName` label the toolbar row currently spells out. Likely shares a mechanism with the operation panel above (both are "floating, anchored-to-geometry panels"), so worth scoping together rather than as two independent UI components.
 
+**Tool panels float over the viewport (decided by Jordan, 2026-11-25, after M11).** M11 shipped its Distance / Align / Pattern panel as a docked strip under the toolbar, with the Pattern count/spacing strip and the Make variable prompt beside it. In the M10 UI rework these become floating windows over the 3D viewport, like Onshape's feature dialogs: a titled window in the viewport's top-left area with the labeled part slots (Move / Relative to, Part), the tool's own fields, the preview and Apply/Cancel, so the model stays in view while you pick. Scope it together with the two entries above (tool-first operation panel and floating parameter panel) as one floating-window component that the booleans, extrudes, M11 tools, Text and M13's edge tools all use. It also clears the toolbar wrap noted in "M11 build notes" (three rows at 1280 px). Open for M10 to settle: whether windows can be dragged, whether position is remembered, and how one window yields when another tool starts.
+
 ## v1 scope detail (decided with Jordan, 2026-10-16)
 
 Recorded after a review of this plan against what is built. Items marked *proposed* are first drafts for Jordan to correct, not decisions.
@@ -220,7 +222,7 @@ Recorded after a review of this plan against what is built. Items marked *propos
 1. The variables panel is a collapsible sidebar on the left edge of the editor.
 2. It follows OpenSCAD Customizer conventions: reads `// [min:max]` / `// [min:step:max]` sliders, `// [a, b]` dropdowns, `/* [Tab] */` groups and `[Hidden]`; new variables go in one block at the top of the file (after `use`/`include`), before the first module, so the file still works in OpenSCAD's and MakerWorld's Customizer.
 3. When the reference part's size can't be written as an expression (custom module, boolean, text), the tool writes the measured number and the UI marks it as not following.
-4. Relate tools use a small docked tool panel with two labeled slots, "Move" and "Relative to" (the tool-first pattern from the M10 backlog, docked rather than floating; M13 reuses it). Jordan: like Onshape's tool windows, it must always be clear which part is which.
+4. Relate tools use a small docked tool panel with two labeled slots, "Move" and "Relative to" (the tool-first pattern from the M10 backlog, docked for M11; Jordan decided on 2026-11-25 it becomes a floating window over the viewport in the M10 rework; M13 reuses it). Jordan: like Onshape's tool windows, it must always be clear which part is which.
 5. Pattern spacing is center-to-center pitch (Onshape/Fusion convention), with a gap option when the part's width is known. A circular pattern is in M11 too.
 6. Sketch-point dimensions are not in M11 (square/circle get them through Make variable); deferred to M12.
 7. Deleting a variable that is still used shows where it is used and offers to inline its value.
