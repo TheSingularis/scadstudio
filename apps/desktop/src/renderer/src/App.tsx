@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Tree } from 'web-tree-sitter';
 import { Editor } from './components/Editor';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   Viewport,
   type GizmoMode,
@@ -67,6 +68,8 @@ import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelF
 
 type ModuleSourceFile = Awaited<ReturnType<Window['scadstudio']['scanModules']>>[number];
 import { createCoalescingRunner } from './coalescingRunner';
+import { RenderCache, type CachedRender } from './renderCache';
+import { isEngineCrash, renderErrorMessage } from './renderErrors';
 import {
   EMPTY_SKETCH,
   addProfile,
@@ -236,23 +239,10 @@ translate([40, 0, 0])
 // renders, no per-keystroke pile-up) rather than relying on debounce alone.
 const RENDER_DEBOUNCE_MS = 400;
 
-// Electron wraps an error thrown by an ipcMain handler as "Error invoking
-// remote method 'scad:render': ScadRenderError: <message>"; keep the message.
-function renderErrorMessage(err: unknown): string {
-  const text = err instanceof Error ? err.message : String(err);
-  return text.replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
-}
-
-// M9 per-node render cache (PLAN.md "Per-node selection & manipulation
-// strategy", point 2; risk 2). Keyed on the exact source sent to the engine
-// (the node's primitive plus everything it can see), so an edit to one node
-// re-renders only that node: its siblings' sources are unchanged and come
-// from here, and so does everything when stepping in and out of a drill-in.
-// Cleared when a used/included file changes on disk or the document moves
-// (relative paths resolve differently), the two ways the same text can mean
-// different geometry.
-type CachedRender = { bytes: Uint8Array } | { firstError: unknown; secondError: unknown };
-const RENDER_CACHE_LIMIT = 500;
+// The per-node render cache lives in renderCache.ts (bounded by entries and
+// by total mesh size). Cleared when a used/included file changes on disk or
+// the document moves (relative paths resolve differently), the two ways the
+// same text can mean different geometry.
 
 // Test hook: counts engine calls and cache hits, so e2e tests can check that
 // an edit re-renders only what it changed.
@@ -402,7 +392,7 @@ export function App() {
   const focusEpochRef = useRef(0);
   const prevSetRef = useRef<{ epoch: number; fingerprints: NodeFingerprint[] } | null>(null);
   const [contextMeshes, setContextMeshes] = useState<NodeMesh[]>([]);
-  const renderCache = useRef(new Map<string, CachedRender>());
+  const renderCache = useRef(new RenderCache());
   // The confirm-flash after a typed edit (PLAN.md risk 5).
   const [flashToken, setFlashToken] = useState(0);
   const lastTypedSourceRef = useRef<string | null>(null);
@@ -480,8 +470,6 @@ export function App() {
     const hit = cache.get(source);
     if (hit) {
       stats.cacheHits++;
-      cache.delete(source);
-      cache.set(source, hit);
       return hit;
     }
     let result: CachedRender;
@@ -496,15 +484,21 @@ export function App() {
       // visible/selectable instead of silently missing from the viewport.
       // Context stays outside the wrapper — see wrapAsThinExtrude's
       // 2026-09-21 comment for the real bug this fixed.
-      try {
-        stats.engineCalls++;
-        result = { bytes: await window.scadstudio.renderScad(flatSource) };
-      } catch (secondError) {
-        result = { firstError, secondError };
+      //
+      // Not when the engine itself died (out of memory, usually): the
+      // retry would redo the same heavy work and very likely die again.
+      if (isEngineCrash(firstError)) {
+        result = { firstError, secondError: firstError };
+      } else {
+        try {
+          stats.engineCalls++;
+          result = { bytes: await window.scadstudio.renderScad(flatSource) };
+        } catch (secondError) {
+          result = { firstError, secondError };
+        }
       }
     }
     cache.set(source, result);
-    if (cache.size > RENDER_CACHE_LIMIT) cache.delete(cache.keys().next().value!);
     return result;
   }, []);
 
@@ -2048,35 +2042,37 @@ export function App() {
           />
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
-          <Viewport
-            meshes={nodeMeshes}
-            selectedIndices={selectedIndices}
-            onSelect={handleSelect}
-            gizmoMode={gizmoMode}
-            rotateSpace={rotateSpace}
-            onTransformCommit={handleTransformCommit}
-            fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
-            activeSketchPlane={activeSketchPlane}
-            pickingFace={pickingFace}
-            onPickFace={handlePickFace}
-            sketch={sketch}
-            onSketchClick={handleSketchClick}
-            sketchTool={sketchTool}
-            toolAnchors={toolAnchors}
-            curveSegments={curveSegments}
-            onHandleClick={handleSketchHandleClick}
-            snapSettings={snapSettings}
-            onMoveSketchPoint={handleMoveSketchPoint}
-            onSketchDragStart={handleSketchDragStart}
-            onDeleteSketchPoint={handleDeleteSketchPoint}
-            editingNodeIndex={editingSketchIndex}
-            contextMeshes={contextMeshes}
-            onDrill={handleDrill}
-            flashToken={flashToken}
-            overlay={breadcrumb}
-            editable={!readOnly}
-            cuttersFirst={workingSet?.containerCall === 'difference'}
-          />
+          <ErrorBoundary label="The 3D view" resetKey={nodeMeshes}>
+            <Viewport
+              meshes={nodeMeshes}
+              selectedIndices={selectedIndices}
+              onSelect={handleSelect}
+              gizmoMode={gizmoMode}
+              rotateSpace={rotateSpace}
+              onTransformCommit={handleTransformCommit}
+              fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
+              activeSketchPlane={activeSketchPlane}
+              pickingFace={pickingFace}
+              onPickFace={handlePickFace}
+              sketch={sketch}
+              onSketchClick={handleSketchClick}
+              sketchTool={sketchTool}
+              toolAnchors={toolAnchors}
+              curveSegments={curveSegments}
+              onHandleClick={handleSketchHandleClick}
+              snapSettings={snapSettings}
+              onMoveSketchPoint={handleMoveSketchPoint}
+              onSketchDragStart={handleSketchDragStart}
+              onDeleteSketchPoint={handleDeleteSketchPoint}
+              editingNodeIndex={editingSketchIndex}
+              contextMeshes={contextMeshes}
+              onDrill={handleDrill}
+              flashToken={flashToken}
+              overlay={breadcrumb}
+              editable={!readOnly}
+              cuttersFirst={workingSet?.containerCall === 'difference'}
+            />
+          </ErrorBoundary>
         </div>
       </div>
     </div>
