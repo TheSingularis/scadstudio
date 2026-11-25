@@ -6,7 +6,7 @@
 // must land where OpenSCAD's own full render puts it.
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { createOpenSCAD } from 'openscad-wasm';
+import { createEngine } from '../../src/main/engine';
 import { Matrix4, type BufferGeometry } from 'three';
 import { applyNodeTransform, bbox, parseStl } from '../helpers/stl';
 import { docOf, resolverFor } from '../helpers/drill';
@@ -16,7 +16,7 @@ import { guardInactive, isolatedRender, partPath, resolveFocus, topLevelSet, typ
 const RACK = readFileSync(new URL('../fixtures/rack_mount_single_keystone.scad', import.meta.url), 'utf8');
 
 async function renderDirect(source: string): Promise<Uint8Array | null> {
-  const instance = (await createOpenSCAD({ print: () => {}, printErr: () => {} })).getInstance();
+  const instance = await createEngine({ print: () => {}, printErr: () => {} });
   instance.FS.writeFile('/input.scad', source);
   const code = instance.callMain(['/input.scad', '-o', '/output.stl', '--backend=Manifold']);
   if (code !== 0) return null;

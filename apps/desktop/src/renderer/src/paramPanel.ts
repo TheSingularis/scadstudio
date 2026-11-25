@@ -46,7 +46,7 @@ export function effectiveWidget(param: ToolParam | null, valueText: string | nul
     (declared === 'checkbox' && shape === 'bool') ||
     ((declared === 'number' || declared === 'angle') && shape === 'number') ||
     (declared === 'xyz' && shape === 'vec3') ||
-    (declared === 'text' && shape === 'string');
+    ((declared === 'text' || declared === 'font' || declared === 'choice') && shape === 'string');
   return fits ? declared : 'generic';
 }
 
@@ -54,8 +54,9 @@ export function panelFields(call: CallArgs, params: ToolParam[], listUnset: bool
   const fields: PanelField[] = [];
   const used = new Set<string>();
   let position = 0;
+  const positional = params.filter((p) => !p.namedOnly);
   call.args.forEach((arg, i) => {
-    const param = arg.name !== null ? (params.find((p) => p.name === arg.name) ?? null) : (params[position] ?? null);
+    const param = arg.name !== null ? (params.find((p) => p.name === arg.name) ?? null) : (positional[position] ?? null);
     const label = arg.name ?? param?.name ?? `#${i + 1}`;
     if (arg.name === null) position++;
     if (param) used.add(param.name);

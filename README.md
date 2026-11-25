@@ -112,7 +112,7 @@ Later: solver-based sketch constraints (M12) and customizable keybinds (M14).
 
 - **Parsing:** [tree-sitter](https://tree-sitter.github.io) with an OpenSCAD grammar turns the source into a syntax tree that keeps every byte, comments and whitespace included.
 - **Editing:** a visual edit becomes a small text patch on the exact range it affects, then the file is re-parsed. The text is always the source of truth.
-- **Rendering:** [openscad-wasm](https://github.com/openscad/openscad-wasm) with the Manifold backend renders each top-level statement to a mesh, shown with [three.js](https://threejs.org).
+- **Rendering:** OpenSCAD compiled to WebAssembly ([@lofcz/openscad-wasm](https://github.com/lofcz/openscad-wasm), a build of [openscad-wasm](https://github.com/openscad/openscad-wasm) that also renders unhinted fonts) with the Manifold backend renders each top-level statement to a mesh, shown with [three.js](https://threejs.org).
 - **App:** Electron, React and TypeScript, with the [Monaco](https://microsoft.github.io/monaco-editor/) editor.
 
 ## Contributing
@@ -121,6 +121,6 @@ Bug reports with a small `.scad` file that shows the problem are the most helpfu
 
 ## License
 
-ScadStudio is licensed under the GNU General Public License, version 3 or (at your option) any later version (GPL-3.0-or-later); see [LICENSE](LICENSE). The app bundles the OpenSCAD engine (openscad-wasm, GPL), whose WebAssembly build includes GPLv3+ components such as CGAL, so distributed builds are covered by GPLv3 terms.
+ScadStudio is licensed under the GNU General Public License, version 3 or (at your option) any later version (GPL-3.0-or-later); see [LICENSE](LICENSE). The app bundles the OpenSCAD engine (openscad-wasm, GPL) and the Liberation fonts (SIL Open Font License 1.1), whose WebAssembly build includes GPLv3+ components such as CGAL, so distributed builds are covered by GPLv3 terms.
 
 ScadStudio is an independent project and is not affiliated with the OpenSCAD project.

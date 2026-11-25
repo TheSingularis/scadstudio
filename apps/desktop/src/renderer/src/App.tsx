@@ -40,7 +40,7 @@ import {
   type Modifier,
   type ColorVector,
 } from './targetedPatch';
-import { appendSketchPolygon, appendStatement, sketchPolygonStatement } from './primitives';
+import { appendSketchPolygon, appendStatement, sketchPolygonStatement, sketchTextStatement } from './primitives';
 import {
   callDefinition,
   canDrill,
@@ -62,9 +62,11 @@ import {
   type WorkingSet,
 } from './drillIn';
 import { remapIndices, type NodeFingerprint } from './nodeIdentity';
-import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, addUseDirective, builtinTool, type ToolDefinition } from './tools';
+import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, LIST_UNSET_BUILTINS, addUseDirective, builtinTool, type ToolDefinition } from './tools';
 import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleIntrospection';
 import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
+import { findOption, fontGroups, isFontAvailable, type FontEntry } from './fontOptions';
+import { SettingsDialog, type EditorFontSettings } from './components/SettingsDialog';
 
 type ModuleSourceFile = Awaited<ReturnType<Window['scadstudio']['scanModules']>>[number];
 import { createCoalescingRunner } from './coalescingRunner';
@@ -126,6 +128,7 @@ const SKETCH_TOOL_BUTTONS: { tool: SketchTool; label: string }[] = [
   { tool: 'arc', label: 'Arc' },
   { tool: 'rect', label: 'Rectangle' },
   { tool: 'circle', label: 'Circle' },
+  { tool: 'text', label: 'Text' },
   { tool: 'edit', label: 'Edit Points' },
 ];
 
@@ -143,6 +146,8 @@ function sketchToolHint(tool: SketchTool, anchors: number, openPoints: number): 
       return anchors === 0 ? 'click the first corner' : 'click the opposite corner';
     case 'circle':
       return anchors === 0 ? 'click the center' : 'click a point on the circle';
+    case 'text':
+      return 'click where the text starts (its baseline); edit the words and font in the panel';
     case 'edit':
       return 'click near an edge to add a point, double-click a point to delete it (Shift: its whole loop)';
   }
@@ -979,9 +984,37 @@ export function App() {
           if (next) setSketchTracked(next, true);
           return;
         }
+        case 'text': {
+          // M15: text isn't a loop of points, so it goes straight into the
+          // source as its own statement on this plane (drilled in: into
+          // the focused node, in its local frame, like Finish Sketch).
+          if (!activeSketchPlane) return;
+          const set = currentSet(resolvedRef.current);
+          let next: string;
+          if (set?.container) {
+            const local = worldToFrame(set.frame, activeSketchPlane.origin, activeSketchPlane.rotationDeg);
+            next = insertIntoContainer(sourceRef.current, set.container, sketchTextStatement(local.origin, local.rotationDeg, p));
+          } else {
+            next = appendStatement(sourceRef.current, sketchTextStatement(activeSketchPlane.origin, activeSketchPlane.rotationDeg, p));
+          }
+          // With nothing else drawn, leave sketch mode with the new text
+          // selected, so its panel (words, font, size) is right there.
+          // Otherwise stay, keeping the loops drawn so far.
+          const leave = cur.profiles.length === 0 && cur.open.length === 0;
+          if (leave) pendingSelectLast.current = true;
+          if (debounceTimer.current) clearTimeout(debounceTimer.current);
+          setSource(next);
+          runRender(next);
+          if (leave) {
+            setActiveSketchPlane(null);
+            resetSketch();
+            setResetViewToken((t) => t + 1);
+          }
+          return;
+        }
       }
     },
-    [sketchTool, toolAnchors, curveSegments, setSketchTracked],
+    [sketchTool, toolAnchors, curveSegments, setSketchTracked, activeSketchPlane, runRender, resetSketch],
   );
 
   // A plain click on a handle is a click exactly on that point: the open
@@ -1305,8 +1338,50 @@ export function App() {
     if (!selectedArgs) return null;
     const custom = customTools.find((t) => t.callName === selectedArgs.callName);
     const params = custom?.params ?? BUILTIN_SIGNATURES[selectedArgs.callName] ?? [];
-    return { callName: selectedArgs.callName, custom: !!custom, fields: panelFields(selectedArgs, params, !!custom) };
+    return { callName: selectedArgs.callName, custom: !!custom, fields: panelFields(selectedArgs, params, !!custom || LIST_UNSET_BUILTINS.has(selectedArgs.callName)) };
   }, [selectedArgs, customTools]);
+
+  // M15: persisted app settings (Settings > Fonts: the code editor's font).
+  const [settings, setSettings] = useState<EditorFontSettings>({ editorFontFamily: '', editorFontSize: 13 });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    void window.scadstudio
+      .getSettings()
+      .then(setSettings)
+      .catch((err) => console.error('[scadstudio] settings', err));
+  }, []);
+  const handleSettingsChange = useCallback((patch: Partial<EditorFontSettings>) => {
+    setSettings((s) => ({ ...s, ...patch }));
+    void window.scadstudio
+      .updateSettings(patch)
+      .then(setSettings)
+      .catch((err) => console.error('[scadstudio] settings', err));
+  }, []);
+
+  // M15: the fonts the Text panel's font picker offers, fetched when a
+  // panel with a font field first shows and again whenever the document's
+  // libraries or `use <font.ttf>` files change (the same trigger as the
+  // Custom toolbar's module scan).
+  const [fontList, setFontList] = useState<FontEntry[] | null>(null);
+  const [fontListStale, setFontListStale] = useState(true);
+  const wantsFonts = !!panel?.fields.some((f) => f.widget === 'font');
+  const fontRequestRef = useRef(0);
+  useEffect(() => {
+    if (!wantsFonts || !fontListStale) return;
+    setFontListStale(false);
+    // Only the newest request's answer is kept (a later one may follow
+    // while this is in flight, after a library or font file changed).
+    const id = ++fontRequestRef.current;
+    void window.scadstudio
+      .listFonts(sourceRef.current)
+      .then((list) => {
+        if (id === fontRequestRef.current) setFontList(list);
+      })
+      .catch((err) => console.error('[scadstudio] font list', err));
+  }, [wantsFonts, fontListStale]);
+  const fontUseKey = useMemo(() => (source.match(/\buse\s*<[^>\n]*\.(?:ttf|otf|ttc|otc)\s*>/gi) ?? []).join('|'), [source]);
+  useEffect(() => setFontListStale(true), [fontUseKey, documentToken]);
+  useEffect(() => window.scadstudio.onModulesChanged(() => setFontListStale(true)), []);
 
   // A parameter the call doesn't pass yet: add it as a named argument.
   const handleAddArg = useCallback(
@@ -1726,6 +1801,9 @@ export function App() {
           Save As...
         </button>
         <button onClick={() => setResetViewToken((t) => t + 1)}>Reset View</button>
+        <button onClick={() => setSettingsOpen(true)} title="Settings (editor font)">
+          Settings
+        </button>
         <span title={dirty ? 'Unsaved changes' : undefined}>
           {filePath ?? '(unsaved default example)'}
           {dirty ? ' •' : ''}
@@ -1750,7 +1828,7 @@ export function App() {
       >
         {readOnly && <span style={{ opacity: 0.7 }}>Viewing a library module (read-only)</span>}
         {!readOnly && (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span role="group" aria-label="Insert" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Insert:
           {INSERT_TOOLS.map((tool) => (
             <button key={tool.id} onClick={() => handleInsertTool(tool)}>
@@ -1834,6 +1912,7 @@ export function App() {
           ) : (
             <>
               <span style={{ opacity: 0.7 }}>{sketchPlaneLabel(activeSketchPlane.kind, editingSketchIndex !== null)}:</span>
+              <span role="group" aria-label="Sketch tools" style={{ display: 'contents' }}>
               {SKETCH_TOOL_BUTTONS.map(({ tool, label }) => (
                 <button
                   key={tool}
@@ -1844,6 +1923,7 @@ export function App() {
                   {label}
                 </button>
               ))}
+              </span>
               {(sketchTool === 'arc' || sketchTool === 'circle') && (
                 <select
                   aria-label="Curve segments"
@@ -2018,6 +2098,7 @@ export function App() {
             <ParamField
               key={`${i}-${field.label}-${field.valueText}`}
               field={field}
+              fonts={field.widget === 'font' ? fontList : undefined}
               disabled={!!readOnly}
               onCommit={(text) => (field.argIndex !== null ? handleArgCommit(field.argIndex, text) : handleAddArg(field.label, text))}
             />
@@ -2036,6 +2117,8 @@ export function App() {
                 : null
             }
             revealRequest={revealRequest}
+            fontFamily={settings.editorFontFamily}
+            fontSize={settings.editorFontSize}
             selectedIndex={readOnly ? null : primarySelectedIndex}
             onSelectNode={(index) => handleSelect(index, 'replace')}
             documentKey={documentToken}
@@ -2075,6 +2158,7 @@ export function App() {
           </ErrorBoundary>
         </div>
       </div>
+      {settingsOpen && <SettingsDialog settings={settings} onChange={handleSettingsChange} onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }
@@ -2083,7 +2167,18 @@ export function App() {
 // default (or the argument's own literal; see paramPanel.ts). Every widget
 // commits OpenSCAD source text, so a commit is the same targeted argument
 // patch whichever widget made it.
-function ParamField({ field, onCommit, disabled = false }: { field: PanelField; onCommit: (valueText: string) => void; disabled?: boolean }) {
+function ParamField({
+  field,
+  onCommit,
+  disabled = false,
+  fonts = null,
+}: {
+  field: PanelField;
+  onCommit: (valueText: string) => void;
+  disabled?: boolean;
+  // M15: every font text() can use here, or null while still loading.
+  fonts?: FontEntry[] | null;
+}) {
   const unset = field.valueText === null;
   const shown = field.valueText ?? field.param?.defaultText ?? '';
   const label = `Parameter ${field.label}`;
@@ -2189,6 +2284,57 @@ function ParamField({ field, onCommit, disabled = false }: { field: PanelField; 
           }}
           onKeyDown={commitOnEnter}
         />
+      );
+      break;
+    }
+    case 'choice': {
+      const current = /^\s*"/.test(shown) ? unquoteScadString(shown) : shown;
+      const choices = field.param?.choices ?? [];
+      control = (
+        <select aria-label={label} defaultValue={current} onChange={(e) => onCommit(quoteScadString(e.target.value))}>
+          {!choices.includes(current) && <option value={current}>{current}</option>}
+          {choices.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+      );
+      break;
+    }
+    case 'font': {
+      // M15: the font is written in the code (font="Family:style=Style");
+      // this lists what can render it. A name not installed here still
+      // shows, flagged, since another computer may have it.
+      const current = /^\s*"/.test(shown) ? unquoteScadString(shown) : shown;
+      const groups = fontGroups(fonts ?? []);
+      const match = findOption(current, groups);
+      const missing = fonts !== null && !isFontAvailable(current, fonts);
+      control = (
+        <>
+          <select
+            aria-label={label}
+            value={match?.value ?? current}
+            style={{ maxWidth: 220, fontFamily: current.split(':')[0] }}
+            onChange={(e) => onCommit(quoteScadString(e.target.value))}
+          >
+            {!match && <option value={current}>{fonts === null ? current : `${current} (not installed)`}</option>}
+            {groups.map((g) => (
+              <optgroup key={g.label} label={g.label}>
+                {g.options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+          {missing && (
+            <span role="note" style={{ color: '#e8a05a' }} title="OpenSCAD substitutes another font when the named one isn't installed. Install the font, or add it to the project with use <font.ttf>.">
+              Not installed here: renders in a substitute font
+            </span>
+          )}
+        </>
       );
       break;
     }

@@ -1,4 +1,5 @@
-import { formatNumber, formatSketchPolygonArgs } from './targetedPatch';
+import { Vector3 } from 'three';
+import { formatNumber, formatSketchPolygonArgs, transformToQuaternion } from './targetedPatch';
 import type { SketchPoint } from './sketchEditing';
 
 // M5 toolbar primitive insertion. Deliberately minimal codegen: append a new
@@ -8,7 +9,7 @@ import type { SketchPoint } from './sketchEditing';
 // here — each is just a primitive pre-wrapped around a default 2D profile,
 // so they reuse the exact same append path as every other primitive; no
 // interactive sketching (that's M7.5, see PLAN.md).
-export type PrimitiveKind = 'cube' | 'sphere' | 'cylinder' | 'square' | 'circle' | 'linear_extrude' | 'rotate_extrude';
+export type PrimitiveKind = 'cube' | 'sphere' | 'cylinder' | 'square' | 'circle' | 'text' | 'linear_extrude' | 'rotate_extrude';
 
 export const PRIMITIVE_DEFAULTS: Record<PrimitiveKind, string> = {
   cube: 'cube([10, 10, 10]);',
@@ -16,6 +17,10 @@ export const PRIMITIVE_DEFAULTS: Record<PrimitiveKind, string> = {
   cylinder: 'cylinder(h=10, r=5, $fn=32);',
   square: 'square([10, 10]);',
   circle: 'circle(r=5, $fn=32);',
+  // M15: flat 2D text like square()/circle(), extruded with the Extrude
+  // tools afterwards (the CAD convention: sketch text, then extrude). The
+  // font is written out so the panel and other machines agree on it.
+  text: 'text("Text", size=10, font="Liberation Sans");',
   // linear_extrude pushes a 2D profile straight up; rotate_extrude spins one
   // around the Z axis (so its profile must sit at positive X to form a solid
   // of revolution — a circle at x=15 gives a torus, the canonical demo).
@@ -62,7 +67,22 @@ export function sketchPolygonStatement(
   // One loop writes the plain polygon(points=[...]) it always has; several
   // add paths=, which OpenSCAD fills even-odd (a loop inside another is a
   // hole). See profilesToPolygon.
-  let statement = `polygon(${formatSketchPolygonArgs(loops)});`;
+  return wrapInPlane(origin, rotationDeg, `polygon(${formatSketchPolygonArgs(loops)});`);
+}
+
+// M15: the sketch-mode Text tool's statement: PRIMITIVE_DEFAULTS.text
+// placed on the sketch plane with its baseline start at the clicked point
+// `at` (plane-local u, v). The click is folded into the plane's own
+// translate(), so the result is the same canonical translate() rotate()
+// wrap a sketch polygon gets, which the gizmo and panel already handle.
+export function sketchTextStatement(origin: [number, number, number], rotationDeg: [number, number, number], at: SketchPoint): string {
+  const p = new Vector3(at[0], at[1], 0).applyQuaternion(transformToQuaternion(rotationDeg)).add(new Vector3(...origin));
+  const clean = (v: number) => Math.round(v * 1000) / 1000 + 0;
+  return wrapInPlane([clean(p.x), clean(p.y), clean(p.z)], rotationDeg, PRIMITIVE_DEFAULTS.text);
+}
+
+function wrapInPlane(origin: [number, number, number], rotationDeg: [number, number, number], inner: string): string {
+  let statement = inner;
   if (rotationDeg.some((v) => v !== 0)) {
     statement = `rotate([${rotationDeg.map(formatNumber).join(', ')}]) ${statement}`;
   }

@@ -25,6 +25,20 @@ export interface ModuleSourceFile {
   useDirective: string | null;
 }
 
+// M15: a font text() can use (see the main process's fonts:list).
+export interface FontListEntry {
+  family: string;
+  style: string;
+  monospace?: boolean;
+  source: 'bundled' | 'project' | 'system';
+}
+
+// M15: persisted app settings (src/main/settings.ts).
+export interface AppSettings {
+  editorFontFamily: string;
+  editorFontSize: number;
+}
+
 const api = {
   renderScad: (source: string): Promise<Uint8Array> => ipcRenderer.invoke('scad:render', source),
   openFile: (): Promise<OpenFileResult | OpenFileSaveFirst | null> => ipcRenderer.invoke('scad:openFile'),
@@ -35,6 +49,10 @@ const api = {
   setDirty: (dirty: boolean): void => ipcRenderer.send('scad:setDirty', dirty),
   closeAfterSave: (): void => ipcRenderer.send('scad:closeAfterSave'),
   scanModules: (source: string): Promise<ModuleSourceFile[]> => ipcRenderer.invoke('scad:scanModules', source),
+  // M15: fonts for the Text panel; `refresh` re-reads installed fonts.
+  listFonts: (source: string, refresh = false): Promise<FontListEntry[]> => ipcRenderer.invoke('fonts:list', source, refresh),
+  getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
+  updateSettings: (patch: Partial<AppSettings>): Promise<AppSettings> => ipcRenderer.invoke('settings:update', patch),
   // A watched library file changed on disk.
   onModulesChanged: (callback: () => void): (() => void) => {
     const listener = () => callback();

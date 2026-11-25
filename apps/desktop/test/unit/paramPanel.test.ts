@@ -59,3 +59,30 @@ describe('M8 parameter panel', () => {
     expect(parseVec3('[1, 2]')).toBeNull();
   });
 });
+
+describe('M15 text() panel', () => {
+  it('names text/size/font positionally and lists font, alignment and spacing with defaults', async () => {
+    const { tree, node } = await nodeAt('text("Hi", 12, "Liberation Serif");\n', 0);
+    const fields = panelFields(primitiveArgs(tree.rootNode, node)!, BUILTIN_SIGNATURES.text, true);
+    expect(fields.map((f) => [f.label, f.valueText, f.widget])).toEqual([
+      ['text', '"Hi"', 'text'],
+      ['size', '12', 'number'],
+      ['font', '"Liberation Serif"', 'font'],
+      ['halign', null, 'choice'],
+      ['valign', null, 'choice'],
+      ['spacing', null, 'number'],
+    ]);
+    expect(fields.find((f) => f.label === 'valign')?.param?.choices).toEqual(['top', 'center', 'baseline', 'bottom']);
+  });
+
+  it('a 4th positional argument is not named halign (OpenSCAD ignores it)', async () => {
+    const { tree, node } = await nodeAt('text("Hi", 12, "Arial", "center");\n', 0);
+    const fields = panelFields(primitiveArgs(tree.rootNode, node)!, BUILTIN_SIGNATURES.text, false);
+    expect(fields[3].label).toBe('#4');
+  });
+
+  it('a font given as an expression falls back to a plain field', () => {
+    expect(effectiveWidget(BUILTIN_SIGNATURES.text[2], 'myFont')).toBe('generic');
+    expect(effectiveWidget(BUILTIN_SIGNATURES.text[2], '"Arial:style=Bold"')).toBe('font');
+  });
+});

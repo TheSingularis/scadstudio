@@ -42,7 +42,7 @@ On Linux without a display (a container, SSH, CI), Electron needs a virtual disp
 
 ## How the code is laid out
 
-- `apps/desktop/src/main/` is the Electron main process: file dialogs, saving, scanning and watching `use`d libraries, and rendering through `openscad-wasm`.
+- `apps/desktop/src/main/` is the Electron main process: file dialogs, saving, scanning and watching `use`d libraries, and rendering through the OpenSCAD WebAssembly engine (`engine.ts` is the only file that touches the engine package; `fonts.ts` indexes installed fonts).
 - `apps/desktop/src/preload/` is the bridge the renderer uses to call the main process.
 - `apps/desktop/src/renderer/` is the React UI: the Monaco editor, the three.js viewport, the toolbar, sketch mode, and the code that patches `.scad` source (`targetedPatch.ts`).
 - `apps/desktop/test/` holds the unit, integration, corpus and end-to-end tests.

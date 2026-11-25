@@ -6,8 +6,10 @@ import { PRIMITIVE_DEFAULTS, appendStatement, type PrimitiveKind } from './primi
 // inserted or rendered (PLAN.md, "Custom module auto-toolbar" point 5).
 
 // The parameter-panel widget for a parameter. 'generic' is a plain
-// expression field.
-export type WidgetKind = 'checkbox' | 'number' | 'angle' | 'xyz' | 'text' | 'generic';
+// expression field. M15: 'font' is the font picker (bundled, project and
+// installed fonts) and 'choice' a dropdown of the string values in
+// ToolParam.choices (text()'s halign/valign).
+export type WidgetKind = 'checkbox' | 'number' | 'angle' | 'xyz' | 'text' | 'font' | 'choice' | 'generic';
 
 export interface ToolParam {
   name: string;
@@ -17,6 +19,10 @@ export interface ToolParam {
   required: boolean;
   // For a required parameter: a value seen at an existing call site.
   exampleText: string | null;
+  // For a 'choice' widget: the allowed string values, unquoted.
+  choices?: string[];
+  // Can only be passed by name (a positional argument never maps to it).
+  namedOnly?: boolean;
 }
 
 export type ToolSection = 'insert' | 'extrude' | 'custom';
@@ -40,8 +46,8 @@ export interface ToolDefinition {
   description: string | null;
 }
 
-function param(name: string, widget: WidgetKind = 'generic'): ToolParam {
-  return { name, defaultText: null, widget, required: false, exampleText: null };
+function param(name: string, widget: WidgetKind = 'generic', defaultText: string | null = null, choices?: string[]): ToolParam {
+  return { name, defaultText, widget, required: false, exampleText: null, ...(choices ? { choices } : {}) };
 }
 
 // Positional parameter order of the built-ins the app inserts or a panel
@@ -61,7 +67,24 @@ export const BUILTIN_SIGNATURES: Record<string, ToolParam[]> = {
   offset: [param('r', 'number')],
   linear_extrude: [param('height', 'number')],
   rotate_extrude: [param('angle', 'angle')],
+  // M15. Defaults as OpenSCAD documents them (Liberation Sans is its
+  // default font); the panel lists the ones a call leaves out
+  // (LIST_UNSET_BUILTINS) so font and alignment are one click away. Only
+  // text/size/font are positional: OpenSCAD's TextNode.cc parses the rest
+  // as named-only, and the engine ignores a 4th positional argument.
+  text: [
+    param('text', 'text'),
+    param('size', 'number', '10'),
+    param('font', 'font', '"Liberation Sans"'),
+    { ...param('halign', 'choice', '"left"', ['left', 'center', 'right']), namedOnly: true },
+    { ...param('valign', 'choice', '"baseline"', ['top', 'center', 'baseline', 'bottom']), namedOnly: true },
+    { ...param('spacing', 'number', '1'), namedOnly: true },
+  ],
 };
+
+// Built-ins whose panel also lists the parameters a call doesn't pass (as
+// a custom module's does), with their defaults.
+export const LIST_UNSET_BUILTINS = new Set(['text']);
 
 const BUILTIN_TOOLS: { kind: PrimitiveKind; label: string; section: ToolSection }[] = [
   { kind: 'cube', label: 'Cube', section: 'insert' },
@@ -69,6 +92,7 @@ const BUILTIN_TOOLS: { kind: PrimitiveKind; label: string; section: ToolSection 
   { kind: 'cylinder', label: 'Cylinder', section: 'insert' },
   { kind: 'square', label: 'Square', section: 'insert' },
   { kind: 'circle', label: 'Circle', section: 'insert' },
+  { kind: 'text', label: 'Text', section: 'insert' },
   { kind: 'linear_extrude', label: 'Linear Extrude', section: 'extrude' },
   { kind: 'rotate_extrude', label: 'Rotate Extrude', section: 'extrude' },
 ];

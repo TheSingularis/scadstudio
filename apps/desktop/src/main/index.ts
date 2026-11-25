@@ -3,11 +3,17 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { watch, type FSWatcher } from 'chokidar';
-import { collectDependencies, defaultLibraryDirs } from './scadRender';
+import { collectDependencies, collectFontDependencies, defaultLibraryDirs } from './scadRender';
+import { BUNDLED_FONT_FACES, SystemFontIndex, fontFilesWanted, readFontFileFaces, type FontFace } from './fonts';
+import { SettingsStore, type AppSettings } from './settings';
 import { RenderHost, type RenderChild } from './renderHost';
 import { scanModuleSources } from './moduleSources';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// The e2e suite gives each launch its own settings folder (M15 settings.json),
+// so one test's editor font can't leak into the next.
+if (process.env['SCADSTUDIO_USER_DATA']) app.setPath('userData', process.env['SCADSTUDIO_USER_DATA']);
 
 // The document the renderer is showing, as far as the main process knows:
 // set whenever a file is opened (and, later, saved). Renders resolve
@@ -250,13 +256,50 @@ function createWindow(): void {
   }
 }
 
+// M15: installed fonts, indexed by name on first use (names only; the font
+// files themselves are read by the render process when a document names
+// them, see fonts.ts).
+const systemFonts = new SystemFontIndex();
+
+// Keep in step with FontListEntry in src/preload/index.ts.
+interface FontListEntry extends FontFace {
+  source: 'bundled' | 'project' | 'system';
+}
+
 app.whenReady().then(() => {
+  const settings = new SettingsStore(join(app.getPath('userData'), 'settings.json'));
+
   ipcMain.handle('scad:render', async (_event, source: string) => {
+    const libraryDirs = defaultLibraryDirs(app.getPath('documents'));
+    const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
+    // Only system families the document (or a library it pulls in) names
+    // in a string literal go to the render; see fontFilesWanted.
+    const dependencies = await collectDependencies(source, documentDir, libraryDirs);
+    const fontFiles = fontFilesWanted([source, ...dependencies.values()], await systemFonts.get());
     return renderHost.render(source, {
       documentPath: currentDocumentPath,
-      libraryDirs: defaultLibraryDirs(app.getPath('documents')),
+      libraryDirs,
+      fontFiles,
     });
   });
+
+  // M15: every font text() can use from this document, for the Text
+  // panel's font dropdown: bundled, the document's `use <font.ttf>` files,
+  // then installed fonts.
+  ipcMain.handle('fonts:list', async (_event, source: string, refresh?: boolean) => {
+    const libraryDirs = defaultLibraryDirs(app.getPath('documents'));
+    const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
+    const dependencies = await collectDependencies(source, documentDir, libraryDirs);
+    const projectFiles = await collectFontDependencies(source, documentDir, dependencies, libraryDirs);
+    const list: FontListEntry[] = BUNDLED_FONT_FACES.map((f) => ({ ...f, source: 'bundled' }));
+    for (const file of projectFiles) for (const f of await readFontFileFaces(file)) list.push({ ...f, source: 'project' });
+    const index = refresh ? await systemFonts.refresh() : await systemFonts.get();
+    for (const entry of index) for (const f of entry.faces) list.push({ ...f, source: 'system' });
+    return list;
+  });
+
+  ipcMain.handle('settings:get', () => settings.get());
+  ipcMain.handle('settings:update', (_event, patch: Partial<AppSettings>) => settings.update(patch));
 
   // M8: the library files that can supply Custom toolbar tools for this
   // source (see moduleSources.ts), and start watching them.
