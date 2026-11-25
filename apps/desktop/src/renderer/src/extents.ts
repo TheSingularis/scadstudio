@@ -95,8 +95,12 @@ function centerFlag(node: Node | null): boolean | null {
   return r.ok && typeof r.value === 'boolean' ? r.value : null;
 }
 
+// Set for the duration of one partExtents call that names literal sizes.
+let promoteLiteral: ((node: Node, suggestedName: string) => string) | null = null;
+
 function sized(node: Node, name: string): { l: Lin; sources: SizeSource[] } {
   const { l, literal } = lin(node);
+  if (literal && promoteLiteral) return { l: fromTerm(term(promoteLiteral(node, name), l.k)), sources: [{ node, suggestedName: name }] };
   return { l, sources: literal ? [{ node, suggestedName: name }] : [] };
 }
 
@@ -220,7 +224,23 @@ function baseName(call: Node | null): string {
  * box of the node's rendered geometry with its rotate/scale applied but not
  * its translate (geometryBox below), used when the call can't be sized.
  */
-export function partExtents(tree: Tree, node: SceneNode, measure: () => { min: number[]; max: number[] } | null): PartExtents | null {
+export function partExtents(
+  tree: Tree,
+  node: SceneNode,
+  measure: () => { min: number[]; max: number[] } | null,
+  // Names a literal size as a variable (the relate tool's "follow"): the
+  // size then appears in the faces as that name.
+  promote: ((node: Node, suggestedName: string) => string) | null = null,
+): PartExtents | null {
+  promoteLiteral = promote;
+  try {
+    return partExtentsInner(tree, node, measure);
+  } finally {
+    promoteLiteral = null;
+  }
+}
+
+function partExtentsInner(tree: Tree, node: SceneNode, measure: () => { min: number[]; max: number[] } | null): PartExtents | null {
   const d = decomposeNode(tree.rootNode, node);
   if (!d) return null;
   const call = d.primitiveNode;

@@ -467,6 +467,23 @@ function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
   return prefix;
 }
 
+// M11 patterns: the node's placement split in two, so copies can step
+// along world axes between them: `outer` is color() and translate(),
+// `inner` is rotate(), mirror() and scale().
+export function transformPrefixParts(t: NodeTransform, baseIndent = ''): { outer: string; inner: string } {
+  const none = [null, null, null];
+  const e = t.exprs;
+  const outer = formatTransformPrefix(
+    { ...t, rotateDeg: [0, 0, 0], scale: [1, 1, 1], exprs: e && { translate: e.translate, rotateDeg: none, scale: none } },
+    baseIndent,
+  );
+  const inner = formatTransformPrefix(
+    { ...t, translate: [0, 0, 0], color: null, exprs: e && { translate: none, rotateDeg: e.rotateDeg, scale: e.scale } },
+    baseIndent,
+  );
+  return { outer, inner };
+}
+
 // The targeted-patch loop: given a gizmo drag's *final* absolute transform
 // (not a delta — the pivot group's position/quaternion/scale directly reflect
 // the true placement now, so there's nothing to compose with an "existing"
@@ -475,9 +492,9 @@ function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
 // edit. Identity components are omitted entirely (no `rotate([0,0,0])`
 // clutter). Only the wrap prefix is replaced — the primitive's own text,
 // comments, and formatting are always preserved untouched.
-export function patchTransform(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): string {
+export function transformEdit(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): { start: number; end: number; text: string } | null {
   const decomposed = decomposeNode(tree.rootNode, node);
-  if (!decomposed) return source;
+  if (!decomposed) return null;
   const baseIndent = lineIndentAt(source, decomposed.wrapStart);
   const separator = `\n${baseIndent}    `;
   // M11: a commit that doesn't say what the expression components become
@@ -495,7 +512,12 @@ export function patchTransform(source: string, tree: Tree, node: SceneNode, tran
   if (decomposed.primitiveNode.type === 'block' && prefix === '' && readModifier(tree.rootNode, node)) {
     prefix = 'union() ';
   }
-  return source.slice(0, decomposed.wrapStart) + prefix + source.slice(decomposed.primitiveStart);
+  return { start: decomposed.wrapStart, end: decomposed.primitiveStart, text: prefix };
+}
+
+export function patchTransform(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): string {
+  const edit = transformEdit(source, tree, node, transform);
+  return edit ? source.slice(0, edit.start) + edit.text + source.slice(edit.end) : source;
 }
 
 export interface PrimitiveArg {
