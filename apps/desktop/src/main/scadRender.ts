@@ -21,6 +21,10 @@ import { createOpenSCAD } from 'openscad-wasm';
 //    so relative paths, including `../`, resolve exactly the way they would
 //    for desktop OpenSCAD, and library folders are handed to OpenSCAD through
 //    its own OPENSCADPATH lookup.
+//
+// 3. It exports binary STL, not OpenSCAD's default ASCII: about a quarter of
+//    the size and much cheaper for the viewport to parse. A detailed model
+//    (the gag-trophy crash report, 2026-11-25) came out as 122 MB of ASCII.
 
 export interface RenderOptions {
   // Absolute path of the document being rendered, or null for an unsaved
@@ -268,7 +272,7 @@ export async function renderScadToStl(source: string, options: RenderOptions = {
 
   let exitCode: number;
   try {
-    exitCode = instance.callMain([inputPath, '--backend=Manifold', '-o', OUTPUT_PATH]);
+    exitCode = instance.callMain([inputPath, '--backend=Manifold', '--export-format=binstl', '-o', OUTPUT_PATH]);
   } catch (err) {
     // Emscripten throws its own non-Error objects (ExitStatus, a bare
     // number) on abort, which used to reach the renderer as

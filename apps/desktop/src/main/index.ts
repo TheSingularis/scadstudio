@@ -1,9 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, utilityProcess } from 'electron';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { watch, type FSWatcher } from 'chokidar';
-import { collectDependencies, defaultLibraryDirs, renderScadToStl } from './scadRender';
+import { collectDependencies, defaultLibraryDirs } from './scadRender';
+import { RenderHost, type RenderChild } from './renderHost';
 import { scanModuleSources } from './moduleSources';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -52,6 +53,24 @@ function watchLibraries(paths: string[]): void {
   watchedPaths = next;
 }
 
+// OpenSCAD runs in its own process (renderWorker.ts via renderHost.ts), not
+// here: see renderWorker.ts for the crash that moved it. Started on the
+// first render; replaced if it dies.
+const renderHost = new RenderHost(
+  () =>
+    utilityProcess.fork(join(__dirname, 'renderWorker.js'), [], {
+      serviceName: 'ScadStudio OpenSCAD renderer',
+      stdio: 'inherit',
+    }) as unknown as RenderChild,
+  // A render that leaves the process this large (the WASM heap never
+  // shrinks) retires it, so memory goes back to the system.
+  { recycleAboveBytes: 512 * 1024 * 1024 },
+);
+
+// Safety net: an error anywhere in the main process is logged, never fatal.
+process.on('uncaughtException', (err) => console.error('[scadstudio] uncaught exception in main process', err));
+process.on('unhandledRejection', (reason) => console.error('[scadstudio] unhandled rejection in main process', reason));
+
 const SCAD_FILTERS = [{ name: 'OpenSCAD', extensions: ['scad'] }];
 
 // Asks before unsaved changes are thrown away. Returns 'save', 'discard' or
@@ -97,6 +116,34 @@ function createWindow(): void {
       // scad:closeAfterSave once the file is written.
       win.webContents.send('app:saveAndClose');
     });
+  });
+
+  // Safety net: if the window's renderer process dies (out of memory, a GPU
+  // or driver fault), say so and bring the window back instead of leaving a
+  // blank or frozen one. It comes back empty rather than reopening the file
+  // by itself: if that file is what used up the memory, reopening it would
+  // only crash again.
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[scadstudio] renderer process gone', details);
+    if (details.reason === 'clean-exit' || win.isDestroyed()) return;
+    const lost = currentDocumentPath;
+    documentDirty = false;
+    currentDocumentPath = null;
+    void dialog
+      .showMessageBox(win, {
+        type: 'error',
+        message: 'The ScadStudio window stopped unexpectedly.',
+        detail:
+          `Reason: ${details.reason}${details.exitCode ? ` (exit code ${details.exitCode})` : ''}.\n\n` +
+          'ScadStudio will reload the window. ' +
+          (lost ? `${lost} on disk is unchanged; changes since your last save could not be recovered.` : 'Unsaved changes could not be recovered.'),
+        buttons: ['Reload'],
+        noLink: true,
+      })
+      .catch(() => {})
+      .then(() => {
+        if (!win.isDestroyed()) win.webContents.reload();
+      });
   });
 
   win.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
@@ -205,7 +252,7 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   ipcMain.handle('scad:render', async (_event, source: string) => {
-    return renderScadToStl(source, {
+    return renderHost.render(source, {
       documentPath: currentDocumentPath,
       libraryDirs: defaultLibraryDirs(app.getPath('documents')),
     });
@@ -296,6 +343,14 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
+
+app.on('child-process-gone', (_event, details) => {
+  // The render process is handled by RenderHost; this logs the rest (GPU,
+  // utility services) so a report has something to go on.
+  console.error('[scadstudio] child process gone', details);
+});
+
+app.on('will-quit', () => renderHost.dispose());
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
