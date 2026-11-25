@@ -4,7 +4,7 @@
 // full design. Checked against openscad-wasm by bounding box, with
 // asymmetric shapes so a wrong rotation or mirror shows.
 import { describe, expect, it } from 'vitest';
-import { createOpenSCAD } from 'openscad-wasm';
+import { createEngine } from '../../src/main/engine';
 import { Matrix4 } from 'three';
 import { applyNodeTransform, bbox, parseStl } from '../helpers/stl';
 import { docOf, resolverFor } from '../helpers/drill';
@@ -12,7 +12,7 @@ import { buildSceneGraph } from '../../src/renderer/src/sceneGraph';
 import { isolatedRender, resolveFocus, type FocusEntry } from '../../src/renderer/src/drillIn';
 
 async function renderDirect(source: string): Promise<Uint8Array | null> {
-  const instance = (await createOpenSCAD({ print: () => {}, printErr: () => {} })).getInstance();
+  const instance = await createEngine({ print: () => {}, printErr: () => {} });
   instance.FS.writeFile('/input.scad', source);
   const code = instance.callMain(['/input.scad', '-o', '/output.stl', '--backend=Manifold']);
   if (code !== 0) return null;

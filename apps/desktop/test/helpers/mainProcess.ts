@@ -4,7 +4,7 @@
 // `scad:render` handler directly, so they exercise exactly the code the app
 // runs (backend flags, virtual-FS setup, error handling) without Electron.
 //
-// openscad-wasm is wrapped, not replaced: every instance the main process
+// The OpenSCAD engine (src/main/engine.ts) is wrapped, not replaced: every instance the main process
 // creates still renders for real, but its stdout/stderr lines are also
 // recorded so tests can see which geometry backend OpenSCAD reports using.
 import { vi } from 'vitest';
@@ -79,13 +79,12 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
     return { ...fake, default: fake };
   });
 
-  vi.doMock('openscad-wasm', async (importOriginal) => {
-    const real = await importOriginal<typeof import('openscad-wasm')>();
-    type Opts = Parameters<typeof real.createOpenSCAD>[0];
-    const createOpenSCAD = (options: Opts = {}) => {
+  vi.doMock('../../src/main/engine', async (importOriginal) => {
+    const real = await importOriginal<typeof import('../../src/main/engine')>();
+    const createEngine = (options: Parameters<typeof real.createEngine>[0] = {}) => {
       const lines: string[] = [];
       engineLog.push(lines);
-      return real.createOpenSCAD({
+      return real.createEngine({
         ...options,
         print: (t: string) => {
           lines.push(t);
@@ -97,7 +96,7 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
         },
       });
     };
-    return { ...real, createOpenSCAD, default: { ...real, createOpenSCAD } };
+    return { ...real, createEngine };
   });
 
   await import('../../src/main/index');

@@ -2,11 +2,11 @@
 // on (PLAN.md "M0 spike results" and "Known engine bug"). Not app code: if a
 // dependency bump changes one of these, this is where it shows up first.
 import { describe, expect, it } from 'vitest';
-import { createOpenSCAD } from 'openscad-wasm';
+import { createEngine } from '../../src/main/engine';
 
 async function run(files: Record<string, string>, args: string[] = []) {
   const log: string[] = [];
-  const instance = (await createOpenSCAD({ print: (t) => log.push(t), printErr: (t) => log.push(t) })).getInstance();
+  const instance = await createEngine({ print: (t: string) => log.push(t), printErr: (t: string) => log.push(t) });
   for (const [path, text] of Object.entries(files)) {
     const dir = path.slice(0, path.lastIndexOf('/'));
     if (dir) {
@@ -32,9 +32,14 @@ describe('openscad-wasm engine (M0)', () => {
     expect(r.log).toMatch(/\(manifold\)/i);
   });
 
-  it('defaults to CGAL when no backend is passed (why H1 needs the flag)', async () => {
+  // openscad-wasm 0.0.4 (OpenSCAD 2025.07) defaulted to CGAL, about 57x
+  // slower, which is why QC audit H1 added --backend=Manifold. The M15
+  // engine (OpenSCAD 2026.09) defaults to Manifold; the app keeps passing
+  // the flag so a future engine can't silently fall back.
+  it('defaults to Manifold when no backend is passed (OpenSCAD 2026.09)', async () => {
     const r = await run({ '/input.scad': 'difference() { cube(10); sphere(6); }' });
-    expect(r.log).toMatch(/Nef polyhedron/);
+    expect(r.code).toBe(0);
+    expect(r.log).toMatch(/\(manifold\)/i);
   });
 
   it('resolves use <lib.scad> when the library is in its virtual FS (the H4 fix relies on this)', async () => {
@@ -57,9 +62,8 @@ describe('openscad-wasm engine (M0)', () => {
     expect(r.code).toBe(0);
   });
 
-  it.fails('text() renders (no fonts bundled in openscad-wasm 0.0.4, tracked by M15)', async () => {
+  it('text() fails without fonts in the virtual FS (why the app mounts them, M15)', async () => {
     const r = await run({ '/input.scad': 'linear_extrude(1) text("Hi");' }, ['--backend=Manifold']);
-    expect(r.code).toBe(0);
-    expect(r.stl).toContain('facet');
+    expect(r.stl).not.toContain('facet');
   });
 });

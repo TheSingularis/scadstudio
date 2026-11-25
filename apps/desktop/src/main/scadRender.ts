@@ -1,7 +1,9 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { createOpenSCAD } from 'openscad-wasm';
+import { createEngine, type EngineFS } from './engine';
+import { isFontPath } from './fonts';
+import { FONT_ROOT, bundledFontFiles, fontFileCache } from './fontStore';
 
 // Everything the main process needs to turn OpenSCAD source into STL bytes,
 // kept free of Electron imports so it can be exercised directly from Node.
@@ -32,6 +34,9 @@ export interface RenderOptions {
   documentPath?: string | null;
   // OpenSCAD library folders, searched after the including file's own folder.
   libraryDirs?: string[];
+  // M15: installed font files this render may need (chosen by the main
+  // process from its system font index, see fonts.ts fontFilesWanted).
+  fontFiles?: string[];
 }
 
 export class ScadRenderError extends Error {
@@ -166,6 +171,8 @@ export async function collectDependencies(
   while (queue.length > 0 && files.size < MAX_DEPENDENCY_FILES) {
     const { text, dir } = queue.shift()!;
     for (const rel of findDependencyPaths(text)) {
+      // `use <font.ttf>` registers a font (M15): binary, not SCAD source.
+      if (isFontPath(rel)) continue;
       for (const candidate of resolutionCandidates(rel, dir, libraryDirs)) {
         if (files.has(candidate)) break;
         if (missing.has(candidate)) continue;
@@ -181,6 +188,65 @@ export async function collectDependencies(
     }
   }
   return files;
+}
+
+async function isFile(hostPath: string): Promise<boolean> {
+  try {
+    return (await stat(hostPath)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// M15: the font files registered with `use <font.ttf>` by the document or
+// any file it pulls in, resolved the same way as a .scad dependency.
+export async function collectFontDependencies(
+  source: string,
+  documentDir: string | null,
+  dependencies: Map<string, string>,
+  libraryDirs: string[],
+  exists: (hostPath: string) => Promise<boolean> = isFile,
+): Promise<string[]> {
+  const found = new Set<string>();
+  const files: { text: string; dir: string | null }[] = [
+    { text: source, dir: documentDir },
+    ...[...dependencies].map(([p, text]) => ({ text, dir: path.dirname(p) })),
+  ];
+  for (const { text, dir } of files) {
+    for (const d of findDirectives(text)) {
+      if (d.kind !== 'use' || !isFontPath(d.path)) continue;
+      for (const candidate of resolutionCandidates(d.path, dir, libraryDirs)) {
+        if (found.has(candidate) || (await exists(candidate))) {
+          found.add(candidate);
+          break;
+        }
+      }
+    }
+  }
+  return [...found];
+}
+
+// M15: puts fonts into a fresh engine instance. The bundled Liberation
+// fonts always go in (about 1 ms from memory, and text() is unusable without
+// them); system fonts go under FONT_ROOT/system, where fontconfig finds them
+// alongside the bundled ones; `use <font.ttf>` files go at their mirrored
+// path so OpenSCAD's own `use` finds and registers them.
+export async function mountFonts(FS: EngineFS, systemFonts: string[], projectFonts: string[]): Promise<void> {
+  mkdirTree(FS, FONT_ROOT);
+  for (const [p, data] of bundledFontFiles()) FS.writeFile(p, data);
+  if (systemFonts.length > 0) mkdirTree(FS, `${FONT_ROOT}/system`);
+  let n = 0;
+  for (const hostPath of systemFonts) {
+    const bytes = await fontFileCache.get(hostPath);
+    if (bytes) FS.writeFile(`${FONT_ROOT}/system/${n++}-${path.basename(hostPath).replace(/[^\w.-]/g, '_')}`, bytes);
+  }
+  for (const hostPath of projectFonts) {
+    const bytes = await fontFileCache.get(hostPath);
+    if (!bytes) continue;
+    const virtual = toVirtualPath(hostPath);
+    mkdirTree(FS, path.posix.dirname(virtual));
+    FS.writeFile(virtual, bytes);
+  }
 }
 
 // OpenSCAD's own default user library folder for this platform (the one its
@@ -232,31 +298,17 @@ export async function renderScadToStl(source: string, options: RenderOptions = {
   const documentDir = documentPath ? path.dirname(documentPath) : null;
   const libraryDirs = (options.libraryDirs ?? []).map((d) => path.resolve(d));
   const dependencies = await collectDependencies(source, documentDir, libraryDirs);
+  const projectFonts = await collectFontDependencies(source, documentDir, dependencies, libraryDirs);
 
   const log: string[] = [];
   const openscadPath = libraryDirs.map(toVirtualPath).join(':');
-  const openscad = await createOpenSCAD({
+  const instance = await createEngine({
     print: (text: string) => log.push(text),
     printErr: (text: string) => log.push(text),
     // OpenSCAD reads OPENSCADPATH once at startup, so it has to be in the
-    // environment before main runs; setting instance.ENV afterwards is too
-    // late. Emscripten passes the module to each preRun callback.
-    preRun: [
-      (module: { ENV?: Record<string, string> }) => {
-        if (module?.ENV && openscadPath) module.ENV['OPENSCADPATH'] = openscadPath;
-      },
-    ],
-  } as Parameters<typeof createOpenSCAD>[0]);
-  const instance = openscad.getInstance() as unknown as {
-    FS: {
-      writeFile: (p: string, data: string) => void;
-      readFile: (p: string) => Uint8Array;
-      mkdir: (p: string) => void;
-      mkdirTree?: (p: string) => void;
-      analyzePath: (p: string) => { exists: boolean };
-    };
-    callMain: (args: string[]) => number;
-  };
+    // environment before main runs.
+    env: openscadPath ? { OPENSCADPATH: openscadPath } : {},
+  });
   const { FS } = instance;
 
   for (const [hostPath, contents] of dependencies) {
@@ -264,6 +316,8 @@ export async function renderScadToStl(source: string, options: RenderOptions = {
     mkdirTree(FS, path.posix.dirname(virtual));
     FS.writeFile(virtual, contents);
   }
+
+  await mountFonts(FS, options.fontFiles ?? [], projectFonts);
 
   const inputDir = documentDir ? toVirtualPath(documentDir) : '/untitled';
   mkdirTree(FS, inputDir);

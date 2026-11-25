@@ -5,7 +5,7 @@
 // for every statement shape the app decomposes. This checks it against real
 // openscad-wasm output by comparing bounding boxes of asymmetric shapes.
 import { describe, expect, it } from 'vitest';
-import { createOpenSCAD } from 'openscad-wasm';
+import { createEngine } from '../../src/main/engine';
 import { audit } from '../helpers/audit';
 import { nodeAt } from '../helpers/parse';
 import { applyNodeTransform, bbox, parseStl } from '../helpers/stl';
@@ -15,7 +15,7 @@ import { IDENTITY_TRANSFORM, decomposeNode, primitiveOnlySlice, wrapAsThinExtrud
 // fast regardless of which backend the app itself picks (that is audit H1,
 // tested in renderIpc.test.ts).
 async function renderDirect(source: string): Promise<Uint8Array> {
-  const instance = (await createOpenSCAD({ print: () => {}, printErr: () => {} })).getInstance();
+  const instance = await createEngine({ print: () => {}, printErr: () => {} });
   instance.FS.writeFile('/input.scad', source);
   const code = instance.callMain(['/input.scad', '-o', '/output.stl', '--backend=Manifold']);
   if (code !== 0) throw new Error(`openscad exited ${code} for:\n${source}`);

@@ -16,6 +16,8 @@ const CASES: { name: string; values: string[]; wrap?: (call: string) => string }
   { name: 'offset', values: ['2'], wrap: (c) => `linear_extrude(1) ${c} square(1)` },
   { name: 'linear_extrude', values: ['7'], wrap: (c) => `${c} square(2)` },
   { name: 'rotate_extrude', values: ['180'], wrap: (c) => `${c} translate([5, 0]) square(1)` },
+  // halign/valign/spacing are named-only (namedOnly in BUILTIN_SIGNATURES).
+  { name: 'text', values: ['"Hi"', '12', '"Liberation Serif"'], wrap: (c) => `linear_extrude(1) ${c}` },
 ];
 
 function box(source: string) {
@@ -23,12 +25,19 @@ function box(source: string) {
 }
 
 describe('M8 built-in positional signatures (engine-checked)', () => {
+  it('a named-only parameter really is (text halign as a 4th positional is ignored)', async () => {
+    const plain = await box('linear_extrude(1) text("Hi", 12, "Liberation Sans");');
+    expect(await box('linear_extrude(1) text("Hi", 12, "Liberation Sans", "center");')).toEqual(plain);
+    expect(await box('linear_extrude(1) text("Hi", 12, "Liberation Sans", halign="center");')).not.toEqual(plain);
+  });
+
   it('covers every signature', () => {
     expect(CASES.map((c) => c.name).sort()).toEqual(Object.keys(BUILTIN_SIGNATURES).sort());
   });
   for (const { name, values, wrap = (c: string) => c } of CASES) {
-    it(`${name}(${BUILTIN_SIGNATURES[name].map((p) => p.name).join(', ')})`, async () => {
-      const params = BUILTIN_SIGNATURES[name];
+    it(`${name}(${BUILTIN_SIGNATURES[name].filter((p) => !p.namedOnly).map((p) => p.name).join(', ')})`, async () => {
+      const params = BUILTIN_SIGNATURES[name].filter((p) => !p.namedOnly);
+      expect(values).toHaveLength(params.length);
       const positional = `${wrap(`${name}(${values.join(', ')})`)};`;
       const named = `${wrap(`${name}(${values.map((v, i) => `${params[i].name}=${v}`).join(', ')})`)};`;
       expect(await box(positional)).toEqual(await box(named));

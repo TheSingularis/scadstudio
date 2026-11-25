@@ -1,6 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { findDirectives, resolutionCandidates } from './scadRender';
+import { isFontPath } from './fonts';
+import { findDirectives, resolutionCandidates, type Directive } from './scadRender';
+
+// `use <font.ttf>` registers a font (M15), not a library of modules.
+const scadDirectives = (source: string): Directive[] => findDirectives(source).filter((d) => !isFontPath(d.path));
 
 // M8: which library files can supply custom-module toolbar tools, and how
 // each one's modules become callable from the open document. Kept free of
@@ -95,7 +99,7 @@ export async function scanModuleSources(
   // Each entry is a file reached through `use`, with the directive that
   // makes it callable (null = already in scope).
   const queue: { path: string; contents: string; useDirective: string | null }[] = [];
-  for (const d of findDirectives(source)) {
+  for (const d of scadDirectives(source)) {
     if (d.kind !== 'use') continue;
     const found = await resolve(d.path, documentDir);
     if (found) queue.push({ ...found, useDirective: null });
@@ -112,7 +116,7 @@ export async function scanModuleSources(
       const file = pending.shift()!;
       if (files.has(file.path) || group.some((g) => g.path === file.path)) continue;
       group.push(file);
-      for (const d of findDirectives(file.contents)) {
+      for (const d of scadDirectives(file.contents)) {
         const found = await resolve(d.path, path.dirname(file.path));
         if (!found) continue;
         if (d.kind === 'include') pending.push(found);

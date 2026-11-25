@@ -12,7 +12,8 @@ export type Vec2 = [number, number];
 
 // 'edit' is Edit Points: click an edge to insert a vertex, double-click a
 // vertex to delete it. Dragging a handle works with every tool.
-export type SketchTool = 'line' | 'arc' | 'rect' | 'circle' | 'edit';
+// M15 'text': one click places a text() statement on the sketch plane.
+export type SketchTool = 'line' | 'arc' | 'rect' | 'circle' | 'text' | 'edit';
 
 // Same 3-decimal rounding formatNumber applies when the polygon is written,
 // done here so the preview, the snap targets and the committed source all

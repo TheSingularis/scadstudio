@@ -22,9 +22,31 @@ interface EditorProps {
   // "Go to definition": select this range and scroll it into view, once
   // per new token.
   revealRequest?: { start: number; end: number; token: number } | null;
+  // M15 Settings > Fonts: the editor's font ('' = Monaco's default) and size.
+  fontFamily?: string;
+  fontSize?: number;
 }
 
-export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, documentKey, focusRange = null, revealRequest = null }: EditorProps) {
+// Monaco's own default stack, used when no font is chosen and as the
+// fallback after a chosen one.
+const DEFAULT_EDITOR_FONTS = 'Consolas, "Courier New", monospace';
+
+export function editorFontFamily(family: string): string {
+  return family ? `"${family}", ${DEFAULT_EDITOR_FONTS}` : DEFAULT_EDITOR_FONTS;
+}
+
+export function Editor({
+  value,
+  onChange,
+  nodes,
+  selectedIndex,
+  onSelectNode,
+  documentKey,
+  focusRange = null,
+  revealRequest = null,
+  fontFamily = '',
+  fontSize = 13,
+}: EditorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const decorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
@@ -59,7 +81,8 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, do
       theme: 'vs-dark',
       minimap: { enabled: false },
       automaticLayout: true,
-      fontSize: 13,
+      fontSize,
+      fontFamily: editorFontFamily(fontFamily),
     });
     editorRef.current = editor;
     decorationsRef.current = editor.createDecorationsCollection();
@@ -162,6 +185,14 @@ export function Editor({ value, onChange, nodes, selectedIndex, onSelectNode, do
       applyingValueRef.current = false;
     }
   }, [value, documentKey]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.updateOptions({ fontFamily: editorFontFamily(fontFamily), fontSize });
+    // Glyph widths changed; Monaco caches them per font.
+    monaco.editor.remeasureFonts();
+  }, [fontFamily, fontSize]);
 
   // Selection -> text: highlight the selected node's range (doesn't move the
   // cursor, so it doesn't fight with the user if they're editing elsewhere).

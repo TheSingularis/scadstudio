@@ -17,6 +17,7 @@ import { decodePng } from './png';
 
 export const DESKTOP_DIR = resolve(fileURLToPath(new URL('.', import.meta.url)), '../..');
 export const SPIKE_FIXTURES_DIR = resolve(DESKTOP_DIR, '../../spikes/fixtures');
+export const FONT_FIXTURES_DIR = resolve(DESKTOP_DIR, 'test/fixtures/fonts');
 
 const LAUNCH_ARGS = ['--no-sandbox', '--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
 
@@ -215,7 +216,14 @@ export const test = base.extend<{ scad: ScadApp; tmpDir: string }>({
     const app = await electron.launch({
       args: [join(DESKTOP_DIR, 'out/main/index.js'), ...LAUNCH_ARGS],
       cwd: DESKTOP_DIR,
-      env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true' },
+      env: {
+        ...process.env,
+        ELECTRON_DISABLE_SECURITY_WARNINGS: 'true',
+        // A fresh settings folder per launch, and a known set of
+        // "installed" fonts (M15).
+        SCADSTUDIO_USER_DATA: mkdtempSync(join(tmpdir(), 'scadstudio-userdata-')),
+        SCADSTUDIO_SYSTEM_FONT_DIRS: process.env['SCADSTUDIO_SYSTEM_FONT_DIRS'] ?? FONT_FIXTURES_DIR,
+      },
     });
     const page = await app.firstWindow();
     const scad = new ScadApp(app, page);
