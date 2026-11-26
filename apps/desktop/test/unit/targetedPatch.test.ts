@@ -15,6 +15,7 @@ import {
   patchArgument,
   patchModifier,
   patchSketchPoints,
+  parseColorString,
   patchTransform,
   primitiveArgs,
   primitiveOnlySlice,
@@ -534,5 +535,48 @@ describe('M11 expression components through patchTransform', () => {
     const source = `${ctx}color([w / 10, 0, 0]) translate([1, 0, 0]) cube(1);`;
     const { tree, node } = await nodeAt(source, 0);
     expect(decomposeNode(tree.rootNode, node)!.transform.color).toBeNull();
+  });
+});
+
+describe('named and hex colors (M10a)', () => {
+  it('parses OpenSCAD color names (any case) and hex forms', () => {
+    expect(parseColorString('goldenrod')).toEqual([218 / 255, 165 / 255, 32 / 255, null]);
+    expect(parseColorString('SaddleBrown')).toEqual([139 / 255, 69 / 255, 19 / 255, null]);
+    expect(parseColorString('#f00')).toEqual([1, 0, 0, null]);
+    expect(parseColorString('#ff000080')).toEqual([1, 0, 0, 128 / 255]);
+    expect(parseColorString('#0f08')).toEqual([0, 1, 0, 136 / 255]);
+    expect(parseColorString('not-a-color')).toBeNull();
+    expect(parseColorString('#12345')).toBeNull();
+  });
+
+  it('reads color("name") and color("#hex", alpha) wraps, so the node takes that color', async () => {
+    expect((await decompose('color("goldenrod") cube(1);'))?.transform.color).toEqual([218 / 255, 165 / 255, 32 / 255]);
+    const d = await decompose('color("#ff0000", 0.5) translate([1, 0, 0]) cube(1);');
+    expect(d?.transform.color).toEqual([1, 0, 0, 0.5]);
+    expect(d?.transform.translate).toEqual([1, 0, 0]);
+    expect((await decompose('color(c = "red", alpha = 0.25) cube(1);'))?.transform.color).toEqual([1, 0, 0, 0.25]);
+  });
+
+  it('leaves what it cannot read in the render: unknown names, variables, alpha given twice', async () => {
+    for (const src of ['color("nope") cube(1);', 'color(c) cube(1);', 'color("#ff000080", 0.5) cube(1);', 'color("red", a) cube(1);']) {
+      const d = await decompose(`c = "red"; a = 1;\n${src}`, 0);
+      expect(d, src).not.toBeNull();
+      expect(d!.transform.color, src).toBeNull();
+    }
+  });
+
+  it('a gizmo edit writes the name back as it was written', async () => {
+    const source = 'color("goldenrod") translate([1, 0, 0]) cube(1);';
+    const before = await decompose(source);
+    const { patched, reread } = await patchAndReread(source, { ...before!.transform, translate: [5, 0, 0] });
+    expect(patched).toMatch(/^color\("goldenrod"\)\s+translate\(\[5, 0, 0\]\)\s+cube\(1\);$/);
+    expect(reread?.colorText).toBe('"goldenrod"');
+  });
+
+  it('a new color from the picker replaces the name with a vector', async () => {
+    const source = 'color("goldenrod", 0.5) cube(1);';
+    const before = await decompose(source);
+    const { patched } = await patchAndReread(source, { ...before!.transform, color: [0, 0, 1, 0.5], colorText: undefined });
+    expect(patched).toMatch(/^color\(\[0, 0, 1, 0.5\]\)\s+cube\(1\);$/);
   });
 });

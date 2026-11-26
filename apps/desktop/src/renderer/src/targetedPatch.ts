@@ -1,3 +1,4 @@
+import { NAMED_COLORS } from './namedColors';
 import type { Node, Tree } from 'web-tree-sitter';
 import { Euler, Quaternion } from 'three';
 import type { SceneNode } from './sceneGraph';
@@ -30,6 +31,11 @@ export interface NodeTransform {
   // A fourth component is color()'s alpha, kept so an edit never drops it
   // from the file (QC audit M2).
   color: ColorVector | null;
+  // M10a: the color() wrap's arguments exactly as written, when they are a
+  // name or hex string (`"goldenrod"`, `"#ff0000", 0.5`) rather than a
+  // vector. Written back unchanged while `color` is untouched; the color
+  // picker drops it, since it writes a new color as a vector.
+  colorText?: string;
   // M11: the source text of components written as expressions
   // (`translate([base_w + gap, 0, 0])`), null for a literal number. The
   // numbers above are what the expressions come to (scadExpr.ts), so the
@@ -185,6 +191,61 @@ export function readVectorCall(call: Node, allowExpressions = true): VectorCall 
   return { name, xyz: nums.slice(0, 3) as [number, number, number], w: count === 4 ? nums[3] : null, texts };
 }
 
+// M10a: a color() call whose color is a string: an OpenSCAD color name
+// (namedColors.ts, any case) or a hex color (#rgb, #rgba, #rrggbb,
+// #rrggbbaa), with an optional alpha (second argument or `alpha=`, a
+// literal). Returns the 0-1 color and the argument text as written, or null
+// for anything else (an expression, a variable, an unknown name).
+export function readColorCall(call: Node): { color: ColorVector; text: string } | null {
+  if (call.childForFieldName('name')?.text !== 'color') return null;
+  const argList = call.childForFieldName('arguments');
+  const args = argList?.namedChild(0);
+  if (!argList || !args) return null;
+  let colorNode: Node | null = null;
+  let alphaNode: Node | null = null;
+  let position = 0;
+  for (let i = 0; i < args.namedChildCount; i++) {
+    const arg = args.namedChild(i);
+    if (!arg || arg.type !== 'argument') return null;
+    const hasName = arg.childCount >= 3 && arg.child(1)?.type === '=';
+    const value = arg.namedChild(arg.namedChildCount - 1);
+    const index = hasName ? -1 : position++;
+    const key = hasName ? arg.child(0)?.text : index === 0 ? 'c' : index === 1 ? 'alpha' : null;
+    if (key === 'c') colorNode = value;
+    else if (key === 'alpha') alphaNode = value;
+    else return null;
+  }
+  if (!colorNode || colorNode.type !== 'string') return null;
+  const rgba = parseColorString(colorNode.text.slice(1, -1));
+  if (!rgba) return null;
+  let alpha = rgba[3];
+  if (alphaNode) {
+    const a = readNumber(alphaNode);
+    if (a === null || alpha !== null) return null; // an expression, or alpha given twice
+    alpha = a;
+  }
+  const color: ColorVector = alpha === null ? [rgba[0], rgba[1], rgba[2]] : [rgba[0], rgba[1], rgba[2], alpha];
+  return { color, text: argList.text.slice(1, -1).trim() };
+}
+
+// "goldenrod" / "#rgb" / "#rgba" / "#rrggbb" / "#rrggbbaa" -> 0-1 RGB and
+// alpha (null when the string has none), or null if it isn't a color.
+export function parseColorString(text: string): [number, number, number, number | null] | null {
+  const t = text.trim().toLowerCase();
+  if (t.startsWith('#')) {
+    const hex = t.slice(1);
+    if (!/^[0-9a-f]+$/.test(hex)) return null;
+    const short = hex.length === 3 || hex.length === 4;
+    if (!short && hex.length !== 6 && hex.length !== 8) return null;
+    const digits = short ? [...hex].map((d) => d + d) : hex.match(/../g)!;
+    const v = digits.map((d) => parseInt(d, 16) / 255);
+    return [v[0], v[1], v[2], v.length === 4 ? v[3] : null];
+  }
+  const packed = NAMED_COLORS[t];
+  if (packed === undefined) return null;
+  return [((packed >> 16) & 255) / 255, ((packed >> 8) & 255) / 255, (packed & 255) / 255, null];
+}
+
 export interface DecomposedNode {
   transform: NodeTransform;
   // Byte range of the base primitive call itself (e.g. `cylinder(...)`),
@@ -295,7 +356,17 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
     // color() and mirror() are rewritten from their numbers, so they're
     // only consumed when literal; an expression there stops the walk.
     const vc = readVectorCall(current, name !== 'color' && name !== 'mirror');
-    if (!vc) break;
+    if (!vc) {
+      // M10a: color("goldenrod") / color("#d4a017", 0.5): read the color so
+      // the picker shows it and the node draws in it, and keep the text.
+      const named = name === 'color' && !sawColor ? readColorCall(current) : null;
+      if (!named) break;
+      transform.color = named.color;
+      transform.colorText = named.text;
+      sawColor = true;
+      current = next;
+      continue;
+    }
     // An expression scale that comes out negative would be written back as
     // mirror() plus the expression, flipping twice.
     if (name === 'scale' && vc.texts.some((t, i) => t !== null && vc.xyz[i] < 0)) break;
@@ -449,7 +520,7 @@ function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
   const e = t.exprs;
   const anyText = (texts: readonly (string | null)[] | undefined) => !!texts?.some((x) => x !== null);
   let prefix = '';
-  if (t.color) prefix += `color(${formatVector(t.color)})${WRAP_SEPARATOR}`;
+  if (t.color) prefix += `color(${t.colorText ?? formatVector(t.color)})${WRAP_SEPARATOR}`;
   // An expression component keeps its wrap even when it comes to the
   // identity value (`translate([gap, 0, 0])` with gap = 0).
   if (anyText(e?.translate) || t.translate.some((v) => v !== 0)) prefix += `translate(${formatComponents(t.translate, e?.translate)})${WRAP_SEPARATOR}`;

@@ -98,7 +98,8 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 type ModuleSourceFile = Awaited<ReturnType<Window['scadstudio']['scanModules']>>[number];
 import { createCoalescingRunner } from './coalescingRunner';
 import { RenderCache, type CachedRender } from './renderCache';
-import { isEngineCrash, renderErrorMessage } from './renderErrors';
+import { isEngineCrash, isRenderCancelled, renderErrorMessage } from './renderErrors';
+import { RenderProgressOverlay, useRenderIsSlow, type RenderProgress } from './components/RenderProgress';
 import {
   EMPTY_SKETCH,
   addProfile,
@@ -278,6 +279,10 @@ function meshBox(mesh: NodeMesh | undefined): { min: number[]; max: number[] } |
   }
 }
 
+// M10a: thrown inside a render when Cancel was pressed between parts (same
+// text as the main process's, so isRenderCancelled matches both).
+const RENDER_CANCELLED = 'Render cancelled';
+
 const DEFAULT_SOURCE = `// scadstudio — drag the gizmo (Move/Rotate/Scale), insert primitives, click
 // to select, or shift-click to multi-select two+ shapes for a boolean op
 module bracket(w=20, h=10, thickness=3) {
@@ -446,6 +451,17 @@ export function App() {
   } | null>(null);
   const [rotateSpace, setRotateSpace] = useState<RotateSpace>('local');
   const [status, setStatus] = useState('Rendering...');
+  // M10a: the render in progress (null when idle), for the progress overlay
+  // and the greyed-out stale meshes. cancelGenRef counts Cancel presses; a
+  // render that sees it change stops between parts.
+  // The progress itself lives in a ref the overlay reads on its own timer,
+  // so a working set of many (mostly cached) parts doesn't re-render the
+  // whole app once per part; only the start and end are React state.
+  const [renderStartedAt, setRenderStartedAt] = useState<number | null>(null);
+  const renderProgressRef = useRef<RenderProgress | null>(null);
+  const renderIsSlow = useRenderIsSlow(renderStartedAt);
+  const renderingRef = useRef(false);
+  const cancelGenRef = useRef(0);
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   // Reactive mirror of treeRef below, purely so the parameter panel (a
   // useMemo over tree+sceneNodes+selection) can recompute when a render
@@ -576,6 +592,8 @@ export function App() {
       stats.engineCalls++;
       result = { bytes: await window.scadstudio.renderScad(source) };
     } catch (firstError) {
+      // M10a: Cancel is not a result of this source; don't cache it.
+      if (isRenderCancelled(firstError)) throw firstError;
       // M7: a pure-2D node (bare square/circle/polygon, a 2D boolean, ...)
       // fails here every time — real OpenSCAD can't STL-export 2D geometry.
       // Retry once wrapped in a hairline linear_extrude (see
@@ -593,6 +611,7 @@ export function App() {
           stats.engineCalls++;
           result = { bytes: await window.scadstudio.renderScad(flatSource) };
         } catch (secondError) {
+          if (isRenderCancelled(secondError)) throw secondError;
           result = { firstError, secondError };
         }
       }
@@ -605,6 +624,16 @@ export function App() {
     () =>
       createCoalescingRunner(async (src: string) => {
         setStatus('Rendering...');
+        // M10a: progress, and a way to stop between parts on Cancel (the
+        // render process itself is killed by the main process).
+        const generation = cancelGenRef.current;
+        const checkCancelled = () => {
+          if (cancelGenRef.current !== generation) throw new Error(RENDER_CANCELLED);
+        };
+        renderingRef.current = true;
+        const startedAt = performance.now();
+        renderProgressRef.current = { startedAt, part: 0, parts: 0, stage: null, context: false };
+        setRenderStartedAt(startedAt);
         try {
           const { tree: parsedTree, errorCount } = await parseScad(src);
           const isCurrent = src === sourceRef.current;
@@ -636,7 +665,8 @@ export function App() {
           // First node that failed both render attempts, shown in the status
           // bar so a failure says which node and why (QC audit M4).
           let firstFailure: string | null = null;
-          for (const node of set.nodes) {
+          for (const [position, node] of set.nodes.entries()) {
+            renderProgressRef.current = { startedAt, part: position + 1, parts: set.nodes.length, stage: null, context: false };
             // `*` (disable) — real OpenSCAD never evaluates disabled
             // geometry at all, so skip the WASM call entirely rather than
             // rendering it and hiding it after the fact. The node stays
@@ -661,6 +691,7 @@ export function App() {
             // set's frame when drilled in (drillIn.ts).
             const job = isolatedRender(set, node, graph.context);
             const result = await renderCached(job.source, job.flatSource);
+            checkCancelled();
             if ('bytes' in result) {
               meshes.push({
                 index: node.index,
@@ -712,6 +743,8 @@ export function App() {
           // M9: the dimmed context, after the working set so that one is
           // interactive first: every other node at each level above it.
           const context: NodeMesh[] = [];
+          const contextTotal = r.focus.reduce((n, _f, depth) => n + r.sets[depth].nodes.length - 1, 0);
+          let contextDone = 0;
           for (let depth = 0; depth < r.focus.length; depth++) {
             const level = r.sets[depth];
             for (const node of level.nodes) {
@@ -720,7 +753,10 @@ export function App() {
               if (modifier === '*' || modifier === '%') continue;
               if (guardInactive(level.guards[node.index] ?? null)) continue;
               const job = isolatedRender(level, node, graph.context);
+              contextDone++;
+              renderProgressRef.current = { startedAt, part: contextDone, parts: contextTotal, stage: null, context: true };
               const result = await renderCached(job.source, job.flatSource);
+              checkCancelled();
               if ('bytes' in result) {
                 context.push({
                   index: -1,
@@ -755,8 +791,17 @@ export function App() {
                 : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}${firstFailure ? ` — ${firstFailure}` : ''}`),
           );
         } catch (err) {
-          setStatus(`Render failed: ${(err as Error).message}`);
-          console.error('[scadstudio] render failed', err);
+          if (isRenderCancelled(err)) {
+            // The last finished render stays on screen (no longer greyed).
+            setStatus('Render cancelled');
+          } else {
+            setStatus(`Render failed: ${(err as Error).message}`);
+            console.error('[scadstudio] render failed', err);
+          }
+        } finally {
+          renderingRef.current = false;
+          renderProgressRef.current = null;
+          setRenderStartedAt(null);
         }
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -931,6 +976,23 @@ export function App() {
     [filePath],
   );
 
+  // M10a: the progress overlay's Cancel. Stops the render process (main) and
+  // the per-part loop here; what was on screen before stays.
+  const handleCancelRender = useCallback(() => {
+    if (!renderingRef.current) return;
+    cancelGenRef.current++;
+    void window.scadstudio.cancelRender();
+  }, []);
+
+  // M10a: the step the render process is on, for the overlay.
+  useEffect(
+    () =>
+      window.scadstudio.onRenderStage((stage) => {
+        if (renderProgressRef.current) renderProgressRef.current = { ...renderProgressRef.current, stage };
+      }),
+    [],
+  );
+
   const openWith = useCallback(async (open: () => ReturnType<Window['scadstudio']['openFile']>) => {
     let result = await open();
     if (result && 'saveFirst' in result) {
@@ -939,6 +1001,15 @@ export function App() {
     }
     if (!result || 'saveFirst' in result) return;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    // M10a: the previous file's render is no use now (it would otherwise
+    // run to the end first, over a minute for the gag trophy), and its
+    // meshes must not show under the new file's name.
+    if (renderingRef.current) {
+      cancelGenRef.current++;
+      void window.scadstudio.cancelRender();
+    }
+    setNodeMeshes([]);
+    setContextMeshes([]);
     // A new document starts at its top level.
     focusRef.current = [];
     focusEpochRef.current++;
@@ -1118,6 +1189,9 @@ export function App() {
             setActiveSketchPlane(null);
             resetSketch();
             setResetViewToken((t) => t + 1);
+            // M10a: and again once the new text has rendered, so the view
+            // takes it in without a Reset View (M15 known issue).
+            fitAfterRenderRef.current = true;
           }
           return;
         }
@@ -1213,6 +1287,8 @@ export function App() {
     setActiveSketchPlane(null);
     resetSketch();
     setResetViewToken((t) => t + 1);
+    // M10a: refit once the new shape has rendered too.
+    fitAfterRenderRef.current = true;
   }, [activeSketchPlane, runRender, resetSketch]);
 
   // M7.5 on-plane editing: the selected node, when it's a sketch this app can
@@ -1267,6 +1343,7 @@ export function App() {
     setEditingSketchIndex(null);
     resetSketch();
     setResetViewToken((t) => t + 1);
+    fitAfterRenderRef.current = true;
   }, [editingSketchIndex, runRender, resetSketch]);
 
   // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
@@ -1338,7 +1415,8 @@ export function App() {
       const b = parseInt(hex.slice(5, 7), 16) / 255;
       // Keep an existing alpha: the picker only chooses the RGB part.
       const color: ColorVector = current.color?.length === 4 ? [r, g, b, current.color[3]] : [r, g, b];
-      handleTransformCommit(primarySelectedIndex, { ...current, color });
+      // A new color is written as a vector, replacing a name or hex string.
+      handleTransformCommit(primarySelectedIndex, { ...current, color, colorText: undefined });
     },
     [primarySelectedIndex, nodeMeshes, handleTransformCommit],
   );
@@ -1347,7 +1425,7 @@ export function App() {
     if (primarySelectedIndex === null) return;
     const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
     if (!current) return;
-    handleTransformCommit(primarySelectedIndex, { ...current, color: null });
+    handleTransformCommit(primarySelectedIndex, { ...current, color: null, colorText: undefined });
   }, [primarySelectedIndex, nodeMeshes, handleTransformCommit]);
 
   // Position fields in the toolbar: same single-field-edit-of-current-
@@ -2819,7 +2897,8 @@ export function App() {
             documentKey={documentToken}
           />
         </div>
-        <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
+        <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333', position: 'relative' }}>
+          {renderStartedAt !== null && renderIsSlow && <RenderProgressOverlay progressRef={renderProgressRef} onCancel={handleCancelRender} />}
           <ErrorBoundary label="The 3D view" resetKey={nodeMeshes}>
             <Viewport
               meshes={nodeMeshes}
@@ -2850,6 +2929,7 @@ export function App() {
               editable={!readOnly && !tool}
               freeAxes={primaryFreeAxes}
               cuttersFirst={workingSet?.containerCall === 'difference'}
+              stale={renderStartedAt !== null && renderIsSlow}
             />
           </ErrorBoundary>
         </div>

@@ -9,6 +9,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { loadMainProcess, type MainProcessHarness } from '../helpers/mainProcess';
 import { FIXTURES_DIR } from '../helpers/paths';
 import { bbox, parseStl, triangleCount } from '../helpers/stl';
+import { readFaceColors } from '../../src/renderer/src/meshColors';
 
 const SOURCE = readFileSync(join(FIXTURES_DIR, 'gag_trophy1.scad'), 'utf8');
 const lowDetail = (part: string) => `${SOURCE}\npart = "${part}";\n$fn = 16;\ndome_res = 0.6;\n`;
@@ -21,11 +22,12 @@ beforeAll(async () => {
 });
 
 describe('gag_trophy1.scad renders (crash report 2026-11-25)', () => {
-  it('the assembly renders as binary STL with the trophy\'s overall size', async () => {
+  it('the assembly renders as binary STL (plus a color trailer, M10a) with the trophy\'s overall size', async () => {
     const bytes = await render(lowDetail('assembly'));
-    // Binary STL: 80-byte header, triangle count, 50 bytes per triangle.
+    // Binary STL: 80-byte header, triangle count, 50 bytes per triangle,
+    // then "RGBA" and 4 bytes per triangle (src/main/offMesh.ts).
     const count = new DataView(bytes.buffer, bytes.byteOffset).getUint32(80, true);
-    expect(bytes.byteLength).toBe(84 + 50 * count);
+    expect(bytes.byteLength).toBe(84 + 50 * count + 4 + 4 * count);
     const geom = parseStl(bytes);
     expect(triangleCount(geom)).toBe(count);
     const { min, max } = bbox(geom);
@@ -34,6 +36,16 @@ describe('gag_trophy1.scad renders (crash report 2026-11-25)', () => {
     expect(max[1] - min[1]).toBeCloseTo(70, 0);
     expect(max[2]).toBeGreaterThan(250);
     expect(min[2]).toBeCloseTo(0, 3);
+  });
+
+  it('keeps the colors its modules give each part (M10a: it used to render all one color)', async () => {
+    const faces = readFaceColors(await render(lowDetail('assembly')))!;
+    expect(faces).not.toBeNull();
+    const seen = new Set<string>();
+    for (let i = 0; i < faces.length; i += 4) seen.add(`${faces[i]},${faces[i + 1]},${faces[i + 2]}`);
+    // color("goldenrod"), color("saddlebrown"), color("firebrick"),
+    // color("silver"), color("white") and color([0.15, 0.15, 0.15]).
+    for (const rgb of ['218,165,32', '139,69,19', '178,34,34', '192,192,192', '255,255,255', '38,38,38']) expect(seen).toContain(rgb);
   });
 
   it.each(['base', 'plaque', 'blade', 'fob_half', 'mug_half', 'foam', 'buttons_grey', 'button_accent'])('part "%s" renders', async (part) => {

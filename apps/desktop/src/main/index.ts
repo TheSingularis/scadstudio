@@ -269,19 +269,29 @@ interface FontListEntry extends FontFace {
 app.whenReady().then(() => {
   const settings = new SettingsStore(join(app.getPath('userData'), 'settings.json'));
 
-  ipcMain.handle('scad:render', async (_event, source: string) => {
+  ipcMain.handle('scad:render', async (event, source: string) => {
     const libraryDirs = defaultLibraryDirs(app.getPath('documents'));
     const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
     // Only system families the document (or a library it pulls in) names
     // in a string literal go to the render; see fontFilesWanted.
     const dependencies = await collectDependencies(source, documentDir, libraryDirs);
     const fontFiles = fontFilesWanted([source, ...dependencies.values()], await systemFonts.get());
-    return renderHost.render(source, {
-      documentPath: currentDocumentPath,
-      libraryDirs,
-      fontFiles,
-    });
+    return renderHost.render(
+      source,
+      {
+        documentPath: currentDocumentPath,
+        libraryDirs,
+        fontFiles,
+      },
+      // M10a: the progress bar's step label.
+      (stage) => {
+        if (!event.sender.isDestroyed()) event.sender.send('scad:renderStage', stage);
+      },
+    );
   });
+
+  // M10a: the progress bar's Cancel button.
+  ipcMain.handle('scad:cancelRender', () => renderHost.cancel());
 
   // M15: every font text() can use from this document, for the Text
   // panel's font dropdown: bundled, the document's `use <font.ttf>` files,
