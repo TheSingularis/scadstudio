@@ -1,0 +1,231 @@
+// M11 directional constraints in the running app: the variables panel,
+// Make variable, the Distance/Align/Pattern tool panel, and expression axes
+// in the Position fields and gizmo. Real clicks and typing throughout.
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test, expect, type ScadApp } from './fixtures';
+
+// Screenshots for the PR / Jordan, when asked for (SCADSTUDIO_SHOTS=dir).
+const SHOTS = process.env['SCADSTUDIO_SHOTS'];
+async function shot(scad: ScadApp, name: string) {
+  if (!SHOTS) return;
+  mkdirSync(SHOTS, { recursive: true });
+  await scad.page.waitForTimeout(400);
+  await scad.page.screenshot({ path: join(SHOTS, `${name}.png`) });
+}
+
+const TWO_PARTS = 'cube([30, 20, 10]);\n\ntranslate([60, 5, 0]) sphere(r = 8, $fn = 32);\n';
+
+test.describe('M11 directional constraints', () => {
+  test('Distance with follow: locked together, the sphere keeps its gap when the cube grows or either part is dragged', async ({ scad }) => {
+    await scad.load(TWO_PARTS);
+    await scad.button('Distance').click();
+    const panel = scad.page.getByRole('region', { name: 'Distance tool' });
+    await expect(panel).toBeVisible();
+    // Distance and Align are marked experimental until the solver redoes them.
+    await expect(scad.page.getByTestId('constrain-experimental')).toBeVisible();
+    await expect(panel.getByTestId('tool-experimental')).toHaveText('experimental');
+    // Nothing selected: the Move slot is waiting for a click.
+    await expect(panel.getByTestId('slot-move')).toHaveAttribute('aria-pressed', 'true');
+    await scad.clickEditorLine(3); // the sphere
+    await expect(panel.getByTestId('slot-relative-to')).toHaveAttribute('aria-pressed', 'true');
+    await scad.clickEditorLine(1); // the cube
+    await expect(panel.getByTestId('slot-move')).toContainText('sphere');
+    await expect(panel.getByTestId('slot-relative-to')).toContainText('cube');
+    // The default distance is where the parts are now: 52 - 30.
+    await expect(panel.getByLabel('Offset', { exact: true })).toHaveValue('22');
+    await panel.getByLabel('Offset', { exact: true }).fill('5');
+    await expect(scad.page.getByTestId('tool-preview')).toContainText('translate X = cube_x + cube_width + gap + sphere_r');
+    await shot(scad, '1-distance-panel');
+    await scad.rendersAfter(() => panel.getByRole('button', { name: 'Apply' }).click());
+    // Distance locks the parts together on every axis: the sphere's Y and Z
+    // are the cube's position plus today's offset.
+    expect(await scad.source()).toBe(
+      'cube_x = 0;\ncube_y = 0;\ncube_z = 0;\ncube_width = 30;\nsphere_r = 8;\ngap = 5;\n\ntranslate([cube_x, cube_y, cube_z])\n    cube([cube_width, 20, 10]);\n\ntranslate([cube_x + cube_width + gap + sphere_r, cube_y + 5, cube_z])\n    sphere(r = sphere_r, $fn = 32);\n',
+    );
+    await expect(panel).toBeHidden();
+    // The variables panel lists what was written.
+    const vars = scad.page.getByRole('complementary', { name: 'Variables' });
+    for (const name of ['cube_x', 'cube_y', 'cube_z', 'cube_width', 'sphere_r', 'gap']) await expect(vars.getByTestId(`variable-${name}`)).toBeVisible();
+    await shot(scad, '2-applied');
+
+    // Grow the cube from the variables panel: the sphere moves with it.
+    await scad.rendersAfter(async () => {
+      await vars.getByLabel('Variable cube_width', { exact: true }).fill('50');
+      await vars.getByLabel('Variable cube_width', { exact: true }).press('Enter');
+    });
+    expect(await scad.source()).toContain('cube_width = 50;');
+    await scad.clickEditorLine(11); // the sphere's translate
+    const x = scad.page.getByLabel('Position X', { exact: true });
+    await expect(x).toHaveValue('cube_x + cube_width + gap + sphere_r');
+    await expect(x).toHaveAttribute('title', /comes to 63/);
+    // Every axis moves with the cube's position: all three handles drag.
+    await expect(scad.page.getByTestId('gizmo-lock-note')).toContainText('Linked: dragging moves cube_x, cube_y, cube_z');
+    for (const axis of ['x', 'y', 'z'] as const) expect((await scad.axisHandle(axis)).count, `${axis} handle`).toBeGreaterThan(20);
+    await shot(scad, '3-cube-grown-sphere-follows');
+
+    // Drag the sphere along Y: both parts move, the expressions stay.
+    const before = await scad.source();
+    const handle = await scad.axisHandle('y');
+    const len = Math.hypot(handle.dx, handle.dy);
+    await scad.rendersAfter(() => scad.dragViewport(handle, { dx: handle.dx + (handle.dx / len) * 80, dy: handle.dy + (handle.dy / len) * 80 }));
+    const afterSphere = await scad.source();
+    const cubeY = Number(afterSphere.match(/^cube_y = (-?[\d.]+);$/m)![1]);
+    expect(cubeY).not.toBe(0);
+    expect(afterSphere.replace(/^cube_y = .*$/m, 'cube_y = 0;')).toBe(before);
+
+    // Drag the cube along X: the sphere comes along, keeping the gap.
+    await scad.clickEditorLine(8); // the cube
+    await expect(scad.page.getByTestId('gizmo-lock-note')).toContainText('Linked: dragging moves cube_x, cube_y, cube_z');
+    const hx = await scad.axisHandle('x');
+    const lx = Math.hypot(hx.dx, hx.dy);
+    await scad.rendersAfter(() => scad.dragViewport(hx, { dx: hx.dx + (hx.dx / lx) * 80, dy: hx.dy + (hx.dy / lx) * 80 }));
+    const afterCube = await scad.source();
+    // (The handle's screen direction is measured from the viewport centre,
+    // not the gizmo, so only the change is checked, not its sign.)
+    expect(Number(afterCube.match(/^cube_x = (-?[\d.]+);$/m)![1])).not.toBe(0);
+    expect(afterCube).toContain('translate([cube_x, cube_y, cube_z])\n    cube([cube_width, 20, 10]);');
+    expect(afterCube).toContain('translate([cube_x + cube_width + gap + sphere_r, cube_y + 5, cube_z])');
+    await scad.resetView();
+    await shot(scad, '3b-dragged-together');
+  });
+
+  test('Align centers, and Position accepts an expression or a number', async ({ scad }) => {
+    await scad.load('w = 30;\n\ntranslate([0, 10, 0]) cube([w, 20, 10], center = true);\n\ntranslate([60, 0, 0]) cylinder(h = 5, r = 4);\n');
+    await scad.button('Align').click();
+    const panel = scad.page.getByRole('region', { name: 'Align tool' });
+    await panel.getByTestId('slot-move').click();
+    await scad.clickEditorLine(5);
+    await panel.getByTestId('slot-relative-to').click();
+    await scad.clickEditorLine(3);
+    await panel.getByRole('group', { name: 'Axis' }).getByRole('button', { name: 'Y' }).click();
+    await expect(scad.page.getByTestId('tool-preview')).toContainText('translate Y = cube_y');
+    await scad.rendersAfter(() => panel.getByRole('button', { name: 'Apply' }).click());
+    expect(await scad.source()).toContain('translate([60, cube_y, 0])');
+
+    // Position X takes an expression...
+    await scad.clickEditorLine(7);
+    const x = scad.page.getByLabel('Position X', { exact: true });
+    await scad.rendersAfter(async () => {
+      await x.fill('w * 2 + 5');
+      await x.press('Enter');
+    });
+    expect(await scad.source()).toContain('translate([w * 2 + 5, cube_y, 0])');
+    // ...and a number detaches it again.
+    await scad.rendersAfter(async () => {
+      await scad.page.getByLabel('Position X', { exact: true }).fill('12');
+      await scad.page.getByLabel('Position X', { exact: true }).press('Enter');
+    });
+    expect(await scad.source()).toContain('translate([12, cube_y, 0])');
+  });
+
+  test('Pattern: a linear row, then the count edited from its panel', async ({ scad }) => {
+    await scad.load('translate([0, 0, 0]) cube([10, 4, 4]);\n');
+    await scad.clickEditorLine(1);
+    await scad.button('Pattern').click();
+    const panel = scad.page.getByRole('region', { name: 'Pattern tool' });
+    await expect(panel.getByTestId('slot-part')).toContainText('cube');
+    // Default pitch: the part's width plus 5.
+    await expect(panel.getByLabel('Spacing', { exact: true })).toHaveValue('15');
+    await shot(scad, '4-pattern-panel');
+    await scad.rendersAfter(() => panel.getByRole('button', { name: 'Apply' }).click());
+    expect(await scad.source()).toBe('for (i = [0 : 2])\n    translate([i * 15, 0, 0])\n    cube([10, 4, 4]);\n');
+    const strip = scad.page.getByRole('group', { name: 'Pattern' });
+    await expect(strip).toContainText('Linear pattern along X');
+    await scad.rendersAfter(async () => {
+      await strip.getByLabel('Pattern count').fill('5');
+      await strip.getByLabel('Pattern count').press('Enter');
+    });
+    expect(await scad.source()).toContain('for (i = [0 : 4])');
+    // The whole pattern moves like any part: Position gives it a translate.
+    await scad.rendersAfter(async () => {
+      await scad.page.getByLabel('Position Y', { exact: true }).fill('8');
+      await scad.page.getByLabel('Position Y', { exact: true }).press('Enter');
+    });
+    expect(await scad.source()).toMatch(/^translate\(\[0, 8, 0\]\)\n\s+for \(i = \[0 : 4\]\)/);
+    await scad.resetView();
+    await shot(scad, '5-pattern-five');
+  });
+
+  test('Make variable from the parameter panel, and delete with inline', async ({ scad }) => {
+    await scad.load('cylinder(h = 20, r = 5);\n');
+    await scad.clickEditorLine(1);
+    await scad.page.getByRole('button', { name: 'Make h a variable' }).click();
+    const prompt = scad.page.getByRole('form', { name: 'Make variable' });
+    await expect(prompt.getByLabel('Variable name')).toHaveValue('cylinder_h');
+    await scad.rendersAfter(() => prompt.getByRole('button', { name: 'Make variable' }).click());
+    expect(await scad.source()).toBe('cylinder_h = 20;\n\ncylinder(h = cylinder_h, r = 5);\n');
+    // The r field autocompletes variable names: type one in.
+    await scad.clickEditorLine(3);
+    const r = scad.page.getByLabel('Parameter r', { exact: true });
+    await scad.rendersAfter(async () => {
+      await r.fill('cylinder_h / 4');
+      await r.press('Enter');
+    });
+    expect(await scad.source()).toContain('cylinder(h = cylinder_h, r = cylinder_h / 4)');
+    await shot(scad, '6-make-variable');
+
+    // Deleting a used variable asks, then inlines its value.
+    const vars = scad.page.getByRole('complementary', { name: 'Variables' });
+    const row = vars.getByTestId('variable-cylinder_h');
+    await row.getByRole('button', { name: 'Delete' }).click();
+    await expect(row.getByRole('alert')).toContainText('used in 2 places');
+    await shot(scad, '7-delete-asks');
+    await scad.rendersAfter(() => row.getByRole('button', { name: 'Inline its value and delete' }).click());
+    expect(await scad.source()).toBe('cylinder(h = 20, r = 20 / 4);\n');
+  });
+
+  test('Customizer annotations become a slider and a dropdown; rename updates uses', async ({ scad }) => {
+    await scad.load('// Wall thickness\nwall = 2; // [1:0.5:5]\nshape = "round"; // [round, square]\n/* [Hidden] */\nfn = 32;\n\ncube([10, 10, wall]);\n');
+    const vars = scad.page.getByRole('complementary', { name: 'Variables' });
+    await expect(vars.getByLabel('Variable wall slider')).toHaveAttribute('max', '5');
+    await expect(vars.getByLabel('Variable shape')).toHaveValue('round');
+    await expect(vars).toContainText('Wall thickness');
+    await expect(vars.getByRole('region', { name: 'Hidden variables' })).toContainText('fn');
+    await shot(scad, '8-customizer');
+    await vars.getByRole('button', { name: 'wall' }).click();
+    await scad.rendersAfter(async () => {
+      await vars.getByLabel('New name for wall').fill('wall_t');
+      await vars.getByLabel('New name for wall').press('Enter');
+    });
+    expect(await scad.source()).toBe('// Wall thickness\nwall_t = 2; // [1:0.5:5]\nshape = "round"; // [round, square]\n/* [Hidden] */\nfn = 32;\n\ncube([10, 10, wall_t]);\n');
+  });
+
+  test('Visible scopes: a module\'s own variables, and an included file\'s', async ({ scad }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'scadstudio-m11-scopes-'));
+    writeFileSync(join(dir, 'sizes.scad'), '// Wall thickness\nwall = 2;\nside = 12;\n');
+    const doc = join(dir, 'box.scad');
+    writeFileSync(doc, 'include <sizes.scad>\n\nside = 20;\n\nmodule box(h = 5) {\n    inner = side - 2 * wall;\n    lid = 1;\n    difference() { cube([side, side, h]); translate([wall, wall, lid]) cube([inner, inner, h]); }\n}\n\nbox();\n');
+    await scad.stubDialogs({ open: doc });
+    await scad.rendersAfter(() => scad.button('Open .scad file...').click());
+    const vars = scad.page.getByRole('complementary', { name: 'Variables' });
+    // The included file's variables, read-only, with the override called out.
+    const included = vars.getByRole('region', { name: 'Variables from sizes.scad' });
+    await expect(included.getByTestId('variable-wall')).toContainText('used on lines');
+    await expect(included.getByLabel('Variable wall', { exact: true })).toBeDisabled();
+    await expect(included.getByTestId('variable-side')).toContainText('Assigned again in this file (line 3)');
+    await expect(vars.getByRole('region', { name: 'Variables inside box()' })).toHaveCount(0);
+
+    // The cursor inside box(): its parameter and local variables appear.
+    await scad.clickEditorLine(7);
+    const inside = vars.getByRole('region', { name: 'Variables inside box()' });
+    await expect(inside.getByTestId('parameter-h')).toContainText('5');
+    await expect(inside.getByTestId('variable-inner')).toContainText('used on line 8');
+    await scad.resetView();
+    await shot(scad, '9-scopes');
+    await scad.rendersAfter(async () => {
+      await inside.getByLabel('Variable lid', { exact: true }).fill('2');
+      await inside.getByLabel('Variable lid', { exact: true }).press('Enter');
+    });
+    expect(await scad.source()).toContain('    lid = 2;\n');
+    // Renaming a local touches only the module.
+    await inside.getByRole('button', { name: 'inner' }).click();
+    await scad.rendersAfter(async () => {
+      await inside.getByLabel('New name for inner').fill('hollow');
+      await inside.getByLabel('New name for inner').press('Enter');
+    });
+    expect(await scad.source()).toContain('    hollow = side - 2 * wall;');
+    expect(await scad.source()).toContain('cube([hollow, hollow, h])');
+  });
+});

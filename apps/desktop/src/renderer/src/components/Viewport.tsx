@@ -41,6 +41,7 @@ const SEE_THROUGH_BASE_OPACITY = 0.45;
 const SKETCH_HANDLE_ACTIVE_COLOR = '#ffffff';
 const SKETCH_OVERLAY_RENDER_ORDER = 999;
 import { transformToQuaternion, quaternionToRotateDeg, type NodeTransform, type Modifier } from '../targetedPatch';
+import { gizmoAxes } from '../gizmoLocks';
 import {
   snapSketchPoint,
   extractOnPlaneGeometry,
@@ -206,6 +207,9 @@ interface ViewportProps {
   flashToken?: number;
   overlay?: ReactNode;
   editable?: boolean;
+  // M11: the selected part's translate axes that drag by moving a
+  // position variable (linkedDrag.ts).
+  freeAxes?: readonly boolean[];
   // Drilled into a difference(): its first child (the base) is drawn
   // see-through and a click that passes through it picks the cutter behind
   // it, so subtracted shapes inside the base can be seen and selected.
@@ -1095,6 +1099,7 @@ export function Viewport({
   flashToken,
   overlay,
   editable = true,
+  freeAxes,
   cuttersFirst = false,
 }: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
@@ -1125,6 +1130,8 @@ export function Viewport({
   const [snapHover, setSnapHover] = useState<SnapResult | null>(null);
   // The gizmo only ever targets one object — the most recently selected one.
   const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
+  const primaryMesh = meshes.find((m) => m.index === primaryIndex);
+  const primaryAxes = primaryMesh ? gizmoAxes(primaryMesh.transform, primaryMesh.frame, gizmoMode, freeAxes) : null;
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
   const dragStart = useRef<DragSnapshot | null>(null);
   const groupsByIndex = useRef(new Map<number, Group>());
@@ -1369,10 +1376,14 @@ export function Viewport({
             }}
           />
         )}
-        {transformTarget && !activeSketchPlane && editable && meshes.find((m) => m.index === primaryIndex)?.transformEditable !== false && (
+        {transformTarget && !activeSketchPlane && editable && primaryMesh?.transformEditable !== false && primaryAxes?.visible !== false && (
           <TransformControls
             object={transformTarget}
             mode={gizmoMode}
+            // M11: axes written as expressions have no handles (gizmoLocks.ts).
+            showX={primaryAxes?.show[0] ?? true}
+            showY={primaryAxes?.show[1] ?? true}
+            showZ={primaryAxes?.show[2] ?? true}
             // Translate stays world-space (moving "up" should mean world-up
             // even for a rotated object — the usual 3D-tool convention).
             // Scale stays local-only: OpenSCAD's scale() is always a plain

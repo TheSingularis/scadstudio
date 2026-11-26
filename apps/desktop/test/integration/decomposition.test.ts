@@ -53,6 +53,15 @@ describe('decomposed render + transform matches the full OpenSCAD render (M3-M5)
     await expectDecompositionMatches(statement);
   });
 
+  it.each([
+    'translate([w + gap, -w / 2, 0]) cube([1, 2, 3]);',
+    'translate([w, 0, 0]) rotate([0, 0, angle]) scale([k, 1, k / 2]) cube([1, 2, 3]);',
+    'translate([gap * 2, 0, 0]) mirror([1, 0, 0]) scale([k, 1, 1]) cube([1, 2, 3]);',
+    'rotate([angle, 0, -angle]) translate([twice(gap), 0, 0]) cube([1, 2, 3]);',
+  ])('M11 expression components: %s', async (statement) => {
+    await expectDecompositionMatches(statement, 'w = 12;\ngap = 2.5;\nangle = 30;\nk = 1.5;\nfunction twice(x) = 2 * x;');
+  });
+
   it('custom modules render through the shared context', async () => {
     await expectDecompositionMatches('translate([10, 0, 0]) part(2);', 'module part(s) { cube([s, 2 * s, 3 * s]); }');
   });

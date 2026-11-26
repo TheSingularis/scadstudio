@@ -96,6 +96,28 @@ describe('M8 scoping matches the engine', () => {
   });
 });
 
+describe('M11 included variables', () => {
+  it('lists included files (nested includes too, not uses), and the engine agrees on what the document sees', async () => {
+    const sizes = write('v/sizes.scad', 'side = 4;\ninclude <more.scad>\nuse <tools.scad>\n');
+    const more = write('v/more.scad', 'tall = 6;\n');
+    write('v/tools.scad', 'hidden_var = 9;\nmodule tool() {}\n');
+    write('v/used.scad', 'used_var = 5;\n');
+    await openDocument('v/main.scad', 'include <sizes.scad>\n');
+    const files = (await main.invoke('scad:scanIncludes', 'include <sizes.scad>\nuse <used.scad>\ncube([side, side, tall]);\n')) as { path: string; via: string }[];
+    expect(files.map((f) => [f.path, f.via])).toEqual([
+      [sizes, 'sizes.scad'],
+      [more, 'sizes.scad'],
+    ]);
+    // Included variables, nested ones too, are visible to the document...
+    const stl = (await main.invoke('scad:render', 'include <sizes.scad>\ncube([side, side, tall]);\n')) as Uint8Array;
+    expect(bbox(parseStl(stl)).max).toEqual([4, 4, 6]);
+    // ...a used file's are not: used_var is undef there, and cube(undef)
+    // falls back to the default 1 mm cube instead of 5.
+    const used = (await main.invoke('scad:render', 'use <used.scad>\ncube(used_var);\n')) as Uint8Array;
+    expect(bbox(parseStl(used)).max).toEqual([1, 1, 1]);
+  });
+});
+
 describe('M8 library watching', () => {
   async function waitForSend(channel: string, since: number, timeout = 8000): Promise<boolean> {
     const deadline = Date.now() + timeout;

@@ -132,3 +132,44 @@ export async function scanModuleSources(
 
   return { files: [...files.values()], watchPaths: [...watch] };
 }
+
+// M11: a file the document `include`s (directly, or through another
+// include), whose top-level variables the document can read: an include is
+// pasted text. Files reached through `use` are left out, because `use`
+// doesn't share variables.
+export interface IncludedFile {
+  path: string;
+  contents: string;
+  // The `include <...>` text in the document that brings it in.
+  via: string;
+}
+
+export async function scanIncludes(
+  source: string,
+  documentDir: string | null,
+  libraryDirs: string[],
+  read: (hostPath: string) => Promise<string | null> = readIfFile,
+): Promise<IncludedFile[]> {
+  const out: IncludedFile[] = [];
+  const seen = new Set<string>();
+  const resolve = async (rel: string, dir: string | null) => {
+    for (const candidate of resolutionCandidates(rel, dir, libraryDirs)) {
+      const contents = await read(candidate);
+      if (contents !== null) return { path: candidate, contents };
+    }
+    return null;
+  };
+  const visit = async (text: string, dir: string | null, via: string | null) => {
+    for (const d of scadDirectives(text)) {
+      if (d.kind !== 'include' || out.length >= MAX_FILES) continue;
+      const found = await resolve(d.path, dir);
+      if (!found || seen.has(found.path)) continue;
+      seen.add(found.path);
+      const v = via ?? d.path;
+      out.push({ ...found, via: v });
+      await visit(found.contents, path.dirname(found.path), v);
+    }
+  };
+  await visit(source, documentDir, null);
+  return out;
+}

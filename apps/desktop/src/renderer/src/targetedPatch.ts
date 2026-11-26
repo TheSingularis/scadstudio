@@ -1,6 +1,7 @@
 import type { Node, Tree } from 'web-tree-sitter';
 import { Euler, Quaternion } from 'three';
 import type { SceneNode } from './sceneGraph';
+import { evaluateNumber } from './scadExpr';
 
 const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
@@ -29,6 +30,25 @@ export interface NodeTransform {
   // A fourth component is color()'s alpha, kept so an edit never drops it
   // from the file (QC audit M2).
   color: ColorVector | null;
+  // M11: the source text of components written as expressions
+  // (`translate([base_w + gap, 0, 0])`), null for a literal number. The
+  // numbers above are what the expressions come to (scadExpr.ts), so the
+  // node still gets a real three.js transform; the gizmo leaves these axes
+  // alone and patchTransform writes the text back unchanged. Absent when
+  // every component is a literal. When a commit passes it, it says exactly
+  // what each component becomes (the Position fields use that to set or
+  // detach an expression).
+  exprs?: TransformExprs;
+}
+
+export interface TransformExprs {
+  translate: (string | null)[];
+  rotateDeg: (string | null)[];
+  scale: (string | null)[];
+}
+
+export function hasExprs(e: TransformExprs | undefined): boolean {
+  return !!e && [...e.translate, ...e.rotateDeg, ...e.scale].some((x) => x !== null);
 }
 
 export type ColorVector = [number, number, number] | [number, number, number, number];
@@ -70,6 +90,9 @@ export interface VectorCall {
   xyz: [number, number, number];
   // Fourth component when the vector has exactly four (color's alpha).
   w: number | null;
+  // M11: per component, the expression's text when it isn't a literal
+  // number (its value is in xyz), else null.
+  texts: (string | null)[];
 }
 
 // The concrete statement node (module_instantiation, block, ...) whose
@@ -131,7 +154,7 @@ function readNumber(n: Node | null): number | null {
   return null;
 }
 
-export function readVectorCall(call: Node): VectorCall | null {
+export function readVectorCall(call: Node, allowExpressions = true): VectorCall | null {
   const name = call.childForFieldName('name')?.text;
   if (!name) return null;
   const args = call.childForFieldName('arguments')?.namedChild(0); // `arguments` node
@@ -142,9 +165,24 @@ export function readVectorCall(call: Node): VectorCall | null {
   if (!vec || vec.type !== 'vector_expression') return null;
   const count = vec.namedChildCount;
   if (count !== 3 && !(count === 4 && name === 'color')) return null;
-  const nums = Array.from({ length: count }, (_, n) => readNumber(vec.namedChild(n)));
-  if (nums.some((n) => n === null)) return null;
-  return { name, xyz: nums.slice(0, 3) as [number, number, number], w: count === 4 ? nums[3] : null };
+  const texts: (string | null)[] = [];
+  const nums: (number | null)[] = [];
+  for (let n = 0; n < count; n++) {
+    const component = vec.namedChild(n);
+    const literal = readNumber(component);
+    if (literal !== null) {
+      nums.push(literal);
+      texts.push(null);
+      continue;
+    }
+    // M11: a component written as an expression the evaluator can work
+    // out (it reads only the file's own top-level variables and functions).
+    const value = allowExpressions && component ? evaluateNumber(component) : null;
+    if (value === null) return null;
+    nums.push(value);
+    texts.push(component!.text);
+  }
+  return { name, xyz: nums.slice(0, 3) as [number, number, number], w: count === 4 ? nums[3] : null, texts };
 }
 
 export interface DecomposedNode {
@@ -200,7 +238,9 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   // a brace-form wrap like `translate(v) { ... }` leaves behind once a gizmo
   // drag returns it to identity). It has no wraps of its own; the block is
   // its own primitive, so it can still be moved and wrapped.
-  if (top.type === 'block') {
+  // M11: a for loop (a pattern) likewise is its own primitive, so the gizmo
+  // can move the whole pattern by giving it a translate().
+  if (top.type === 'block' || top.type === 'for_statement') {
     return {
       transform: { ...IDENTITY_TRANSFORM },
       primitiveStart: top.startIndex,
@@ -211,6 +251,7 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   if (top.type !== 'module_instantiation') return null;
 
   const transform: NodeTransform = { translate: [0, 0, 0], rotateDeg: [0, 0, 0], scale: [1, 1, 1], color: null };
+  const exprs: TransformExprs = { translate: [null, null, null], rotateDeg: [null, null, null], scale: [null, null, null] };
   const mirrorSign: [number, number, number] = [1, 1, 1];
   let sawColor = false;
   let sawScale = false;
@@ -251,8 +292,13 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
     else if (last?.type === 'block') next = last;
     if (!next) break;
 
-    const vc = readVectorCall(current);
+    // color() and mirror() are rewritten from their numbers, so they're
+    // only consumed when literal; an expression there stops the walk.
+    const vc = readVectorCall(current, name !== 'color' && name !== 'mirror');
     if (!vc) break;
+    // An expression scale that comes out negative would be written back as
+    // mirror() plus the expression, flipping twice.
+    if (name === 'scale' && vc.texts.some((t, i) => t !== null && vc.xyz[i] < 0)) break;
     if (name === 'color') {
       if (sawColor) break; // a second color() wrap is unusual; stop rather than guess which wins
       transform.color = vc.w === null ? vc.xyz : [...vc.xyz, vc.w];
@@ -265,13 +311,19 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
     } else if (name === 'scale') {
       if (sawScale || rank < lastRank) break;
       transform.scale = vc.xyz;
+      exprs.scale = vc.texts.slice(0, 3);
       sawScale = true;
       lastRank = rank;
     } else {
       // translate / rotate: each at most once, and only in canonical order.
       if (rank <= lastRank) break;
-      if (name === 'translate') transform.translate = vc.xyz;
-      else transform.rotateDeg = vc.xyz;
+      if (name === 'translate') {
+        transform.translate = vc.xyz;
+        exprs.translate = vc.texts.slice(0, 3);
+      } else {
+        transform.rotateDeg = vc.xyz;
+        exprs.rotateDeg = vc.texts.slice(0, 3);
+      }
       lastRank = rank;
     }
 
@@ -279,6 +331,7 @@ export function decomposeNode(root: Node, node: SceneNode): DecomposedNode | nul
   }
 
   transform.scale = transform.scale.map((v, i) => v * mirrorSign[i]) as [number, number, number];
+  if (hasExprs(exprs)) transform.exprs = exprs;
   // If the loop above never advanced past `top` (no translate/rotate/etc.
   // wrap to walk through — e.g. a bare `%cube(10);`), `current` is still
   // `top` itself, whose startIndex is the modifier's position, not the
@@ -387,12 +440,20 @@ const MIRROR_AXIS_VECTORS: [number, number, number][] = [
 // `baseIndent` is the indentation of the line the wrapped statement starts
 // on, so a nested statement's wraps continue one level in from *it*, not
 // from column 0 (M9: statements inside a boolean or a module body).
+function formatComponents(values: readonly number[], texts: readonly (string | null)[] | undefined): string {
+  return `[${values.map((v, i) => texts?.[i] ?? formatNumber(v)).join(', ')}]`;
+}
+
 function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
   const WRAP_SEPARATOR = `\n${baseIndent}    `;
+  const e = t.exprs;
+  const anyText = (texts: readonly (string | null)[] | undefined) => !!texts?.some((x) => x !== null);
   let prefix = '';
   if (t.color) prefix += `color(${formatVector(t.color)})${WRAP_SEPARATOR}`;
-  if (t.translate.some((v) => v !== 0)) prefix += `translate(${formatVector(t.translate)})${WRAP_SEPARATOR}`;
-  if (t.rotateDeg.some((v) => v !== 0)) prefix += `rotate(${formatVector(t.rotateDeg)})${WRAP_SEPARATOR}`;
+  // An expression component keeps its wrap even when it comes to the
+  // identity value (`translate([gap, 0, 0])` with gap = 0).
+  if (anyText(e?.translate) || t.translate.some((v) => v !== 0)) prefix += `translate(${formatComponents(t.translate, e?.translate)})${WRAP_SEPARATOR}`;
+  if (anyText(e?.rotateDeg) || t.rotateDeg.some((v) => v !== 0)) prefix += `rotate(${formatComponents(t.rotateDeg, e?.rotateDeg)})${WRAP_SEPARATOR}`;
   // Negative scale components are written back out as real mirror() calls
   // rather than a literal negative scale() — see NodeTransform.scale's
   // comment for why they're equivalent and why source should read as
@@ -404,8 +465,25 @@ function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
       absScale[axis] = -t.scale[axis];
     }
   }
-  if (absScale.some((v) => v !== 1)) prefix += `scale(${formatVector(absScale)})${WRAP_SEPARATOR}`;
+  if (anyText(e?.scale) || absScale.some((v) => v !== 1)) prefix += `scale(${formatComponents(absScale, e?.scale)})${WRAP_SEPARATOR}`;
   return prefix;
+}
+
+// M11 patterns: the node's placement split in two, so copies can step
+// along world axes between them: `outer` is color() and translate(),
+// `inner` is rotate(), mirror() and scale().
+export function transformPrefixParts(t: NodeTransform, baseIndent = ''): { outer: string; inner: string } {
+  const none = [null, null, null];
+  const e = t.exprs;
+  const outer = formatTransformPrefix(
+    { ...t, rotateDeg: [0, 0, 0], scale: [1, 1, 1], exprs: e && { translate: e.translate, rotateDeg: none, scale: none } },
+    baseIndent,
+  );
+  const inner = formatTransformPrefix(
+    { ...t, translate: [0, 0, 0], color: null, exprs: e && { translate: none, rotateDeg: e.rotateDeg, scale: e.scale } },
+    baseIndent,
+  );
+  return { outer, inner };
 }
 
 // The targeted-patch loop: given a gizmo drag's *final* absolute transform
@@ -416,12 +494,15 @@ function formatTransformPrefix(t: NodeTransform, baseIndent = ''): string {
 // edit. Identity components are omitted entirely (no `rotate([0,0,0])`
 // clutter). Only the wrap prefix is replaced — the primitive's own text,
 // comments, and formatting are always preserved untouched.
-export function patchTransform(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): string {
+export function transformEdit(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): { start: number; end: number; text: string } | null {
   const decomposed = decomposeNode(tree.rootNode, node);
-  if (!decomposed) return source;
+  if (!decomposed) return null;
   const baseIndent = lineIndentAt(source, decomposed.wrapStart);
   const separator = `\n${baseIndent}    `;
-  let prefix = formatTransformPrefix(transform, baseIndent);
+  // M11: a commit that doesn't say what the expression components become
+  // (a gizmo drag) keeps them as written; the gizmo doesn't move those axes.
+  const written = transform.exprs ? transform : { ...transform, exprs: decomposed.transform.exprs };
+  let prefix = formatTransformPrefix(written, baseIndent);
   // Brace form keeps its brace on the wrap's own line:
   // `translate([40, 0, 0]) { ... }`, not a `{` alone on the next line.
   if (decomposed.primitiveNode.type === 'block' && prefix.endsWith(separator)) {
@@ -433,7 +514,12 @@ export function patchTransform(source: string, tree: Tree, node: SceneNode, tran
   if (decomposed.primitiveNode.type === 'block' && prefix === '' && readModifier(tree.rootNode, node)) {
     prefix = 'union() ';
   }
-  return source.slice(0, decomposed.wrapStart) + prefix + source.slice(decomposed.primitiveStart);
+  return { start: decomposed.wrapStart, end: decomposed.primitiveStart, text: prefix };
+}
+
+export function patchTransform(source: string, tree: Tree, node: SceneNode, transform: NodeTransform): string {
+  const edit = transformEdit(source, tree, node, transform);
+  return edit ? source.slice(0, edit.start) + edit.text + source.slice(edit.end) : source;
 }
 
 export interface PrimitiveArg {

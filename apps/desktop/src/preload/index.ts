@@ -25,6 +25,13 @@ export interface ModuleSourceFile {
   useDirective: string | null;
 }
 
+// M11: a file the document includes (see src/main/moduleSources.ts).
+export interface IncludedFile {
+  path: string;
+  contents: string;
+  via: string;
+}
+
 // M15: a font text() can use (see the main process's fonts:list).
 export interface FontListEntry {
   family: string;
@@ -49,6 +56,7 @@ const api = {
   setDirty: (dirty: boolean): void => ipcRenderer.send('scad:setDirty', dirty),
   closeAfterSave: (): void => ipcRenderer.send('scad:closeAfterSave'),
   scanModules: (source: string): Promise<ModuleSourceFile[]> => ipcRenderer.invoke('scad:scanModules', source),
+  scanIncludes: (source: string): Promise<IncludedFile[]> => ipcRenderer.invoke('scad:scanIncludes', source),
   // M15: fonts for the Text panel; `refresh` re-reads installed fonts.
   listFonts: (source: string, refresh = false): Promise<FontListEntry[]> => ipcRenderer.invoke('fonts:list', source, refresh),
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
