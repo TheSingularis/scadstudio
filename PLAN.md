@@ -250,7 +250,7 @@ The alternative, keeping M13 before all of M10 (the 2026-10-16 order), was consi
 
 The sketch items "v1 scope detail" lists that M7.5 did not build, plus M7.5's deferred list, had no milestone. Jordan decided on 2026-11-26 that they become their own milestone after v1: **M17 — Sketch tools, round 2** (see the milestone list).
 
-### Sketch mode follow-ups (raised by Jordan, 2026-11-26; held until after M10a–M10f and M13)
+### Sketch mode follow-ups (raised and decided by Jordan, 2026-11-26; two small fixes in M10b, the rest after v1)
 
 After hand-testing sketch tools, save and undo (all fine), Jordan listed four things sketch mode still needs. He asked for the larger ones to be **held until the current rework (M10a–M10f and M13) is done**.
 
