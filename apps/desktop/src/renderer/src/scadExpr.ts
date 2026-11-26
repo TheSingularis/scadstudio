@@ -313,7 +313,7 @@ const OPERATORS: Record<string, string> = {
   logical_or_operator: '||',
 };
 
-function operatorOf(node: Node): string {
+export function operatorOf(node: Node): string {
   const op = node.childForFieldName('operator');
   if (op) return OPERATORS[op.type] ?? op.text;
   // Fallback: the unnamed operator token between the operands.

@@ -63,6 +63,24 @@ describe('M11 relate tools (engine-checked)', () => {
     expect((await boxOf(grown)).max[0]).toBeCloseTo(71, 1);
   });
 
+  it('Distance attaches the other axes: the sphere follows the cube in every direction', async () => {
+    const plan = await relate(base, { axis: 0, moveEdge: 'min', referenceEdge: 'max', offsetText: '5', offsetName: 'gap', attach: true });
+    expect(plan.newVariables.map((v) => v.name)).toEqual(['cube_x', 'cube_y', 'cube_z', 'cube_width', 'sphere_r', 'gap']);
+    expect(plan.source).toContain('translate([cube_x, cube_y, cube_z])\n    cube([cube_width, 20, 10]);');
+    expect(plan.source).toContain('translate([cube_x + cube_width + gap + sphere_r, cube_y + 5, cube_z])');
+    // Moving the cube's position variables moves the sphere the same way.
+    let moved = plan.source;
+    for (const [name, value] of [['cube_x', '10'], ['cube_y', '-4'], ['cube_z', '3']]) {
+      const v = readVariables((await parse(moved)).rootNode).find((x) => x.name === name)!;
+      moved = setVariableValue(moved, v, value);
+    }
+    expect(await translateOf(moved, 0)).toEqual([10, -4, 3]);
+    expect(await translateOf(moved, 1)).toEqual([53, 1, 3]);
+    const box = await boxOf(moved);
+    expect(box.min[2]).toBeCloseTo(-5, 0);
+    expect(box.max[0]).toBeCloseTo(61, 1);
+  });
+
   it('without follow, the numbers are copied', async () => {
     const plan = await relate(base, { axis: 0, moveEdge: 'min', referenceEdge: 'max', offsetText: '5', follow: false });
     expect(plan.newVariables).toEqual([]);

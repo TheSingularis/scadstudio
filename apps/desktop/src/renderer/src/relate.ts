@@ -29,6 +29,12 @@ export interface RelateRequest {
   // Name the offset as a variable (e.g. `gap`), or null to write it inline.
   offsetName: string | null;
   follow: boolean;
+  // Distance with follow (Jordan, 2026-11-26): the parts are locked
+  // together on every axis, not only the constrained one. The Move part's
+  // other two translate components become the reference's position plus
+  // today's offset, so dragging either part in any direction carries the
+  // other (see gizmoLocks.ts). Align leaves the other axes alone.
+  attach?: boolean;
   measureMove: () => { min: number[]; max: number[] } | null;
   measureReference: () => { min: number[]; max: number[] } | null;
 }
@@ -137,19 +143,48 @@ export function planRelate(source: string, tree: Tree, req: RelateRequest): Rela
   const used = new Set(result.terms.map((t) => t.term.text));
 
   const edits: TextEdit[] = [];
-  if (refTranslateName && used.has(refTranslateName)) {
-    newVariables.push({ name: refTranslateName, valueText: tNode ? tNode.text.trim() : '0' });
-    if (tNode) {
-      edits.push({ start: tNode.startIndex, end: tNode.endIndex, text: refTranslateName });
-    } else {
-      // No translate() yet: give the reference one that reads the variable.
-      const t = b.decomposed.transform;
-      const exprs = copyExprs(t);
-      exprs.translate[k] = refTranslateName;
-      const edit = transformEdit(source, tree, req.reference, { ...t, exprs });
-      if (!edit) return { ok: false, reason: 'The reference part has no position the app can edit.' };
-      edits.push(edit);
+  // The reference's translate components to name: axis k when the
+  // expression reads it, plus the other two when attaching.
+  const refNames: (string | null)[] = [null, null, null];
+  if (refTranslateName && used.has(refTranslateName)) refNames[k] = refTranslateName;
+  // Attach: the Move part's other axes, as reference position + offset.
+  const attached: (string | null)[] = [null, null, null];
+  const at = a.decomposed.transform;
+  if (req.follow && req.attach) {
+    for (const j of [0, 1, 2] as const) {
+      if (j === k) continue;
+      // Already set by an expression (an earlier constraint): keep it.
+      if (at.exprs?.translate[j]) continue;
+      const jNode = b.axes[j].translate.node;
+      const jValue = b.axes[j].translate.value;
+      let ref: Lin;
+      if (jNode && !NUMBER.test(jNode.text)) {
+        ref = linOf(jNode);
+      } else {
+        const name = nameFor(`${b.callName ?? 'part'}_${AXIS[j]}`);
+        refNames[j] = name;
+        ref = fromTerm(term(name, jValue));
+      }
+      const d = Math.round((at.translate[j] - jValue) * 1e6) / 1e6;
+      attached[j] = format(d === 0 ? ref : add(ref, constant(d)));
     }
+  }
+  const refT = b.decomposed.transform;
+  const hasRefTranslate = [0, 1, 2].some((j) => b.axes[j].translate.node !== null);
+  for (const j of [0, 1, 2] as const) {
+    const name = refNames[j];
+    if (!name) continue;
+    const jNode = b.axes[j].translate.node;
+    newVariables.push({ name, valueText: jNode ? jNode.text.trim() : String(refT.translate[j]) });
+    if (jNode) edits.push({ start: jNode.startIndex, end: jNode.endIndex, text: name });
+  }
+  if (!hasRefTranslate && refNames.some((n) => n !== null)) {
+    // No translate() yet: give the reference one that reads the variables.
+    const exprs = copyExprs(refT);
+    for (const j of [0, 1, 2] as const) if (refNames[j]) exprs.translate[j] = refNames[j];
+    const edit = transformEdit(source, tree, req.reference, { ...refT, exprs });
+    if (!edit) return { ok: false, reason: 'The reference part has no position the app can edit.' };
+    edits.push(edit);
   }
   for (const { name, node } of [...tentative.values()].sort((x, y) => x.node.startIndex - y.node.startIndex)) {
     if (!used.has(name)) continue;
@@ -161,9 +196,10 @@ export function planRelate(source: string, tree: Tree, req: RelateRequest): Rela
   // The Move part's translate component becomes the expression. Its own
   // promoted sizes sit inside its primitive, after the prefix this edit
   // replaces, so the edits never overlap.
-  const t = a.decomposed.transform;
+  const t = at;
   const exprs = copyExprs(t);
   exprs.translate[k] = expression;
+  for (const j of [0, 1, 2] as const) if (attached[j]) exprs.translate[j] = attached[j];
   const translate = [...t.translate] as [number, number, number];
   const v = value(result);
   if (Number.isFinite(v)) translate[k] = v;

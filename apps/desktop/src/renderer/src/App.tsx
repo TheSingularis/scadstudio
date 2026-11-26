@@ -69,6 +69,7 @@ import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleI
 import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
 import { findOption, fontGroups, isFontAvailable, type FontEntry } from './fontOptions';
 import { SettingsDialog, type EditorFontSettings } from './components/SettingsDialog';
+import { drivenAxes, positionAnchors } from './linkedDrag';
 import { VariablesPanel, type IncludedSection, type ModuleSection, type VariableScope } from './components/VariablesPanel';
 import { ToolPanel, type ToolState } from './components/ToolPanel';
 import {
@@ -402,6 +403,8 @@ export function App() {
   const [editingSketchIndex, setEditingSketchIndex] = useState<number | null>(null);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
+  const nodeMeshesRef = useRef(nodeMeshes);
+  nodeMeshesRef.current = nodeMeshes;
   // See Viewport.tsx's SelectMode/ViewportProps.selectedIndices comments for
   // ordering. The last entry is the "primary" selection that gizmo/mirror/
   // color/parameter-panel editing (all single-target operations) act on.
@@ -1277,7 +1280,29 @@ export function App() {
       const tree = treeRef.current;
       const node = sceneNodesRef.current.find((n) => n.index === index);
       if (!tree || !node) return;
-      const patched = patchTransform(sourceRef.current, tree, node, transform);
+      let patched = patchTransform(sourceRef.current, tree, node, transform);
+      // M11 linked drag: an expression axis that moves with a position
+      // variable moves that variable, so the linked parts come along.
+      const mesh = nodeMeshesRef.current.find((m) => m.index === index);
+      if (mesh?.transform.exprs) {
+        const anchors = positionAnchors(readVariables(tree.rootNode), nodeMeshesRef.current.map((m) => m.transform));
+        const moved = new Map<string, number>();
+        for (const d of drivenAxes(tree, node, mesh.transform, anchors)) {
+          const delta = transform.translate[d.axis] - mesh.transform.translate[d.axis];
+          const base = moved.get(d.anchor.name) ?? Number(d.anchor.display);
+          if (Math.abs(delta) > 1e-9 && Number.isFinite(base)) moved.set(d.anchor.name, base + delta);
+        }
+        if (moved.size > 0) {
+          const parsed = parseScadSync(patched);
+          if (parsed) {
+            const edits = readVariables(parsed.rootNode)
+              .filter((v) => moved.has(v.name))
+              .map((v) => ({ start: v.valueStart, end: v.valueEnd, text: formatNumber(moved.get(v.name)!) }));
+            parsed.delete();
+            patched = applyEdits(patched, edits);
+          }
+        }
+      }
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(patched);
       runRender(patched);
@@ -1807,6 +1832,7 @@ export function App() {
         offsetText: tool.offset,
         offsetName: tool.offsetName.trim() || null,
         follow: tool.follow,
+        attach: tool.kind === 'distance',
         measureMove: measureIndex(tool.move),
         measureReference: measureIndex(tool.reference),
       });
@@ -1815,6 +1841,7 @@ export function App() {
       if (r.plan.measured.reference) notes.push(`${labelOf(tool.reference)} can’t be sized from its code, so its measured size is used: the part follows when it moves, not when it changes size.`);
       if (r.plan.measured.move) notes.push(`${labelOf(tool.move)} is sized from its rendered mesh: if it changes size, its edge won’t stay put.`);
       if (!tool.follow) notes.push('Numbers are copied: the part won’t follow later changes.');
+      else if (tool.kind === 'distance') notes.push('Locked together: drag either part in any direction and the other follows. Change the distance in the Variables panel.');
       return {
         ok: true as const,
         lines: [...r.plan.newVariables.map((v) => `${v.name} = ${v.valueText};`), `${labelOf(tool.move)} → translate ${'XYZ'[tool.axis]} = ${r.plan.expression}`],
@@ -2122,15 +2149,28 @@ export function App() {
   const visibleCustomTools = workingSet?.editingModule ? customTools.filter((t) => t.callName !== workingSet.editingModule) : customTools;
 
   // M11: say why some gizmo handles are missing.
+  // M11 linked drag: the selected part's axes that move a position variable.
+  const primaryDriven = useMemo(() => {
+    const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
+    const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
+    if (!tree || !mesh || !node || readOnly) return [];
+    return drivenAxes(tree, node, mesh.transform, positionAnchors(variables, nodeMeshes.map((m) => m.transform)));
+  }, [tree, nodeMeshes, primarySelectedIndex, variables, readOnly]);
+  const primaryFreeAxes = useMemo(() => [0, 1, 2].map((axis) => primaryDriven.some((d) => d.axis === axis)), [primaryDriven]);
   const lockNote = useMemo(() => {
     const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
     if (!mesh) return null;
-    const axes = gizmoAxes(mesh.transform, mesh.frame, gizmoMode);
-    if (axes.locked.length === 0) return null;
+    const axes = gizmoAxes(mesh.transform, mesh.frame, gizmoMode, primaryFreeAxes);
+    if (axes.locked.length === 0) {
+      if (gizmoMode !== 'translate' || primaryDriven.length === 0) return null;
+      const names = [...new Set(primaryDriven.map((d) => d.anchor.name))];
+      const uses = new Set(primaryDriven.flatMap((d) => d.anchor.uses.map((u) => u.start))).size;
+      return `Linked: dragging moves ${names.join(', ')}, and every part that reads ${names.length > 1 ? 'them' : 'it'} moves too (${uses} use${uses === 1 ? '' : 's'}).`;
+    }
     const what = axes.locked.map((l) => `${'XYZ'[l.axis]} = ${l.text}`).join(', ');
     if (!axes.visible) return `${gizmoMode === 'rotate' ? 'Rotation' : gizmoMode === 'scale' ? 'Scale' : 'Position'} is set by an expression (${what}), so the ${gizmoMode} gizmo is off.`;
     return `${what} (expression): the gizmo moves the other axes.`;
-  }, [nodeMeshes, primarySelectedIndex, gizmoMode]);
+  }, [nodeMeshes, primarySelectedIndex, gizmoMode, primaryFreeAxes, primaryDriven]);
   // Make variable's prompt belongs to one selected part.
   useEffect(() => setMakeVar(null), [primarySelectedIndex]);
 
@@ -2617,6 +2657,13 @@ export function App() {
             <button onClick={() => startTool('align')} aria-pressed={tool?.kind === 'align'} title="Line up one part's edge or center with another's, as an expression that follows it">
               Align
             </button>
+            <span
+              data-testid="constrain-experimental"
+              title="Distance and Align are temporary: they will be redone with a real constraint solver (picking faces, with dimension lines). What they write stays plain OpenSCAD."
+              style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, color: '#e8a05a', border: '1px solid #e8a05a', borderRadius: 3, padding: '0 4px' }}
+            >
+              experimental
+            </span>
             <button onClick={() => startTool('pattern')} aria-pressed={tool?.kind === 'pattern'} title="Copies of a part in a row or around an axis, as a for loop">
               Pattern
             </button>
@@ -2801,6 +2848,7 @@ export function App() {
               flashToken={flashToken}
               overlay={breadcrumb}
               editable={!readOnly && !tool}
+              freeAxes={primaryFreeAxes}
               cuttersFirst={workingSet?.containerCall === 'difference'}
             />
           </ErrorBoundary>

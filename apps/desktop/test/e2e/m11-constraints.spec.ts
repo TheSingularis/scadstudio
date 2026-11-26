@@ -18,11 +18,14 @@ async function shot(scad: ScadApp, name: string) {
 const TWO_PARTS = 'cube([30, 20, 10]);\n\ntranslate([60, 5, 0]) sphere(r = 8, $fn = 32);\n';
 
 test.describe('M11 directional constraints', () => {
-  test('Distance with follow: the sphere keeps its gap when the cube grows', async ({ scad }) => {
+  test('Distance with follow: locked together, the sphere keeps its gap when the cube grows or either part is dragged', async ({ scad }) => {
     await scad.load(TWO_PARTS);
     await scad.button('Distance').click();
     const panel = scad.page.getByRole('region', { name: 'Distance tool' });
     await expect(panel).toBeVisible();
+    // Distance and Align are marked experimental until the solver redoes them.
+    await expect(scad.page.getByTestId('constrain-experimental')).toBeVisible();
+    await expect(panel.getByTestId('tool-experimental')).toHaveText('experimental');
     // Nothing selected: the Move slot is waiting for a click.
     await expect(panel.getByTestId('slot-move')).toHaveAttribute('aria-pressed', 'true');
     await scad.clickEditorLine(3); // the sphere
@@ -36,13 +39,15 @@ test.describe('M11 directional constraints', () => {
     await expect(scad.page.getByTestId('tool-preview')).toContainText('translate X = cube_x + cube_width + gap + sphere_r');
     await shot(scad, '1-distance-panel');
     await scad.rendersAfter(() => panel.getByRole('button', { name: 'Apply' }).click());
+    // Distance locks the parts together on every axis: the sphere's Y and Z
+    // are the cube's position plus today's offset.
     expect(await scad.source()).toBe(
-      'cube_x = 0;\ncube_width = 30;\nsphere_r = 8;\ngap = 5;\n\ntranslate([cube_x, 0, 0])\n    cube([cube_width, 20, 10]);\n\ntranslate([cube_x + cube_width + gap + sphere_r, 5, 0])\n    sphere(r = sphere_r, $fn = 32);\n',
+      'cube_x = 0;\ncube_y = 0;\ncube_z = 0;\ncube_width = 30;\nsphere_r = 8;\ngap = 5;\n\ntranslate([cube_x, cube_y, cube_z])\n    cube([cube_width, 20, 10]);\n\ntranslate([cube_x + cube_width + gap + sphere_r, cube_y + 5, cube_z])\n    sphere(r = sphere_r, $fn = 32);\n',
     );
     await expect(panel).toBeHidden();
     // The variables panel lists what was written.
     const vars = scad.page.getByRole('complementary', { name: 'Variables' });
-    for (const name of ['cube_x', 'cube_width', 'sphere_r', 'gap']) await expect(vars.getByTestId(`variable-${name}`)).toBeVisible();
+    for (const name of ['cube_x', 'cube_y', 'cube_z', 'cube_width', 'sphere_r', 'gap']) await expect(vars.getByTestId(`variable-${name}`)).toBeVisible();
     await shot(scad, '2-applied');
 
     // Grow the cube from the variables panel: the sphere moves with it.
@@ -51,15 +56,39 @@ test.describe('M11 directional constraints', () => {
       await vars.getByLabel('Variable cube_width', { exact: true }).press('Enter');
     });
     expect(await scad.source()).toContain('cube_width = 50;');
-    await scad.clickEditorLine(9); // the sphere's translate
+    await scad.clickEditorLine(11); // the sphere's translate
     const x = scad.page.getByLabel('Position X', { exact: true });
     await expect(x).toHaveValue('cube_x + cube_width + gap + sphere_r');
     await expect(x).toHaveAttribute('title', /comes to 63/);
-    // X is an expression: the gizmo has no X handle, Y and Z still drag.
-    await expect(scad.page.getByTestId('gizmo-lock-note')).toContainText('X = cube_x + cube_width + gap + sphere_r');
-    expect((await scad.axisHandle('x')).count).toBeLessThan(20);
-    expect((await scad.axisHandle('y')).count).toBeGreaterThan(20);
+    // Every axis moves with the cube's position: all three handles drag.
+    await expect(scad.page.getByTestId('gizmo-lock-note')).toContainText('Linked: dragging moves cube_x, cube_y, cube_z');
+    for (const axis of ['x', 'y', 'z'] as const) expect((await scad.axisHandle(axis)).count, `${axis} handle`).toBeGreaterThan(20);
     await shot(scad, '3-cube-grown-sphere-follows');
+
+    // Drag the sphere along Y: both parts move, the expressions stay.
+    const before = await scad.source();
+    const handle = await scad.axisHandle('y');
+    const len = Math.hypot(handle.dx, handle.dy);
+    await scad.rendersAfter(() => scad.dragViewport(handle, { dx: handle.dx + (handle.dx / len) * 80, dy: handle.dy + (handle.dy / len) * 80 }));
+    const afterSphere = await scad.source();
+    const cubeY = Number(afterSphere.match(/^cube_y = (-?[\d.]+);$/m)![1]);
+    expect(cubeY).not.toBe(0);
+    expect(afterSphere.replace(/^cube_y = .*$/m, 'cube_y = 0;')).toBe(before);
+
+    // Drag the cube along X: the sphere comes along, keeping the gap.
+    await scad.clickEditorLine(8); // the cube
+    await expect(scad.page.getByTestId('gizmo-lock-note')).toContainText('Linked: dragging moves cube_x, cube_y, cube_z');
+    const hx = await scad.axisHandle('x');
+    const lx = Math.hypot(hx.dx, hx.dy);
+    await scad.rendersAfter(() => scad.dragViewport(hx, { dx: hx.dx + (hx.dx / lx) * 80, dy: hx.dy + (hx.dy / lx) * 80 }));
+    const afterCube = await scad.source();
+    // (The handle's screen direction is measured from the viewport centre,
+    // not the gizmo, so only the change is checked, not its sign.)
+    expect(Number(afterCube.match(/^cube_x = (-?[\d.]+);$/m)![1])).not.toBe(0);
+    expect(afterCube).toContain('translate([cube_x, cube_y, cube_z])\n    cube([cube_width, 20, 10]);');
+    expect(afterCube).toContain('translate([cube_x + cube_width + gap + sphere_r, cube_y + 5, cube_z])');
+    await scad.resetView();
+    await shot(scad, '3b-dragged-together');
   });
 
   test('Align centers, and Position accepts an expression or a number', async ({ scad }) => {

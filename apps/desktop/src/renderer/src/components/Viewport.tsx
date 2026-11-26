@@ -207,6 +207,9 @@ interface ViewportProps {
   flashToken?: number;
   overlay?: ReactNode;
   editable?: boolean;
+  // M11: the selected part's translate axes that drag by moving a
+  // position variable (linkedDrag.ts).
+  freeAxes?: readonly boolean[];
   // Drilled into a difference(): its first child (the base) is drawn
   // see-through and a click that passes through it picks the cutter behind
   // it, so subtracted shapes inside the base can be seen and selected.
@@ -1096,6 +1099,7 @@ export function Viewport({
   flashToken,
   overlay,
   editable = true,
+  freeAxes,
   cuttersFirst = false,
 }: ViewportProps) {
   // `!` ("show only this") — real OpenSCAD discards everything else from the
@@ -1127,7 +1131,7 @@ export function Viewport({
   // The gizmo only ever targets one object — the most recently selected one.
   const primaryIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const primaryMesh = meshes.find((m) => m.index === primaryIndex);
-  const primaryAxes = primaryMesh ? gizmoAxes(primaryMesh.transform, primaryMesh.frame, gizmoMode) : null;
+  const primaryAxes = primaryMesh ? gizmoAxes(primaryMesh.transform, primaryMesh.frame, gizmoMode, freeAxes) : null;
   const orbitControlsRef = useRef<OrbitControlsImpl>(null);
   const dragStart = useRef<DragSnapshot | null>(null);
   const groupsByIndex = useRef(new Map<number, Group>());

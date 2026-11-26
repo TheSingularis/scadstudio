@@ -122,6 +122,14 @@ export function ToolPanel(props: ToolPanelProps) {
       <strong>{title}</strong>
       {tool.kind !== 'pattern' ? (
         <>
+          <span
+            role="note"
+            data-testid="tool-experimental"
+            title="Distance and Align will be redone with a real constraint solver (picking faces, with dimension lines). What they write stays plain OpenSCAD and keeps working."
+            style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, color: '#e8a05a', border: '1px solid #e8a05a', borderRadius: 3, padding: '0 4px' }}
+          >
+            experimental
+          </span>
           <SlotButton label="Move" color={SELECTED_MESH_COLOR} part={props.labelOf(tool.move)} active={tool.picking === 'move'} onPick={() => onChange({ ...tool, picking: 'move' })} />
           <SlotButton
             label="Relative to"
