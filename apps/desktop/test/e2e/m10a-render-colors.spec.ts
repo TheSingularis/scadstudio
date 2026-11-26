@@ -10,13 +10,18 @@ import { decodePng } from './png';
 
 const TROPHY = join(DESKTOP_DIR, 'test/fixtures/gag_trophy1.scad');
 
-/** Viewport pixels matching `match`. */
-async function countPixels(scad: ScadApp, match: (r: number, g: number, b: number) => boolean): Promise<number> {
+/**
+ * Viewport pixels matching `match`. `skipBottom` leaves out that many rows
+ * at the bottom, where the progress overlay (with its blue bar) sits.
+ */
+async function countPixels(scad: ScadApp, match: (r: number, g: number, b: number) => boolean, skipBottom = 0): Promise<number> {
   const img = decodePng(await scad.viewportShot());
+  const end = (img.height - skipBottom) * img.width * 4;
   let n = 0;
-  for (let i = 0; i < img.data.length; i += 4) if (match(img.data[i], img.data[i + 1], img.data[i + 2])) n++;
+  for (let i = 0; i < end; i += 4) if (match(img.data[i], img.data[i + 1], img.data[i + 2])) n++;
   return n;
 }
+const OVERLAY_ROWS = 160;
 
 // Goldenrod-ish (yellow-orange, lit or shaded), deep red, and the app's
 // default blue.
@@ -37,8 +42,10 @@ translate([0, 16, 0]) difference() { color("goldenrod") cube(10); color("red") t
     await scad.resetView();
     expect(await countPixels(scad, isGold)).toBeGreaterThan(2000);
     expect(await countPixels(scad, isRed)).toBeGreaterThan(500);
-    // Nothing here is uncolored, so no default blue.
-    expect(await countPixels(scad, isBlue)).toBeLessThan(50);
+    // Nothing here is uncolored, so no default blue (CI's software GL shows
+    // a few dozen blue-ish pixels elsewhere in the scene; a blue part is
+    // thousands).
+    expect(await countPixels(scad, isBlue)).toBeLessThan(300);
     expect(scad.pageErrors).toEqual([]);
   });
 
@@ -95,7 +102,7 @@ translate([0, 16, 0]) difference() { color("goldenrod") cube(10); color("red") t
     await scad.button('Open .scad file...').click();
     await expect(scad.page.getByText('gag_trophy1.scad')).toBeVisible();
     // The cube is gone right away, not shown under the trophy's name.
-    await expect.poll(() => countPixels(scad, isBlue), { timeout: 3000 }).toBeLessThan(50);
+    await expect.poll(() => countPixels(scad, isBlue, OVERLAY_ROWS), { timeout: 3000 }).toBeLessThan(300);
     await expect(progress(scad)).toBeVisible({ timeout: 10_000 });
 
     // Opening the next file doesn't wait for the trophy to finish.
