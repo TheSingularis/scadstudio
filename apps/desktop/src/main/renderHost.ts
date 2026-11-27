@@ -1,4 +1,4 @@
-import { ScadRenderError, type RenderOptions, type RenderStage } from './scadRender';
+import { ScadRenderError, type MeshResult, type RenderOptions, type RenderStage } from './scadRender';
 import { isStageMessage, type RenderRequest, type RenderWorkerMessage } from './renderWorker';
 
 // Runs renders in a separate render process (renderWorker.ts), one at a
@@ -34,7 +34,7 @@ export interface RenderHostOptions {
 
 interface Pending {
   id: number;
-  resolve: (bytes: Uint8Array) => void;
+  resolve: (result: MeshResult) => void;
   reject: (err: Error) => void;
   onStage?: (stage: RenderStage) => void;
 }
@@ -64,6 +64,11 @@ export class RenderHost {
   ) {}
 
   render(source: string, options: RenderOptions = {}, onStage?: (stage: RenderStage) => void): Promise<Uint8Array> {
+    return this.renderResult(source, options, onStage).then((r) => r.bytes);
+  }
+
+  /** M18: like render(), with whether a preview lowered detail and the engine time. */
+  renderResult(source: string, options: RenderOptions = {}, onStage?: (stage: RenderStage) => void): Promise<MeshResult> {
     const generation = this.cancelGeneration;
     const run = this.queue.then(() => {
       // Queued before a Cancel: it is part of what was cancelled.
@@ -115,7 +120,7 @@ export class RenderHost {
       this.pending = null;
       const limit = this.options.recycleAboveBytes;
       if (limit !== undefined && reply.rss > limit) this.retire(child);
-      if (reply.ok) p.resolve(reply.bytes);
+      if (reply.ok) p.resolve({ bytes: reply.bytes, reduced: reply.reduced ?? false, engineMs: reply.engineMs ?? 0, detailFactor: reply.detailFactor ?? 1 });
       else p.reject(new ScadRenderError(reply.message, reply.log));
     });
     child.on('exit', (code) => {
@@ -139,8 +144,8 @@ export class RenderHost {
     p?.reject(err);
   }
 
-  private renderNow(source: string, options: RenderOptions, onStage?: (stage: RenderStage) => void): Promise<Uint8Array> {
-    return new Promise<Uint8Array>((resolve, reject) => {
+  private renderNow(source: string, options: RenderOptions, onStage?: (stage: RenderStage) => void): Promise<MeshResult> {
+    return new Promise<MeshResult>((resolve, reject) => {
       let child: RenderChild;
       try {
         child = this.ensureChild();

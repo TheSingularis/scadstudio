@@ -162,6 +162,19 @@ export class ScadApp {
     await this.page.keyboard.type(text, { delay: 5 });
   }
 
+  /** M18: Settings > Rendering > Quick preview, through the real dialog. */
+  async setQuickPreview(mode: 'auto' | 'always' | 'off'): Promise<void> {
+    await this.button('Settings').click();
+    await this.page.getByLabel('Quick preview').selectOption(mode);
+    await this.button('Close settings').click();
+  }
+
+  /** M18: the viewport's Preview / Full badge ('preview', 'full', or null when hidden). */
+  async renderDetail(): Promise<string | null> {
+    const badge = this.page.getByTestId('render-detail');
+    return (await badge.count()) === 0 ? null : badge.getAttribute('data-detail');
+  }
+
   /** Make Electron's native open/save dialogs return `filePath` without showing UI. */
   async stubDialogs(paths: { open?: string; save?: string }): Promise<void> {
     await this.app.evaluate(({ dialog }, p) => {

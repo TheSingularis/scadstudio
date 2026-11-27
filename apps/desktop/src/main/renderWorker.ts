@@ -1,4 +1,4 @@
-import { renderScadToMesh, ScadRenderError, type RenderOptions, type RenderStage } from './scadRender';
+import { renderScadToMeshResult, ScadRenderError, type RenderOptions, type RenderStage } from './scadRender';
 
 // The OpenSCAD render process (an Electron utilityProcess started by
 // renderHost.ts). OpenSCAD's WASM build runs synchronously, so a render used
@@ -15,7 +15,7 @@ export interface RenderRequest {
 }
 
 export type RenderReply =
-  | { id: number; ok: true; bytes: Uint8Array; rss: number }
+  | { id: number; ok: true; bytes: Uint8Array; reduced: boolean; engineMs: number; detailFactor: number; rss: number }
   | { id: number; ok: false; message: string; log: string[]; rss: number };
 
 // M10a: sent while a render runs, before its reply. Delivered even while the
@@ -34,10 +34,10 @@ export function isStageMessage(message: RenderWorkerMessage): message is RenderS
 
 export async function handleRenderRequest(request: RenderRequest, onStage?: (message: RenderStageMessage) => void): Promise<RenderReply> {
   try {
-    const bytes = await renderScadToMesh(request.source, request.options, {
+    const result = await renderScadToMeshResult(request.source, request.options, {
       onStage: (stage) => onStage?.({ id: request.id, stage }),
     });
-    return { id: request.id, ok: true, bytes, rss: process.memoryUsage().rss };
+    return { id: request.id, ok: true, ...result, rss: process.memoryUsage().rss };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const log = err instanceof ScadRenderError ? err.log : [];

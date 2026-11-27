@@ -44,11 +44,27 @@ export interface FontListEntry {
 export interface AppSettings {
   editorFontFamily: string;
   editorFontSize: number;
+  // M18: see src/main/settings.ts.
+  previewMode: 'auto' | 'always' | 'off';
+  previewSegments: number;
+}
+
+// M18: a render's mesh, whether a preview lowered its curve detail, and the
+// engine time (src/main/scadRender.ts MeshResult).
+export interface MeshResult {
+  bytes: Uint8Array;
+  reduced: boolean;
+  engineMs: number;
+  // A preview: the most any curve's segment count was divided by.
+  detailFactor: number;
 }
 
 const api = {
   // Binary STL with a per-face color trailer (src/main/offMesh.ts).
   renderScad: (source: string): Promise<Uint8Array> => ipcRenderer.invoke('scad:render', source),
+  // M18: a full render (previewSegments null) or a quick preview with curve
+  // detail capped at that many segments.
+  renderMesh: (source: string, previewSegments: number | null): Promise<MeshResult> => ipcRenderer.invoke('scad:renderMesh', source, previewSegments),
   // M10a: stop the render in progress (and any queued behind it).
   cancelRender: (): Promise<boolean> => ipcRenderer.invoke('scad:cancelRender'),
   // M10a: which step the current render is on.
