@@ -7,4 +7,5 @@ What is new since beta-v0.1.6:
 - **Selection over real colors.** A selected part keeps its color, with a tint and an outline in the selection color. Hovering a part lightens it.
 - **Render progress.** A render that takes more than a moment greys out the model on screen and shows a progress bar with the elapsed time, which part it is on, and a Cancel button. Cancel keeps the last finished model.
 - **Opening a file** clears the previous model right away and stops its render.
-- **Camera.** Sketch planes frame the whole model instead of a fixed distance, and finishing a sketch or placing sketch text brings the new shape into view.
+- **Focus (F).** Select a part and press F, or click Focus, to center the view on it without changing the angle.
+- **Camera.** Sketch planes frame the whole model instead of a fixed distance. Leaving sketch mode returns to the view you had before, and a shape you just added (sketch or text) is centered in view.

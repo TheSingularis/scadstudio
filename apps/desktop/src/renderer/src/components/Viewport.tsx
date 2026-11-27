@@ -3,7 +3,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges, Html } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { BufferGeometry, Color, DirectionalLight, SRGBColorSpace, EdgesGeometry, Mesh, MeshStandardMaterial, Vector3, Quaternion, PerspectiveCamera, type Group } from 'three';
+import { Box3, Sphere, BufferGeometry, Color, DirectionalLight, SRGBColorSpace, EdgesGeometry, Mesh, MeshStandardMaterial, Vector3, Quaternion, PerspectiveCamera, type Group } from 'three';
 import { readFaceColors, summarizeFaceColors, vertexColorAttribute } from '../meshColors';
 import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
@@ -264,6 +264,9 @@ interface ViewportProps {
   // parameter) don't yank the camera around. App.tsx changes it only when a
   // genuinely new file is opened or the user explicitly clicks "Reset View".
   fitToken: string;
+  // M10a: frame this node once its mesh is on screen (a shape a sketch just
+  // added or changed). A new token asks again.
+  focusRequest?: FocusRequest | null;
   // M7.5: null outside sketch mode (free orbit, as today). Non-null drives
   // the camera to that plane's canonical view (SketchController) and locks
   // orbit rotation (pan/zoom still work) for the duration — see PLAN.md
@@ -505,7 +508,10 @@ function NodeModel({
 
   return (
     <group
-      ref={(g) => onGroupRef(mesh.index, g)}
+      ref={(g) => {
+        if (g) g.userData.mesh = mesh;
+        onGroupRef(mesh.index, g);
+      }}
       position={mesh.transform.translate}
       quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
       scale={mesh.transform.scale}
@@ -788,10 +794,22 @@ function animateCameraTo(bounds: BoundsApi, target: Vec3, view: CameraView, dist
 
 // Sibling to FitController, same "lives inside <Bounds> for useBounds, fires
 // on prop change only" shape.
-function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSketchPlane | null }) {
+//
+// M10a: entering sketch mode saves the view, and leaving puts it back
+// (it used to reset to the default view, which threw away the user's angle;
+// Jordan, 2026-11-27). A shape added in the sketch is then framed by
+// FocusController once it has rendered.
+function SketchController({ activeSketchPlane, viewApiRef }: { activeSketchPlane: ActiveSketchPlane | null; viewApiRef: RefObject<ViewApi | null> }) {
   const bounds = useBounds();
+  const savedRef = useRef<SavedView | null>(null);
   useEffect(() => {
-    if (!activeSketchPlane) return;
+    if (!activeSketchPlane) {
+      const saved = savedRef.current;
+      savedRef.current = null;
+      if (saved) viewApiRef.current?.restore(saved);
+      return;
+    }
+    if (!savedRef.current) savedRef.current = viewApiRef.current?.snapshot() ?? null;
     const { kind, rotationDeg } = activeSketchPlane;
     const focus = activeSketchPlane.focus ?? activeSketchPlane.origin;
     if (kind !== 'face') {
@@ -811,7 +829,55 @@ function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSket
       { direction: [normal.x, normal.y, normal.z], up: [up.x, up.y, up.z] },
       sketchCameraDistance(bounds, focus),
     );
+    // viewApiRef is a stable ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSketchPlane, bounds]);
+  return null;
+}
+
+// M10a: frame some parts, keeping the view's angle (like Unity's F): the
+// Focus button / F key on the selection, and a shape a sketch just added
+// or changed once its new mesh is on screen. Waits (a few frames at most)
+// for each part's group to hold its current mesh, since the Canvas mounts
+// a new one a frame or so after the meshes change. The box is the parts'
+// world bounds, so their own translate/rotate and any drill-in frame count.
+export interface FocusRequest {
+  token: number;
+  indices: number[];
+}
+function FocusController({
+  request,
+  meshes,
+  groupsByIndex,
+  viewApiRef,
+}: {
+  request: FocusRequest | null;
+  meshes: NodeMesh[];
+  groupsByIndex: RefObject<Map<number, Group>>;
+  viewApiRef: RefObject<ViewApi | null>;
+}) {
+  const pending = useRef<{ indices: number[]; frames: number } | null>(null);
+  useEffect(() => {
+    pending.current = request && request.indices.length > 0 ? { indices: request.indices, frames: 0 } : null;
+  }, [request?.token]); // eslint-disable-line react-hooks/exhaustive-deps
+  useFrame(() => {
+    const p = pending.current;
+    if (!p) return;
+    if (++p.frames > 120) {
+      pending.current = null;
+      return;
+    }
+    const box = new Box3();
+    for (const index of p.indices) {
+      const mesh = meshes.find((m) => m.index === index);
+      const group = groupsByIndex.current?.get(index);
+      if (!mesh || !group || group.userData.mesh !== mesh) return;
+      box.expandByObject(group);
+    }
+    if (box.isEmpty()) return;
+    pending.current = null;
+    viewApiRef.current?.frameBox(box);
+  });
   return null;
 }
 
@@ -827,10 +893,27 @@ const VIEW_STEPS: { step: ViewStep; glyph: string; title: string; dx: number; dy
   { step: 'rollCw', glyph: '↻', title: 'Roll view clockwise 90°', dx: 58, dy: -58 },
 ];
 
+interface SavedView {
+  view: CameraView;
+  target: Vec3;
+  distance: number;
+}
 interface ViewApi {
   orient: (view: CameraView) => void;
   step: (step: ViewStep) => void;
+  // M10a: the view as it is now (or where it's animating to), and a move
+  // back to one saved earlier. Sketch mode saves on entry and restores on
+  // leaving, instead of resetting to the default view.
+  snapshot: () => SavedView;
+  restore: (saved: SavedView) => void;
+  // M10a: keeps the view's direction and centers on `box`, close enough to
+  // fill the view with it (a new sketch shape, after leaving sketch mode).
+  frameBox: (box: Box3) => void;
 }
+
+// How much room frameBox leaves around the box (same as <Bounds margin>).
+const FRAME_MARGIN = 1.2;
+const FRAME_MIN_DISTANCE = 5;
 
 // Bounds' default animation length (its maxDuration prop, left unset below).
 const VIEW_ANIMATION_MS = 1000;
@@ -899,6 +982,22 @@ function ViewController({ apiRef }: { apiRef: RefObject<ViewApi | null> }) {
           up.applyAxisAngle(direction, step === 'rollCw' ? quarter : -quarter);
         }
         go({ direction: [direction.x, direction.y, direction.z], up: [up.x, up.y, up.z] }, target, distance);
+      },
+      snapshot: () => {
+        const { view, target, distance } = current();
+        return { view, target, distance };
+      },
+      restore: (saved) => go(saved.view, saved.target, saved.distance),
+      frameBox: (box) => {
+        const { view } = current();
+        const sphere = box.getBoundingSphere(new Sphere());
+        const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
+        const aspect = camera instanceof PerspectiveCamera ? camera.aspect : 1;
+        // The narrower of the two view angles decides how far back to sit.
+        const halfV = (fov * Math.PI) / 360;
+        const half = Math.min(halfV, Math.atan(Math.tan(halfV) * aspect));
+        const distance = Math.max(FRAME_MIN_DISTANCE, (sphere.radius * FRAME_MARGIN) / Math.sin(half));
+        go(view, [sphere.center.x, sphere.center.y, sphere.center.z], distance);
       },
     };
     return () => {
@@ -1289,6 +1388,7 @@ export function Viewport({
   rotateSpace,
   onTransformCommit,
   fitToken,
+  focusRequest = null,
   activeSketchPlane,
   pickingFace,
   onPickFace,
@@ -1524,8 +1624,9 @@ export function Viewport({
         }
         <Bounds margin={1.2}>
           <FitController fitToken={fitToken} orbitControlsRef={orbitControlsRef} />
-          <SketchController activeSketchPlane={activeSketchPlane} />
+          <SketchController activeSketchPlane={activeSketchPlane} viewApiRef={viewApiRef} />
           <ViewController apiRef={viewApiRef} />
+          <FocusController request={focusRequest} meshes={visibleMeshes} groupsByIndex={groupsByIndex} viewApiRef={viewApiRef} />
           <Center>
             {contextMeshes.map((mesh) => (
               <ContextModel key={mesh.key ?? `ctx-${mesh.index}`} mesh={mesh} shading={shading} />

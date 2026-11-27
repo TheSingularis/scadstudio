@@ -29,6 +29,27 @@ const isGold = (r: number, g: number, b: number) => r > 120 && g > 80 && b < 60 
 const isRed = (r: number, g: number, b: number) => r > 110 && g < 70 && b < 70;
 const isBlue = (r: number, g: number, b: number) => b > 120 && b - r > 60 && b - g > 20;
 
+// Amber (selection color) pixels: how many, and their centroid as a
+// fraction of the viewport (0.5, 0.5 is the center).
+async function amberSpot(scad: ScadApp): Promise<{ n: number; fx: number; fy: number; frac: number }> {
+  const img = decodePng(await scad.viewportShot());
+  let n = 0;
+  let sx = 0;
+  let sy = 0;
+  for (let y = 0; y < img.height; y++) {
+    for (let x = 0; x < img.width; x++) {
+      const i = (y * img.width + x) * 4;
+      const [r, g, b] = [img.data[i], img.data[i + 1], img.data[i + 2]];
+      if (r > 150 && g > 90 && g < 200 && b < 110 && r - b > 90) {
+        n++;
+        sx += x;
+        sy += y;
+      }
+    }
+  }
+  return { n, fx: n ? sx / n / img.width : NaN, fy: n ? sy / n / img.height : NaN, frac: n / (img.width * img.height) };
+}
+
 const progress = (scad: ScadApp) => scad.page.getByTestId('render-progress');
 
 test.describe('M10a render feedback and real colors', () => {
@@ -75,6 +96,87 @@ translate([0, 16, 0]) difference() { color("goldenrod") cube(10); color("red") t
       expect(after).toContain('color("goldenrod")');
       expect(after).toContain('color("#336699", 0.5)');
     }
+    expect(scad.pageErrors).toEqual([]);
+  });
+
+  test('leaving sketch mode returns to the earlier view, and frames a new shape instead of resetting', async ({ scad }) => {
+    // Jordan, 2026-11-27: placing sketch Text reset the whole camera
+    // instead of showing the new text.
+    expect(await scad.load('cube([200, 20, 10]);\n')).toBe('Rendered');
+    await scad.resetView();
+    // Orbit away from the default view (a drag on empty space).
+    await scad.dragViewport({ dx: -200, dy: 220 }, { dx: -130, dy: 220 });
+    await scad.page.waitForTimeout(2000); // orbit damping settles
+    const away = { x: 5, y: 5 }; // keep the pointer off the model (hover lightens it)
+    const v = await scad.viewport();
+    await scad.page.mouse.move(v.x + away.x, v.y + away.y);
+    const before = decodePng(await scad.viewportShot());
+
+    // Exit Sketch with nothing drawn: back to the same view.
+    await scad.button('XY').click();
+    await expect(scad.page.getByText(/Sketching on XY plane/)).toBeVisible();
+    await scad.page.waitForTimeout(1500);
+    await scad.button('Exit Sketch').click();
+    await scad.page.waitForTimeout(1500);
+    await scad.page.mouse.move(v.x + away.x, v.y + away.y);
+    const back = decodePng(await scad.viewportShot());
+    let differ = 0;
+    for (let i = 0; i < before.data.length; i += 4) {
+      if (Math.abs(before.data[i] - back.data[i]) + Math.abs(before.data[i + 1] - back.data[i + 1]) + Math.abs(before.data[i + 2] - back.data[i + 2]) > 60) differ++;
+    }
+    expect(differ, 'pixels that changed after Exit Sketch').toBeLessThan(before.data.length / 4 / 100);
+
+    // Text placed off to one side: once rendered, the view centers on it.
+    await scad.button('XY').click();
+    await scad.page.waitForTimeout(1500);
+    await scad.page.getByRole('group', { name: 'Sketch tools' }).getByRole('button', { name: 'Text' }).click();
+    expect(await scad.rendersAfter(() => scad.clickViewport(-180, 120))).toBe('Rendered');
+    expect(await scad.selectedCall()).toBe('text');
+    await scad.page.waitForTimeout(1500);
+    await scad.page.mouse.move(v.x + away.x, v.y + away.y);
+    const spot = await amberSpot(scad);
+    // The (selected, amber) text fills a good part of the view, centered.
+    expect(spot.frac).toBeGreaterThan(0.015);
+    expect(Math.abs(spot.fx - 0.5)).toBeLessThan(0.12);
+    expect(Math.abs(spot.fy - 0.5)).toBeLessThan(0.12);
+    expect(scad.pageErrors).toEqual([]);
+  });
+
+  test('Focus (button or F) frames the selected part, keeping the view angle', async ({ scad }) => {
+    // Jordan, 2026-11-27: "click a component then press a button like F to
+    // focus the camera view on that part", like Unity's editor.
+    expect(await scad.load('cube([200, 20, 10]);\ntranslate([150, 120, 0]) sphere(5);\n')).toBe('Rendered');
+    await scad.resetView();
+    const v = await scad.viewport();
+    const away = async () => scad.page.mouse.move(v.x + 5, v.y + 5);
+    await scad.clickEditorLine(2);
+    await expect.poll(() => scad.selectedCall()).toBe('sphere');
+    await away();
+    const small = await amberSpot(scad);
+    expect(small.frac).toBeLessThan(0.01);
+
+    await scad.button('Focus').click();
+    await scad.page.waitForTimeout(1500);
+    await away();
+    const framed = await amberSpot(scad);
+    expect(framed.frac).toBeGreaterThan(0.05);
+    expect(Math.abs(framed.fx - 0.5)).toBeLessThan(0.08);
+    expect(Math.abs(framed.fy - 0.5)).toBeLessThan(0.08);
+
+    // F does the same, on the cube now (clicked in the view, so the editor
+    // doesn't have the keyboard).
+    await scad.resetView();
+    await scad.clickEditorLine(1);
+    await expect.poll(() => scad.selectedCall()).toBe('cube');
+    await scad.button('Reset View').focus();
+    await scad.page.keyboard.press('f');
+    await scad.page.waitForTimeout(1500);
+    await away();
+    const cube = await amberSpot(scad);
+    expect(Math.abs(cube.fx - 0.5)).toBeLessThan(0.1);
+    expect(Math.abs(cube.fy - 0.5)).toBeLessThan(0.1);
+    // The key only moved the camera.
+    expect(await scad.source()).toBe('cube([200, 20, 10]);\ntranslate([150, 120, 0]) sphere(5);\n');
     expect(scad.pageErrors).toEqual([]);
   });
 

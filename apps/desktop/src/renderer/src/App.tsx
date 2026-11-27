@@ -10,6 +10,7 @@ import {
   type SelectMode,
   type SketchPlaneKind,
   type ActiveSketchPlane,
+  type FocusRequest,
   SELECTED_MESH_COLOR,
   OPERAND_MESH_COLOR,
   buildGlobalSketchPlane,
@@ -368,6 +369,11 @@ export function App() {
   // on screen before the render (the previous document), so a large part
   // opened with the camera inside it.
   const fitAfterRenderRef = useRef(false);
+  // M10a: set when leaving sketch mode with a new or changed shape. Once it
+  // has rendered, the view frames it (keeping the angle the user had before
+  // the sketch), rather than resetting the whole view (Jordan, 2026-11-27).
+  const focusAfterRenderRef = useRef(false);
+  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
   // M7.5: null outside sketch mode. See Viewport.tsx's ActiveSketchPlane/
   // SketchController for the camera-lock/animate-to-plane behavior this
   // drives. Generalized (slice 3) from a fixed XY/XZ/YZ enum to an arbitrary
@@ -719,13 +725,20 @@ export function App() {
           // otherwise the selection follows its nodes through the edit
           // (nodeIdentity.ts), within one drill-in epoch.
           const prev = prevSetRef.current;
+          const focusIndex = (index: number) => {
+            if (!focusAfterRenderRef.current) return;
+            focusAfterRenderRef.current = false;
+            setFocusRequest((r) => ({ token: (r?.token ?? 0) + 1, indices: [index] }));
+          };
           if (pendingSelectLast.current) {
             pendingSelectLast.current = false;
             setSelectedIndices(set.nodes.length > 0 ? [set.nodes.length - 1] : []);
+            if (set.nodes.length > 0) focusIndex(set.nodes.length - 1);
           } else if (pendingSelectAfterEdit.current !== null) {
             const idx = pendingSelectAfterEdit.current;
             pendingSelectAfterEdit.current = null;
             setSelectedIndices(idx < set.nodes.length ? [idx] : []);
+            if (idx < set.nodes.length) focusIndex(idx);
           } else if (prev && prev.epoch === focusEpochRef.current) {
             const next = remapIndices(prev.fingerprints, set.fingerprints, selectedRef.current);
             setSelectedIndices(next);
@@ -1097,7 +1110,6 @@ export function App() {
     setPickingFace(false);
     setEditingSketchIndex(null);
     resetSketch();
-    setResetViewToken((t) => t + 1);
   }, [resetSketch]);
 
   // M7.5 slice 3: "Pick Face" click → enters the picking-a-face window (free
@@ -1188,10 +1200,9 @@ export function App() {
           if (leave) {
             setActiveSketchPlane(null);
             resetSketch();
-            setResetViewToken((t) => t + 1);
-            // M10a: and again once the new text has rendered, so the view
-            // takes it in without a Reset View (M15 known issue).
-            fitAfterRenderRef.current = true;
+            // M10a: the view goes back to where it was before the sketch,
+            // then frames the new text once it has rendered.
+            focusAfterRenderRef.current = true;
           }
           return;
         }
@@ -1286,9 +1297,7 @@ export function App() {
     runRender(next);
     setActiveSketchPlane(null);
     resetSketch();
-    setResetViewToken((t) => t + 1);
-    // M10a: refit once the new shape has rendered too.
-    fitAfterRenderRef.current = true;
+    focusAfterRenderRef.current = true;
   }, [activeSketchPlane, runRender, resetSketch]);
 
   // M7.5 on-plane editing: the selected node, when it's a sketch this app can
@@ -1342,8 +1351,7 @@ export function App() {
     setActiveSketchPlane(null);
     setEditingSketchIndex(null);
     resetSketch();
-    setResetViewToken((t) => t + 1);
-    fitAfterRenderRef.current = true;
+    focusAfterRenderRef.current = true;
   }, [editingSketchIndex, runRender, resetSketch]);
 
   // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
@@ -2124,12 +2132,23 @@ export function App() {
     const depth = resolvedRef.current?.focus.length ?? 0;
     if (depth > 0) handleStepOut(depth - 1);
   };
+  // M10a: Focus (F, like Unity's editor): frame the selected parts, keeping
+  // the view's angle. With nothing selected, the same as Reset View.
+  const focusSelectionRef = useRef<() => void>(() => {});
+  focusSelectionRef.current = () => {
+    const indices = selectedRef.current.filter((i) => nodeMeshesRef.current.some((m) => m.index === i));
+    if (indices.length === 0) setResetViewToken((t) => t + 1);
+    else setFocusRequest((r) => ({ token: (r?.token ?? 0) + 1, indices }));
+  };
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (e.defaultPrevented) return;
+      const isFocusKey = (e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey;
+      if (e.key !== 'Escape' && !isFocusKey) return;
       const target = e.target as HTMLElement | null;
       if (target?.closest('.monaco-editor, input, textarea, select, [contenteditable="true"]')) return;
-      escapeRef.current();
+      if (isFocusKey) focusSelectionRef.current();
+      else escapeRef.current();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -2424,6 +2443,9 @@ export function App() {
           Save As...
         </button>
         <button onClick={() => setResetViewToken((t) => t + 1)}>Reset View</button>
+        <button onClick={() => focusSelectionRef.current()} title="Frame the selected part, keeping the view angle (F)">
+          Focus
+        </button>
         <button onClick={() => setSettingsOpen(true)} title="Settings (editor font)">
           Settings
         </button>
@@ -2908,6 +2930,7 @@ export function App() {
               rotateSpace={rotateSpace}
               onTransformCommit={handleTransformCommit}
               fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
+              focusRequest={focusRequest}
               activeSketchPlane={activeSketchPlane}
               pickingFace={pickingFace}
               onPickFace={handlePickFace}
