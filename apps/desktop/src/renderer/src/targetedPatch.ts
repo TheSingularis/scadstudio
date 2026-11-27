@@ -793,7 +793,7 @@ const EXTRUDE_DEFAULT_ARGS: Record<WrapOp, string> = {
 // non-Z-axis rotate() wrap ahead of a 2D primitive). So this decomposes the
 // node the same way patchTransform does, and re-emits the wrap prefix
 // ahead of the extrude block instead of inside it.
-export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: WrapOp): string {
+export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: WrapOp, args: string = EXTRUDE_DEFAULT_ARGS[op]): string {
   const decomposed = decomposeNode(root, node);
   const wrapStart = decomposed ? decomposed.wrapStart : node.startIndex;
   const primitiveStart = decomposed ? decomposed.primitiveStart : node.startIndex;
@@ -801,7 +801,7 @@ export function wrapInExtrude(source: string, root: Node, node: SceneNode, op: W
   const prefix = decomposed ? formatTransformPrefix(decomposed.transform, baseIndent) : '';
   const childIndent = `${baseIndent}    `;
   const body = childIndent + reindent(source.slice(primitiveStart, node.endIndex).trim(), baseIndent, childIndent).trimStart();
-  const block = `${prefix}${op}(${EXTRUDE_DEFAULT_ARGS[op]}) {\n${body}\n${baseIndent}}`;
+  const block = `${prefix}${op}(${args}) {\n${body}\n${baseIndent}}`;
   return source.slice(0, wrapStart) + block + source.slice(node.endIndex);
 }
 

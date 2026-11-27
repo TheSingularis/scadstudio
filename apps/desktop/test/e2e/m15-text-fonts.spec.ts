@@ -105,7 +105,8 @@ test.describe('M15 text and fonts', () => {
   test('Extrude on selected text makes it solid', async ({ scad }) => {
     await scad.load('text("Hi", size=10, font="Liberation Sans");\n');
     await scad.clickEditorLine(1);
-    const status = await scad.rendersAfter(() => scad.button('Linear Extrude').click());
+    await scad.startExtrude('Linear');
+    const status = await scad.applyTool();
     expect(status).toBe('Rendered');
     expect(await scad.source()).toMatch(/linear_extrude\([^)]*\)\s*\{?\s*text\("Hi"/);
     await shot(scad, '5-extruded');

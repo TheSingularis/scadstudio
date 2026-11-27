@@ -11,13 +11,13 @@ import {
   type SketchPlaneKind,
   type ActiveSketchPlane,
   type FocusRequest,
-  SELECTED_MESH_COLOR,
-  OPERAND_MESH_COLOR,
+  SHADING_OPTIONS,
+  type ShadingMode,
   buildGlobalSketchPlane,
   buildFaceSketchPlane,
   sketchPlaneFromTransform,
 } from './components/Viewport';
-import { DEFAULT_SNAP_SETTINGS, type SnapSettings } from './sketchSnap';
+import { loadSnapSettings, saveSnapSettings, type SnapSettings } from './sketchSnap';
 import { parseScad, parseScadSync } from './scadParser';
 import { buildSceneGraph, type SceneNode } from './sceneGraph';
 import {
@@ -73,7 +73,9 @@ import { findOption, fontGroups, isFontAvailable, type FontEntry } from './fontO
 import { SettingsDialog, type AppSettingsState } from './components/SettingsDialog';
 import { drivenAxes, positionAnchors } from './linkedDrag';
 import { VariablesPanel, type IncludedSection, type ModuleSection, type VariableScope } from './components/VariablesPanel';
-import { ToolPanel, type ToolState } from './components/ToolPanel';
+import { ToolPanel } from './components/ToolPanel';
+import { FloatingWindow, WindowRow, WindowSection } from './components/FloatingWindow';
+import { defaultExtrudeStatement, extrudeArgs, initialTool, pickIntoTool, toolSlotIndices, type ToolKind, type ToolState } from './toolWindows';
 import {
   applyEdits,
   deleteVariable,
@@ -127,7 +129,6 @@ import type { SnapKind } from './sketchSnap';
 // whole pre-wrapped statement (extrude + default 2D profile) through the same
 // append path, separated into their own labelled group only for clarity.
 const INSERT_TOOLS = BUILTIN_TOOL_DEFINITIONS.filter((t) => t.section === 'insert');
-const EXTRUDE_TOOLS = BUILTIN_TOOL_DEFINITIONS.filter((t) => t.section === 'extrude') as (ToolDefinition & { callName: ExtrudeOp })[];
 
 // Past this many Custom tools (a big library such as BOSL2), the section
 // gets a filter box and shows only the first matches.
@@ -227,14 +228,6 @@ const MODIFIER_BUTTONS: { modifier: Modifier; label: string }[] = [
   { modifier: '*', label: 'Disable *' },
 ];
 
-// M6: boolean ops need 2+ selected nodes (shift-click in the viewport to
-// multi-select) — see wrapInBoolean's comment for why selection order
-// (not document order) determines the generated block's child order.
-const BOOLEAN_OP_BUTTONS: { op: BooleanOp; label: string }[] = [
-  { op: 'union', label: 'Union' },
-  { op: 'difference', label: 'Difference' },
-  { op: 'intersection', label: 'Intersection' },
-];
 
 // The default color-input value (a plain HTML <input type="color">, no
 // alpha support — matches decomposeNode/formatTransformPrefix's RGB-only
@@ -402,8 +395,32 @@ export function App() {
   const [curveSegments, setCurveSegments] = useState(32);
   // M7.5 snap-while-drawing toggles. Deliberately kept across sketch
   // sessions (unlike the sketch itself) — a chosen grid spacing is a working
-  // preference, not part of any one sketch.
-  const [snapSettings, setSnapSettings] = useState<SnapSettings>(DEFAULT_SNAP_SETTINGS);
+  // preference, not part of any one sketch. M10b: and across restarts.
+  const [snapSettings, setSnapSettingsState] = useState<SnapSettings>(() => loadSnapSettings(typeof localStorage === 'undefined' ? null : localStorage));
+  const setSnapSettings = useCallback((update: (s: SnapSettings) => SnapSettings) => {
+    setSnapSettingsState((s) => {
+      const next = update(s);
+      saveSnapSettings(typeof localStorage === 'undefined' ? null : localStorage, next);
+      return next;
+    });
+  }, []);
+  // M10b: the viewport's shading mode (menu in the top bar), remembered.
+  const [shading, setShadingState] = useState<ShadingMode>(() => {
+    try {
+      const v = localStorage.getItem('scadstudio.shading');
+      return v === 'edges' || v === 'wireframe' ? v : 'shaded';
+    } catch {
+      return 'shaded';
+    }
+  });
+  const setShading = useCallback((mode: ShadingMode) => {
+    setShadingState(mode);
+    try {
+      localStorage.setItem('scadstudio.shading', mode);
+    } catch {
+      // Storage unavailable: the choice lasts for this session only.
+    }
+  }, []);
   // M7.5 on-plane editing: synchronous mirror of `sketch`, so a burst of
   // drag moves landing between two renders each build on the latest points
   // rather than a stale closure's copy. Only ever written through
@@ -499,7 +516,7 @@ export function App() {
   // Same idea, for edits that land at a *known* index rather than always the
   // last node — currently just the boolean-op merge (M6), whose result
   // always lands at the selected node with the smallest index (see
-  // handleBooleanOp).
+  // the Boolean window's Apply).
   const pendingSelectAfterEdit = useRef<number | null>(null);
   // Latest parsed tree + inputs to it, kept outside React state: the gizmo
   // commit handler (targetedPatch) needs the CST that matches the *currently
@@ -649,7 +666,8 @@ export function App() {
         result = { firstError, secondError: firstError };
       } else {
         try {
-          result = await attempt(flatSource);
+          // M10b: remembered, so Extrude knows the part is 2D.
+          result = { ...(await attempt(flatSource)), flat: true };
         } catch (secondError) {
           if (isRenderCancelled(secondError)) throw secondError;
           result = { firstError, secondError };
@@ -757,6 +775,7 @@ export function App() {
               if (result.reduced) reducedParts++;
               meshes.push({
                 reduced: result.reduced === true,
+                flat: result.flat === true,
                 index: node.index,
                 bytes: result.bytes,
                 transform: job.transform,
@@ -1580,14 +1599,7 @@ export function App() {
     const active = toolRef.current;
     if (active) {
       if (index === null || !active.picking) return;
-      if (active.kind === 'pattern') {
-        setTool({ ...active, part: index, picking: null, spacing: active.part === index ? active.spacing : '' });
-      } else {
-        const next = { ...active, [active.picking]: index };
-        const picking = active.picking === 'move' && next.reference === null ? 'reference' : null;
-        // A new pair gets a fresh default distance.
-        setTool({ ...next, picking, offset: active.kind === 'distance' ? '' : active.offset });
-      }
+      setTool(pickIntoTool(active, index));
       return;
     }
     if (index === null) {
@@ -1611,29 +1623,6 @@ export function App() {
     // 'toggle'
     setSelectedIndices((prev) => (prev.includes(index) ? prev.filter((i) => i !== index) : [...prev, index]));
   }, []);
-
-  // M6: boolean toolbar. Wraps the selected nodes' verbatim source into a
-  // new union()/difference()/intersection() block and reuses the same
-  // targeted-patch + re-render pipeline as every other edit path.
-  const handleBooleanOp = useCallback(
-    (op: BooleanOp) => {
-      if (selectedIndices.length < 2) return;
-      const nodesInSelectionOrder = selectedIndices
-        .map((i) => sceneNodesRef.current.find((n) => n.index === i))
-        .filter((n): n is SceneNode => n !== undefined);
-      if (nodesInSelectionOrder.length < 2) return;
-      const next = wrapInBoolean(sourceRef.current, nodesInSelectionOrder, op);
-      if (next === sourceRef.current) return;
-      // The merged statement always ends up at the selected node with the
-      // smallest index — see wrapInBoolean's comment on why nothing before
-      // it needs to move.
-      pendingSelectAfterEdit.current = Math.min(...selectedIndices);
-      if (debounceTimer.current) clearTimeout(debounceTimer.current);
-      setSource(next);
-      runRender(next);
-    },
-    [selectedIndices, runRender],
-  );
 
   // M5 (final piece): parameter panel. Reads the selected node's own
   // arguments straight from the live tree — recomputes whenever a render
@@ -1913,38 +1902,47 @@ export function App() {
     [makeVar, primarySelectedIndex, nodeMeshes, commitEdit],
   );
 
-  // M11 tool panel: Distance, Align, Pattern. Slots start from the
-  // selection: the first selected part moves (it keeps the boolean tools'
-  // orange), the second is the reference (red).
-  const startTool = useCallback((kind: ToolState['kind']) => {
-    const sel = selectedRef.current;
-    setMakeVar(null);
-    if (kind === 'pattern') {
-      const part = sel.length > 0 ? sel[sel.length - 1] : null;
-      setTool({ kind, part, picking: part === null ? 'part' : null, mode: 'linear', axis: 0, count: '3', spacingMode: 'pitch', spacing: '', fullCircle: true, step: '30' });
-      return;
+  // M11 tool panel, M10b floating tool windows: Distance, Align, Pattern,
+  // the booleans and the extrudes. Slots start from the selection: the
+  // first selected part moves (it keeps the boolean tools' orange), the
+  // second is the reference (red). Starting a tool replaces the open one
+  // (nothing is written, like Cancel).
+  // The toolbar's Extrude and Boolean buttons open on the operation used
+  // last (the window switches between them), remembered across restarts.
+  const lastOps = useRef<{ extrude: ExtrudeOp; boolean: BooleanOp }>({ extrude: 'linear_extrude', boolean: 'union' });
+  useEffect(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem('scadstudio.lastOps') ?? '{}') as { extrude?: string; boolean?: string };
+      if (v.extrude === 'linear_extrude' || v.extrude === 'rotate_extrude') lastOps.current.extrude = v.extrude;
+      if (v.boolean === 'union' || v.boolean === 'difference' || v.boolean === 'intersection') lastOps.current.boolean = v.boolean;
+    } catch {
+      // Defaults.
     }
-    const move = sel[0] ?? null;
-    const reference = sel[1] ?? null;
-    setTool({
-      kind,
-      move,
-      reference,
-      picking: move === null ? 'move' : reference === null ? 'reference' : null,
-      axis: 0,
-      moveEdge: kind === 'distance' ? 'min' : 'center',
-      referenceEdge: kind === 'distance' ? 'max' : 'center',
-      offset: kind === 'distance' ? '' : '0',
-      offsetName: kind === 'distance' ? 'gap' : '',
-      follow: true,
-    });
+  }, []);
+  const rememberOp = useCallback((t: ToolState) => {
+    if (t.kind === 'extrude') lastOps.current.extrude = t.op;
+    else if (t.kind === 'boolean') lastOps.current.boolean = t.op;
+    else return;
+    try {
+      localStorage.setItem('scadstudio.lastOps', JSON.stringify(lastOps.current));
+    } catch {
+      // Storage unavailable.
+    }
+  }, []);
+  const startTool = useCallback((kind: ToolKind, opts: Parameters<typeof initialTool>[2] = {}) => {
+    setMakeVar(null);
+    setTool(initialTool(kind, selectedRef.current, opts));
   }, []);
   // The viewport highlights the slots in the panel's colors.
   useEffect(() => {
     if (!tool) return;
-    const slots = tool.kind === 'pattern' ? [tool.part] : [tool.move, tool.reference];
-    setSelectedIndices(slots.filter((i): i is number => i !== null));
+    setSelectedIndices(toolSlotIndices(tool));
   }, [tool]);
+  // M10b: a sketch takes over the viewport; an open tool window closes.
+  const sketchingNow = activeSketchPlane !== null || pickingFace;
+  useEffect(() => {
+    if (sketchingNow) setTool(null);
+  }, [sketchingNow]);
   // A drill in or out changes what the slots' indices mean.
   const toolFocusDepth = resolved?.focus.length ?? 0;
   useEffect(() => {
@@ -1956,8 +1954,7 @@ export function App() {
   // open its parts always render in full; if one on screen is a preview,
   // render it again now.
   useEffect(() => {
-    const parts = !tool ? [] : tool.kind === 'pattern' ? [tool.part] : [tool.move, tool.reference];
-    const indices = new Set(parts.filter((i): i is number => i !== null));
+    const indices = new Set(!tool || tool.kind === 'boolean' || tool.kind === 'extrude' ? [] : toolSlotIndices(tool));
     toolFullIndicesRef.current = indices;
     if (nodeMeshes.some((m) => m.reduced && indices.has(m.index))) runRender(sourceRef.current);
   }, [tool, nodeMeshes, runRender]);
@@ -2003,6 +2000,48 @@ export function App() {
     const src = sourceRef.current;
     const nodes = sceneNodesRef.current;
     if (!t) return null;
+    if (tool.kind === 'boolean') {
+      const parts = toolSlotIndices(tool);
+      const picked = parts.map((i) => nodes[i]).filter((n): n is SceneNode => n !== undefined);
+      if (tool.op === 'difference' && (tool.base === null || tool.tools.length === 0)) {
+        return { ok: false as const, reason: 'Pick the base and at least one part to subtract: click a slot, then parts in the viewport.' };
+      }
+      if (picked.length < 2) return { ok: false as const, reason: 'Pick at least two parts: click the slot, then parts in the viewport.' };
+      const next = wrapInBoolean(src, picked, tool.op);
+      if (next === src) return { ok: false as const, reason: 'These parts can’t be combined here.' };
+      return {
+        ok: true as const,
+        lines: [`${tool.op}() {`, ...parts.map((i) => `    ${labelOf(i)}`), '}'],
+        notes: tool.op === 'difference' ? [] : ['The order doesn’t matter for this operation.'],
+        source: next,
+        select: Math.min(...parts),
+      };
+    }
+    if (tool.kind === 'extrude') {
+      const args = extrudeArgs(tool);
+      if (!args.ok) return args;
+      for (const field of tool.op === 'linear_extrude' ? [tool.height, tool.twist] : [tool.angle]) {
+        if (field.trim() !== '' && !isExpression(field)) return { ok: false as const, reason: `Not an OpenSCAD expression: ${field}` };
+      }
+      if (tool.profile === null || !nodes[tool.profile]) {
+        const statement = defaultExtrudeStatement(tool.op, args.args);
+        const set = currentSet(resolvedRef.current);
+        const placed = set?.container ? insertIntoContainer(src, set.container, statement) : appendStatement(src, statement);
+        return {
+          ok: true as const,
+          lines: [statement],
+          notes: ['No profile picked, so Apply inserts a new one. To extrude a part, click the Profile slot, then a 2D part.'],
+          source: placed,
+          select: 'last' as const,
+        };
+      }
+      const mesh = nodeMeshes.find((m) => m.index === tool.profile);
+      if (mesh && !mesh.flat) {
+        return { ok: false as const, reason: `${labelOf(tool.profile)} is 3D. Extrude takes a 2D profile: a sketch, square, circle, polygon or text.` };
+      }
+      const next = wrapInExtrude(src, t.rootNode, nodes[tool.profile], tool.op, args.args);
+      return { ok: true as const, lines: [`${tool.op}(${args.args}) {`, `    ${labelOf(tool.profile)}`, '}'], notes: [], source: next, select: tool.profile };
+    }
     if (tool.kind !== 'pattern') {
       if (tool.move === null || tool.reference === null || !nodes[tool.move] || !nodes[tool.reference]) {
         return { ok: false as const, reason: 'Pick both parts: click a slot, then a part in the viewport.' };
@@ -2064,10 +2103,13 @@ export function App() {
   }, [tool, tree, nodeMeshes, source, measureIndex, labelOf]);
   const handleApplyTool = useCallback(() => {
     if (!tool || !toolPreview?.ok) return;
-    pendingSelectAfterEdit.current = tool.kind === 'pattern' ? tool.part : tool.move;
+    const select = 'select' in toolPreview ? toolPreview.select : tool.kind === 'pattern' ? tool.part : tool.kind === 'distance' || tool.kind === 'align' ? tool.move : null;
+    rememberOp(tool);
+    if (select === 'last') pendingSelectLast.current = true;
+    else pendingSelectAfterEdit.current = select ?? null;
     setTool(null);
     commitEdit(toolPreview.source);
-  }, [tool, toolPreview, commitEdit]);
+  }, [tool, toolPreview, commitEdit, rememberOp]);
   // Esc leaves the tool panel without writing anything.
   useEffect(() => {
     if (!tool) return;
@@ -2113,28 +2155,6 @@ export function App() {
       runRender(next);
     },
     [runRender],
-  );
-
-  // M7.5: Linear/Rotate Extrude wraps the *selected* node (e.g. a just-drawn
-  // sketch) in place when something is selected — falls back to inserting
-  // an unrelated fresh default shape only when nothing is, same as before.
-  // Wrapping in place doesn't change the node's own top-level index, so the
-  // existing selection-preserving logic in runRender keeps it selected with
-  // no extra bookkeeping needed here.
-  const handleExtrude = useCallback(
-    (op: ExtrudeOp) => {
-      const tree = treeRef.current;
-      const node = primarySelectedIndex !== null ? sceneNodesRef.current.find((n) => n.index === primarySelectedIndex) : undefined;
-      if (!tree || !node) {
-        handleInsertTool(builtinTool(op));
-        return;
-      }
-      const next = wrapInExtrude(sourceRef.current, tree.rootNode, node, op);
-      if (debounceTimer.current) clearTimeout(debounceTimer.current);
-      setSource(next);
-      runRender(next);
-    },
-    [primarySelectedIndex, runRender, handleInsertTool],
   );
 
   // M7.5: offset() around the selected sketch, in place (same wrap as the
@@ -2218,6 +2238,8 @@ export function App() {
   // one drill-in level. Not while typing in the editor or a field.
   const escapeRef = useRef<() => void>(() => {});
   escapeRef.current = () => {
+    // An open tool window takes Esc itself (it closes, writing nothing).
+    if (toolRef.current) return;
     if (pickingFace) {
       setPickingFace(false);
       return;
@@ -2520,6 +2542,222 @@ export function App() {
     </span>
   );
 
+  // M10b (QC L2, Jordan 2026-11-26): Extrude only takes a 2D profile, so
+  // it is off while a 3D part is selected (wrapping one used to make the
+  // part vanish). A part is 2D when it only rendered through the 2D retry.
+  const extrudeBlocked = useMemo(() => {
+    if (primarySelectedIndex === null) return null;
+    const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
+    if (!mesh || mesh.flat) return null;
+    return 'Extrude needs a 2D profile (a sketch, square, circle, polygon or text), and the selected part is 3D. Select a 2D part, or nothing to insert a new extrusion.';
+  }, [primarySelectedIndex, nodeMeshes]);
+
+  // M10b: the selected part's properties (the M5 parameter panel, M11's
+  // pattern count/spacing and Make variable, position, gizmo mode, mirror,
+  // color, modifier) in one floating window over the viewport. It steps
+  // aside while a tool window is open or a sketch is being drawn.
+  const selectedMesh = primarySelectedIndex === null ? undefined : nodeMeshes.find((m) => m.index === primarySelectedIndex);
+  const propertiesWindow =
+    primarySelectedIndex !== null && !tool && !sketching ? (
+      <FloatingWindow
+        title={panel?.callName ?? labelOf(primarySelectedIndex) ?? 'Part'}
+        label="Properties"
+        storageKey="properties"
+        testId="properties-window"
+        collapsible
+        width={260}
+        badge={
+          selectedIndices.length > 1 ? (
+            <span style={{ opacity: 0.65, flex: 'none' }} title="Several parts are selected; this window edits the last one clicked">
+              +{selectedIndices.length - 1} selected
+            </span>
+          ) : undefined
+        }
+      >
+        {panel && panel.fields.length > 0 && (
+          <WindowSection title="Parameters">
+            {panel.fields.map((field, i) => (
+              // Keyed on the value text too, not just index: after a commit
+              // lands, the canonical (possibly reformatted) text should
+              // replace whatever the user typed, which an uncontrolled input
+              // only does on remount — see handleArgCommit's comment.
+              <ParamField
+                key={`${i}-${field.label}-${field.valueText}`}
+                field={field}
+                fonts={field.widget === 'font' ? fontList : undefined}
+                disabled={!!readOnly}
+                onCommit={(text) => (field.argIndex !== null ? handleArgCommit(field.argIndex, text) : handleAddArg(field.label, text))}
+                onMakeVariable={
+                  readOnly || (field.valueText !== null && !/^\s*(-?[\d.]+(e[-+]?\d+)?|true|false|\[[-\d.,\s]+\])\s*$/i.test(field.valueText)) || (field.valueText === null && !field.param?.defaultText)
+                    ? undefined
+                    : () => startMakeVariable({ kind: 'arg', argIndex: field.argIndex, label: field.label, defaultText: field.param?.defaultText ?? null })
+                }
+              />
+            ))}
+          </WindowSection>
+        )}
+        {selectedPattern && (
+          <div role="group" aria-label="Pattern">
+          <WindowSection title={selectedPattern.kind === 'linear' ? `Linear pattern along ${'XYZ'[selectedPattern.axis]}` : `Circular pattern around ${'XYZ'[selectedPattern.axis]}`}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <WindowRow label="Count">
+                <input
+                  key={`count-${selectedPattern.countText}`}
+                  aria-label="Pattern count"
+                  list={VARIABLE_DATALIST_ID}
+                  defaultValue={selectedPattern.countText}
+                  size={5}
+                  disabled={!!readOnly}
+                  onBlur={(e) => e.target.value.trim() !== selectedPattern.countText && handlePatternCommit('count', e.target.value.trim())}
+                  onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+                />
+              </WindowRow>
+              {selectedPattern.spacingText !== null ? (
+                <WindowRow label={selectedPattern.kind === 'linear' ? 'Pitch' : 'Step°'}>
+                  <input
+                    key={`spacing-${selectedPattern.spacingText}`}
+                    aria-label="Pattern spacing"
+                    list={VARIABLE_DATALIST_ID}
+                    defaultValue={selectedPattern.spacingText}
+                    size={Math.max(5, selectedPattern.spacingText.length + 1)}
+                    disabled={!!readOnly}
+                    onBlur={(e) => e.target.value.trim() !== selectedPattern.spacingText && handlePatternCommit('spacing', e.target.value.trim())}
+                    onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+                  />
+                </WindowRow>
+              ) : (
+                selectedPattern.kind === 'circular' && <span style={{ opacity: 0.7 }}>Spread over the full circle</span>
+              )}
+            </div>
+          </WindowSection>
+          </div>
+        )}
+        {transformEditable && (
+          <WindowSection title="Placement">
+            <WindowRow label="Gizmo">
+              {GIZMO_MODE_BUTTONS.map(({ mode, label }) => (
+                <button key={mode} onClick={() => setGizmoMode(mode)} aria-pressed={gizmoMode === mode} style={{ fontWeight: gizmoMode === mode ? 'bold' : 'normal' }}>
+                  {label}
+                </button>
+              ))}
+            </WindowRow>
+            {gizmoMode === 'rotate' && (
+              <WindowRow label="Space">
+                {ROTATE_SPACE_BUTTONS.map(({ space, label }) => (
+                  <button key={space} onClick={() => setRotateSpace(space)} aria-pressed={rotateSpace === space} style={{ fontWeight: rotateSpace === space ? 'bold' : 'normal' }}>
+                    {label}
+                  </button>
+                ))}
+              </WindowRow>
+            )}
+            <WindowRow label="Position">
+              {(['X', 'Y', 'Z'] as const).map((label, axis) => {
+                const value = selectedMesh?.transform.translate[axis] ?? 0;
+                // M11: an axis written as an expression shows (and edits) the
+                // expression; typing a number detaches it.
+                const expr = selectedMesh?.transform.exprs?.translate[axis] ?? null;
+                const shown = expr ?? formatNumber(value);
+                return (
+                  <span key={label} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                    <span style={{ opacity: 0.6 }}>{label}</span>
+                    {/* Keyed on the value too, same reformat-after-commit reasoning as the parameter panel's inputs. */}
+                    <input
+                      key={`${primarySelectedIndex}-${axis}-${shown}`}
+                      type="text"
+                      inputMode="decimal"
+                      list={VARIABLE_DATALIST_ID}
+                      aria-label={`Position ${label}`}
+                      defaultValue={shown}
+                      size={expr ? Math.min(24, Math.max(5, expr.length + 1)) : 5}
+                      title={expr ? `Set by an expression (comes to ${formatNumber(value)}). Type a number to detach it.` : 'A number, a variable name or an expression'}
+                      style={expr ? { fontFamily: 'monospace', color: '#9cdcfe', fontStyle: 'italic' } : { width: 46 }}
+                      onBlur={(e) => {
+                        if (e.target.value.trim() !== shown) handlePositionCommit(axis as 0 | 1 | 2, e.target.value);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
+                      }}
+                    />
+                    {!expr && (
+                      <button
+                        className="make-variable"
+                        aria-label={`Make position ${label} a variable`}
+                        title="Make variable: name this position at the top of the file"
+                        onClick={() => startMakeVariable({ kind: 'position', axis: axis as 0 | 1 | 2 })}
+                        style={{ fontSize: 11, padding: '0 3px', fontStyle: 'italic' }}
+                      >
+                        ƒx
+                      </button>
+                    )}
+                  </span>
+                );
+              })}
+            </WindowRow>
+            {lockNote && (
+              <span role="note" data-testid="gizmo-lock-note" style={{ color: '#9cdcfe', opacity: 0.85 }}>
+                {lockNote}
+              </span>
+            )}
+            <WindowRow label="Mirror">
+              {MIRROR_AXIS_BUTTONS.map(({ axis, label }) => (
+                <button key={axis} onClick={() => handleMirrorAxis(axis)}>
+                  {label}
+                </button>
+              ))}
+            </WindowRow>
+          </WindowSection>
+        )}
+        {!readOnly && (
+          <WindowSection title="Appearance">
+            {transformEditable && (
+              <WindowRow label="Color">
+                <input type="color" aria-label="Color" value={rgbToHex(selectedMesh?.transform.color ?? null)} onChange={(e) => handleColorChange(e.target.value)} />
+                {selectedMesh?.transform.color && <button onClick={handleClearColor}>Clear</button>}
+              </WindowRow>
+            )}
+            <WindowRow label="Modifier">
+              {MODIFIER_BUTTONS.map(({ modifier, label }) => (
+                <button
+                  key={modifier}
+                  onClick={() => handleModifierToggle(modifier)}
+                  aria-pressed={selectedModifier === modifier}
+                  style={{ fontWeight: selectedModifier === modifier ? 'bold' : 'normal' }}
+                >
+                  {label}
+                </button>
+              ))}
+            </WindowRow>
+          </WindowSection>
+        )}
+        {makeVar && (
+          <form
+            aria-label="Make variable"
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleMakeVariable(String(new FormData(e.currentTarget).get('name') ?? '').trim());
+            }}
+            style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 8, background: '#22323f', border: '1px solid #3d5366', borderRadius: 4 }}
+          >
+            <WindowRow label="Variable named">
+              <input name="name" aria-label="Variable name" defaultValue={makeVar.name} autoFocus size={14} style={{ fontFamily: 'monospace' }} />
+            </WindowRow>
+            <span style={{ opacity: 0.7 }}>It goes at the top of the file, and the name replaces the value here.</span>
+            {makeVar.error && (
+              <span role="alert" style={{ color: '#e8a05a' }}>
+                {makeVar.error}
+              </span>
+            )}
+            <span style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+              <button type="submit">Make variable</button>
+              <button type="button" onClick={() => setMakeVar(null)}>
+                Cancel
+              </button>
+            </span>
+          </form>
+        )}
+      </FloatingWindow>
+    ) : null;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'sans-serif' }}>
       <div
@@ -2545,6 +2783,13 @@ export function App() {
         <button onClick={() => focusSelectionRef.current()} title="Frame the selected part, keeping the view angle (F)">
           Focus
         </button>
+        <select aria-label="Shading mode" title="How the 3D view draws the model" value={shading} onChange={(e) => setShading(e.target.value as ShadingMode)}>
+          {SHADING_OPTIONS.map(({ mode, label }) => (
+            <option key={mode} value={mode}>
+              {label}
+            </option>
+          ))}
+        </select>
         <button onClick={() => setSettingsOpen(true)} title="Settings (editor font, quick preview)">
           Settings
         </button>
@@ -2574,7 +2819,7 @@ export function App() {
         }}
       >
         {readOnly && <span style={{ opacity: 0.7 }}>Viewing a library module (read-only)</span>}
-        {!readOnly && (
+        {!readOnly && !sketching && (
         <span role="group" aria-label="Insert" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           Insert:
           {INSERT_TOOLS.map((tool) => (
@@ -2584,17 +2829,26 @@ export function App() {
           ))}
         </span>
         )}
-        {!readOnly && (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          Extrude{primarySelectedIndex !== null ? ' (selected)' : ''}:
-          {EXTRUDE_TOOLS.map((tool) => (
-            <button key={tool.id} onClick={() => handleExtrude(tool.callName)}>
-              {tool.label}
+        {!readOnly && !sketching && (
+          <span role="group" aria-label="Operations" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <button
+              onClick={() => startTool('extrude', { extrudeOp: lastOps.current.extrude })}
+              disabled={extrudeBlocked !== null}
+              aria-pressed={tool?.kind === 'extrude'}
+              title={extrudeBlocked ?? 'Extrude a 2D profile (the selected one, if it is 2D): Linear or Rotate, in the window'}
+            >
+              Extrude
             </button>
-          ))}
-        </span>
+            <button
+              onClick={() => startTool('boolean', { booleanOp: lastOps.current.boolean })}
+              aria-pressed={tool?.kind === 'boolean'}
+              title="Union, Difference or Intersection of parts (the selected ones fill the slots), in the window"
+            >
+              Boolean
+            </button>
+          </span>
         )}
-        {!readOnly && visibleCustomTools.length > 0 && (
+        {!readOnly && !sketching && visibleCustomTools.length > 0 && (
           <span
             role="group"
             aria-label="Custom modules"
@@ -2685,10 +2939,6 @@ export function App() {
                   ))}
                 </select>
               )}
-              <span style={{ opacity: 0.7 }} data-testid="sketch-hint">
-                {sketchToolHint(sketchTool, toolAnchors.length, sketch.open.length)} ({sketch.profiles.length} loop
-                {sketch.profiles.length === 1 ? '' : 's'}, {allSketchPoints(sketch).length} points)
-              </span>
               <button onClick={handleUndoSketch} disabled={sketchHistory.length === 0 && toolAnchors.length === 0}>
                 Undo
               </button>
@@ -2712,141 +2962,6 @@ export function App() {
           )}
         </span>
         )}
-        {transformEditable && (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          Gizmo:
-          {GIZMO_MODE_BUTTONS.map(({ mode, label }) => (
-            <button
-              key={mode}
-              onClick={() => setGizmoMode(mode)}
-              style={{ fontWeight: gizmoMode === mode ? 'bold' : 'normal' }}
-            >
-              {label}
-            </button>
-          ))}
-        </span>
-        )}
-        {transformEditable && gizmoMode === 'rotate' && (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Space:
-            {ROTATE_SPACE_BUTTONS.map(({ space, label }) => (
-              <button
-                key={space}
-                onClick={() => setRotateSpace(space)}
-                style={{ fontWeight: rotateSpace === space ? 'bold' : 'normal' }}
-              >
-                {label}
-              </button>
-            ))}
-          </span>
-        )}
-        {transformEditable && !tool && primarySelectedIndex !== null && (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            {MIRROR_AXIS_BUTTONS.map(({ axis, label }) => (
-              <button key={axis} onClick={() => handleMirrorAxis(axis)}>
-                {label}
-              </button>
-            ))}
-          </span>
-        )}
-        {!readOnly && !tool && primarySelectedIndex !== null && (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Modifier:
-            {MODIFIER_BUTTONS.map(({ modifier, label }) => (
-              <button
-                key={modifier}
-                onClick={() => handleModifierToggle(modifier)}
-                style={{ fontWeight: selectedModifier === modifier ? 'bold' : 'normal' }}
-              >
-                {label}
-              </button>
-            ))}
-          </span>
-        )}
-        {transformEditable && !tool && primarySelectedIndex !== null && (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Position:
-            {(['X', 'Y', 'Z'] as const).map((label, axis) => {
-              const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
-              const value = mesh?.transform.translate[axis] ?? 0;
-              // M11: an axis written as an expression shows (and edits) the
-              // expression; typing a number detaches it.
-              const expr = mesh?.transform.exprs?.translate[axis] ?? null;
-              const shown = expr ?? formatNumber(value);
-              return (
-                <span key={label} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-                  <span style={{ opacity: 0.6 }}>{label}:</span>
-                  {/* Keyed on the value too, same reformat-after-commit reasoning as the parameter panel's inputs below. */}
-                  <input
-                    key={`${primarySelectedIndex}-${axis}-${shown}`}
-                    type="text"
-                    inputMode="decimal"
-                    list={VARIABLE_DATALIST_ID}
-                    aria-label={`Position ${label}`}
-                    defaultValue={shown}
-                    size={expr ? Math.min(24, Math.max(5, expr.length + 1)) : 5}
-                    title={expr ? `Set by an expression (comes to ${formatNumber(value)}). Type a number to detach it.` : 'A number, a variable name or an expression'}
-                    style={expr ? { fontFamily: 'monospace', color: '#9cdcfe', fontStyle: 'italic' } : undefined}
-                    onBlur={(e) => {
-                      if (e.target.value.trim() !== shown) handlePositionCommit(axis as 0 | 1 | 2, e.target.value);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') e.currentTarget.blur();
-                    }}
-                  />
-                  {!expr && (
-                    <button
-                      className="make-variable"
-                      aria-label={`Make position ${label} a variable`}
-                      title="Make variable: name this position at the top of the file"
-                      onClick={() => startMakeVariable({ kind: 'position', axis: axis as 0 | 1 | 2 })}
-                      style={{ fontSize: 11, padding: '0 4px', fontStyle: 'italic' }}
-                    >
-                      ƒx
-                    </button>
-                  )}
-                </span>
-              );
-            })}
-            {lockNote && (
-              <span role="note" data-testid="gizmo-lock-note" style={{ color: '#9cdcfe', opacity: 0.85 }}>
-                {lockNote}
-              </span>
-            )}
-          </span>
-        )}
-        {transformEditable && !tool && primarySelectedIndex !== null && (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Color:
-            <input
-              type="color"
-              value={rgbToHex(nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform.color ?? null)}
-              onChange={(e) => handleColorChange(e.target.value)}
-            />
-            {nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform.color && (
-              <button onClick={handleClearColor}>Clear</button>
-            )}
-          </span>
-        )}
-        {!readOnly && !tool && selectedIndices.length >= 2 && (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            Boolean ({selectedIndices.length} selected —
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: SELECTED_MESH_COLOR, display: 'inline-block' }} />
-              base
-            </span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: OPERAND_MESH_COLOR, display: 'inline-block' }} />
-              tool(s)
-            </span>
-            ):
-            {BOOLEAN_OP_BUTTONS.map(({ op, label }) => (
-              <button key={op} onClick={() => handleBooleanOp(op)}>
-                {label}
-              </button>
-            ))}
-          </span>
-        )}
         {transformEditable && !sketching && (
           <span role="group" aria-label="Constrain" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Constrain:
@@ -2869,115 +2984,6 @@ export function App() {
           </span>
         )}
       </div>
-      {tool && (
-        <ToolPanel
-          tool={tool}
-          labelOf={labelOf}
-          onChange={setTool}
-          onApply={handleApplyTool}
-          onCancel={() => setTool(null)}
-          preview={toolPreview}
-          gapAvailable={tool.kind === 'pattern' && tool.part !== null}
-        />
-      )}
-      {makeVar && (
-        <form
-          aria-label="Make variable"
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleMakeVariable(String(new FormData(e.currentTarget).get('name') ?? '').trim());
-          }}
-          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 12px', background: '#1f2a33', color: '#ddd', fontSize: 12, borderBottom: '1px solid #345' }}
-        >
-          Make variable named
-          <input name="name" aria-label="Variable name" defaultValue={makeVar.name} autoFocus size={14} style={{ fontFamily: 'monospace' }} />
-          <button type="submit">Make variable</button>
-          <button type="button" onClick={() => setMakeVar(null)}>
-            Cancel
-          </button>
-          <span style={{ opacity: 0.7 }}>It goes at the top of the file, and the name replaces the value here.</span>
-          {makeVar.error && (
-            <span role="alert" style={{ color: '#e8a05a' }}>
-              {makeVar.error}
-            </span>
-          )}
-        </form>
-      )}
-      {selectedPattern && !tool && (
-        <div
-          role="group"
-          aria-label="Pattern"
-          style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 12px', background: '#252526', color: '#ccc', fontSize: 12, borderBottom: '1px solid #333' }}
-        >
-          <span style={{ opacity: 0.7 }}>
-            {selectedPattern.kind === 'linear' ? `Linear pattern along ${'XYZ'[selectedPattern.axis]}` : `Circular pattern around ${'XYZ'[selectedPattern.axis]}`}:
-          </span>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            Count
-            <input
-              key={`count-${selectedPattern.countText}`}
-              aria-label="Pattern count"
-              list={VARIABLE_DATALIST_ID}
-              defaultValue={selectedPattern.countText}
-              size={5}
-              disabled={!!readOnly}
-              onBlur={(e) => e.target.value.trim() !== selectedPattern.countText && handlePatternCommit('count', e.target.value.trim())}
-              onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-            />
-          </label>
-          {selectedPattern.spacingText !== null && (
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              {selectedPattern.kind === 'linear' ? 'Pitch' : 'Step°'}
-              <input
-                key={`spacing-${selectedPattern.spacingText}`}
-                aria-label="Pattern spacing"
-                list={VARIABLE_DATALIST_ID}
-                defaultValue={selectedPattern.spacingText}
-                size={Math.max(5, selectedPattern.spacingText.length + 1)}
-                disabled={!!readOnly}
-                onBlur={(e) => e.target.value.trim() !== selectedPattern.spacingText && handlePatternCommit('spacing', e.target.value.trim())}
-                onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-              />
-            </label>
-          )}
-          {selectedPattern.kind === 'circular' && selectedPattern.spacingText === null && <span style={{ opacity: 0.7 }}>spread over the full circle</span>}
-        </div>
-      )}
-      {panel && panel.fields.length > 0 && (
-        <div
-          style={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            alignItems: 'center',
-            gap: 12,
-            padding: '6px 12px',
-            background: '#252526',
-            color: '#ccc',
-            fontSize: 12,
-            borderBottom: '1px solid #333',
-          }}
-        >
-          <span style={{ opacity: 0.7 }}>{panel.callName}:</span>
-          {panel.fields.map((field, i) => (
-            // Keyed on the value text too, not just index: after a commit
-            // lands, the canonical (possibly reformatted) text should
-            // replace whatever the user typed, which an uncontrolled input
-            // only does on remount — see handleArgCommit's comment.
-            <ParamField
-              key={`${i}-${field.label}-${field.valueText}`}
-              field={field}
-              fonts={field.widget === 'font' ? fontList : undefined}
-              disabled={!!readOnly}
-              onCommit={(text) => (field.argIndex !== null ? handleArgCommit(field.argIndex, text) : handleAddArg(field.label, text))}
-              onMakeVariable={
-                readOnly || (field.valueText !== null && !/^\s*(-?[\d.]+(e[-+]?\d+)?|true|false|\[[-\d.,\s]+\])\s*$/i.test(field.valueText)) || (field.valueText === null && !field.param?.defaultText)
-                  ? undefined
-                  : () => startMakeVariable({ kind: 'arg', argIndex: field.argIndex, label: field.label, defaultText: field.param?.defaultText ?? null })
-              }
-            />
-          ))}
-        </div>
-      )}
       <datalist id={VARIABLE_DATALIST_ID}>
         {variables.map((v) => (
           <option key={`${v.name}:${v.line}`} value={v.name} />
@@ -3021,6 +3027,46 @@ export function App() {
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333', position: 'relative' }}>
           {renderStartedAt !== null && renderIsSlow && <RenderProgressOverlay progressRef={renderProgressRef} onCancel={handleCancelRender} />}
           <RenderDetailBadge detail={renderDetail} rendering={renderStartedAt !== null} onRender={handleFullRender} />
+          {tool && (
+            <ToolPanel
+              tool={tool}
+              labelOf={labelOf}
+              onChange={setTool}
+              onApply={handleApplyTool}
+              onCancel={() => setTool(null)}
+              preview={toolPreview}
+              gapAvailable={tool.kind === 'pattern' && tool.part !== null}
+              applyLabel={tool.kind === 'extrude' && tool.profile === null ? 'Insert new' : undefined}
+            />
+          )}
+          {propertiesWindow}
+          {activeSketchPlane && (
+            // M10b: the sketch tool's hint sits over the viewport, top center,
+            // so the sketch toolbar stays one row.
+            <div
+              data-testid="sketch-hint"
+              role="status"
+              style={{
+                position: 'absolute',
+                top: 8,
+                left: '50%',
+                transform: 'translateX(-50%)',
+                maxWidth: 'calc(100% - 260px)',
+                zIndex: 10,
+                pointerEvents: 'none',
+                background: 'rgba(30,30,30,0.85)',
+                color: '#ddd',
+                fontSize: 12,
+                fontFamily: 'sans-serif',
+                padding: '4px 10px',
+                borderRadius: 4,
+                textAlign: 'center',
+              }}
+            >
+              {sketchToolHint(sketchTool, toolAnchors.length, sketch.open.length)} ({sketch.profiles.length} loop
+              {sketch.profiles.length === 1 ? '' : 's'}, {allSketchPoints(sketch).length} points)
+            </div>
+          )}
           <ErrorBoundary label="The 3D view" resetKey={nodeMeshes}>
             <Viewport
               meshes={nodeMeshes}
@@ -3053,6 +3099,7 @@ export function App() {
               freeAxes={primaryFreeAxes}
               cuttersFirst={workingSet?.containerCall === 'difference'}
               stale={renderStartedAt !== null && renderIsSlow}
+              shading={shading}
             />
           </ErrorBoundary>
         </div>

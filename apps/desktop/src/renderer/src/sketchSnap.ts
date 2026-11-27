@@ -19,7 +19,37 @@ export interface SnapSettings {
   geometry: boolean;
 }
 
-export const DEFAULT_SNAP_SETTINGS: SnapSettings = { grid: true, gridSize: 1, geometry: true };
+// M10b (Jordan, 2026-11-26): the grid is off by default, like Onshape and
+// Fusion, which snap to geometry (points, midpoints, edges) unless asked.
+export const DEFAULT_SNAP_SETTINGS: SnapSettings = { grid: false, gridSize: 1, geometry: true };
+
+const SNAP_STORAGE_KEY = 'scadstudio.sketchSnap';
+
+// The Snap choices are remembered across restarts (localStorage, like the
+// Variables panel's open state). Anything unreadable falls back to the
+// defaults, field by field.
+export function loadSnapSettings(storage: Pick<Storage, 'getItem'> | null): SnapSettings {
+  try {
+    const raw = storage?.getItem(SNAP_STORAGE_KEY);
+    if (!raw) return DEFAULT_SNAP_SETTINGS;
+    const v = JSON.parse(raw) as Partial<SnapSettings>;
+    return {
+      grid: typeof v.grid === 'boolean' ? v.grid : DEFAULT_SNAP_SETTINGS.grid,
+      gridSize: typeof v.gridSize === 'number' && Number.isFinite(v.gridSize) && v.gridSize > 0 ? v.gridSize : DEFAULT_SNAP_SETTINGS.gridSize,
+      geometry: typeof v.geometry === 'boolean' ? v.geometry : DEFAULT_SNAP_SETTINGS.geometry,
+    };
+  } catch {
+    return DEFAULT_SNAP_SETTINGS;
+  }
+}
+
+export function saveSnapSettings(storage: Pick<Storage, 'setItem'> | null, settings: SnapSettings): void {
+  try {
+    storage?.setItem(SNAP_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Storage unavailable: the choice lasts for this session only.
+  }
+}
 
 export type SnapKind = 'close' | 'endpoint' | 'midpoint' | 'origin' | 'edge' | 'align' | 'grid' | 'none';
 

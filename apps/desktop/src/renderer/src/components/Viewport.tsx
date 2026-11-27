@@ -196,7 +196,7 @@ function useTintedMaterial(): { material: MeshStandardMaterial; setTint: (color:
 // OpenSCAD's "Show Edges" draws); 'wireframe' draws only those edges, with
 // the surface hidden but still clickable.
 export type ShadingMode = 'shaded' | 'edges' | 'wireframe';
-const SHADING_OPTIONS: { mode: ShadingMode; label: string }[] = [
+export const SHADING_OPTIONS: { mode: ShadingMode; label: string }[] = [
   { mode: 'shaded', label: 'Shaded' },
   { mode: 'edges', label: 'Shaded + edges' },
   { mode: 'wireframe', label: 'Wireframe' },
@@ -237,6 +237,9 @@ export interface NodeMesh {
   key?: string;
   // M18: rendered as a quick preview (curve detail lowered).
   reduced?: boolean;
+  // M10b: rendered only through the 2D (thin-extrude) retry: a 2D part,
+  // which is what Extrude can take.
+  flat?: boolean;
   // M10a: text, which has an up and a reading direction (its local +Y and
   // +X, seen from +Z). Focus faces it square and level.
   upright?: boolean;
@@ -343,6 +346,9 @@ interface ViewportProps {
   cuttersFirst?: boolean;
   // M10a: a render is running and has taken long enough to notice, so the
   // meshes on screen are out of date: they are drawn greyed out.
+  // M10b: how meshes draw; the menu lives in the top bar (it used to sit
+  // over the viewport, where it caught clicks meant for the model).
+  shading?: ShadingMode;
   stale?: boolean;
 }
 
@@ -1427,6 +1433,7 @@ export function Viewport({
   freeAxes,
   cuttersFirst = false,
   stale = false,
+  shading = 'shaded',
 }: ViewportProps) {
   // M10a: the part under the pointer, for the hover tint.
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -1485,7 +1492,6 @@ export function Viewport({
   const viewApiRef = useRef<ViewApi | null>(null);
   // View-only preference, not part of the document — lives here rather than
   // App.tsx since nothing outside the viewport reads it.
-  const [shading, setShading] = useState<ShadingMode>('shaded');
 
   const handleGroupRef = useCallback(
     (index: number, group: Group | null) => {
@@ -1807,18 +1813,6 @@ export function Viewport({
           </button>
         ))}
       {overlay}
-      <select
-        aria-label="Shading mode"
-        value={shading}
-        onChange={(e) => setShading(e.target.value as ShadingMode)}
-        style={{ position: 'absolute', right: 12, top: NAV_CUBE_MARGIN_PX * 2 + 8, fontSize: 12 }}
-      >
-        {SHADING_OPTIONS.map(({ mode, label }) => (
-          <option key={mode} value={mode}>
-            {label}
-          </option>
-        ))}
-      </select>
     </div>
   );
 }

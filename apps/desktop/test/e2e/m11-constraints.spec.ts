@@ -21,7 +21,7 @@ test.describe('M11 directional constraints', () => {
   test('Distance with follow: locked together, the sphere keeps its gap when the cube grows or either part is dragged', async ({ scad }) => {
     await scad.load(TWO_PARTS);
     await scad.button('Distance').click();
-    const panel = scad.page.getByRole('region', { name: 'Distance tool' });
+    const panel = scad.page.getByRole('dialog', { name: 'Distance tool' });
     await expect(panel).toBeVisible();
     // Distance and Align are marked experimental until the solver redoes them.
     await expect(scad.page.getByTestId('constrain-experimental')).toBeVisible();
@@ -78,6 +78,9 @@ test.describe('M11 directional constraints', () => {
     // Drag the cube along X: the sphere comes along, keeping the gap.
     await scad.clickEditorLine(8); // the cube
     await expect(scad.page.getByTestId('gizmo-lock-note')).toContainText('Linked: dragging moves cube_x, cube_y, cube_z');
+    // M10b: the cube's gizmo sits under the Properties window at this size;
+    // fold the window to its title bar to reach it.
+    await scad.propertiesWindow().getByRole('button', { name: 'Collapse window' }).click();
     const hx = await scad.axisHandle('x');
     const lx = Math.hypot(hx.dx, hx.dy);
     await scad.rendersAfter(() => scad.dragViewport(hx, { dx: hx.dx + (hx.dx / lx) * 80, dy: hx.dy + (hx.dy / lx) * 80 }));
@@ -94,7 +97,7 @@ test.describe('M11 directional constraints', () => {
   test('Align centers, and Position accepts an expression or a number', async ({ scad }) => {
     await scad.load('w = 30;\n\ntranslate([0, 10, 0]) cube([w, 20, 10], center = true);\n\ntranslate([60, 0, 0]) cylinder(h = 5, r = 4);\n');
     await scad.button('Align').click();
-    const panel = scad.page.getByRole('region', { name: 'Align tool' });
+    const panel = scad.page.getByRole('dialog', { name: 'Align tool' });
     await panel.getByTestId('slot-move').click();
     await scad.clickEditorLine(5);
     await panel.getByTestId('slot-relative-to').click();
@@ -124,7 +127,7 @@ test.describe('M11 directional constraints', () => {
     await scad.load('translate([0, 0, 0]) cube([10, 4, 4]);\n');
     await scad.clickEditorLine(1);
     await scad.button('Pattern').click();
-    const panel = scad.page.getByRole('region', { name: 'Pattern tool' });
+    const panel = scad.page.getByRole('dialog', { name: 'Pattern tool' });
     await expect(panel.getByTestId('slot-part')).toContainText('cube');
     // Default pitch: the part's width plus 5.
     await expect(panel.getByLabel('Spacing', { exact: true })).toHaveValue('15');
