@@ -148,7 +148,7 @@ test.describe('M15 text and fonts', () => {
     // Persisted in the app's settings file.
     const userData = await scad.app.evaluate(({ app }) => app.getPath('userData'));
     const file = join(userData, 'settings.json');
-    await expect.poll(() => existsSync(file) && JSON.parse(readFileSync(file, 'utf8'))).toEqual({ editorFontFamily: 'Source Code Pro', editorFontSize: 18 });
+    await expect.poll(() => existsSync(file) && JSON.parse(readFileSync(file, 'utf8'))).toEqual({ editorFontFamily: 'Source Code Pro', editorFontSize: 18, previewMode: 'auto', previewSegments: 24 });
     await shot(scad, '8-editor-font');
   });
 });

@@ -70,7 +70,7 @@ import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, LIST_UNSET_BUILTINS, addU
 import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleIntrospection';
 import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
 import { findOption, fontGroups, isFontAvailable, type FontEntry } from './fontOptions';
-import { SettingsDialog, type EditorFontSettings } from './components/SettingsDialog';
+import { SettingsDialog, type AppSettingsState } from './components/SettingsDialog';
 import { drivenAxes, positionAnchors } from './linkedDrag';
 import { VariablesPanel, type IncludedSection, type ModuleSection, type VariableScope } from './components/VariablesPanel';
 import { ToolPanel, type ToolState } from './components/ToolPanel';
@@ -100,6 +100,8 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 type ModuleSourceFile = Awaited<ReturnType<Window['scadstudio']['scanModules']>>[number];
 import { createCoalescingRunner } from './coalescingRunner';
 import { RenderCache, type CachedRender } from './renderCache';
+import { cacheKey, chooseQuality, FULL, likelyFastAtFull, PartTimings, type PreviewMode, type Quality } from './renderQuality';
+import { RenderDetailBadge } from './components/RenderDetailBadge';
 import { isEngineCrash, isRenderCancelled, renderErrorMessage } from './renderErrors';
 import { RenderProgressOverlay, useRenderIsSlow, type RenderProgress } from './components/RenderProgress';
 import {
@@ -324,10 +326,12 @@ interface RenderStats {
   // Meshes in the working set and in the dimmed context after the last render.
   workingMeshes: number;
   contextMeshes: number;
+  // M18: meshes on screen that are previews.
+  previewMeshes: number;
 }
 function renderStats(): RenderStats {
   const w = window as unknown as { __scadstudioRenderStats?: RenderStats };
-  w.__scadstudioRenderStats ??= { engineCalls: 0, cacheHits: 0, flashes: 0, workingMeshes: 0, contextMeshes: 0 };
+  w.__scadstudioRenderStats ??= { engineCalls: 0, cacheHits: 0, flashes: 0, workingMeshes: 0, contextMeshes: 0, previewMeshes: 0 };
   return w.__scadstudioRenderStats;
 }
 
@@ -469,6 +473,18 @@ export function App() {
   const renderIsSlow = useRenderIsSlow(renderStartedAt);
   const renderingRef = useRef(false);
   const cancelGenRef = useRef(0);
+  // M18: fast preview. How long each part took at full detail, the
+  // previous working set (to carry timings through an edit), Render's
+  // one-shot "everything at full detail", the parts an open Distance /
+  // Align / Pattern tool measures (always full: a coarser circle is
+  // smaller), and the preview settings (from Settings > Rendering).
+  const timingsRef = useRef(new PartTimings());
+  const prevTimingSetRef = useRef<{ epoch: number; fingerprints: NodeFingerprint[]; sources: string[] } | null>(null);
+  const forceFullRef = useRef(false);
+  const toolFullIndicesRef = useRef<Set<number>>(new Set());
+  const previewSettingsRef = useRef<{ mode: PreviewMode; segments: number }>({ mode: 'auto', segments: 24 });
+  // Parts on screen after the last render, and how many are previews.
+  const [renderDetail, setRenderDetail] = useState<{ parts: number; reduced: number } | null>(null);
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   // Reactive mirror of treeRef below, purely so the parameter panel (a
   // useMemo over tree+sceneNodes+selection) can recompute when a render
@@ -585,19 +601,37 @@ export function App() {
   }, [deriveFocus]);
 
   // One isolated render through the cache: the normal attempt, then M7's
-  // flat (2D) retry; both outcomes are cached.
-  const renderCached = useCallback(async (source: string, flatSource: string): Promise<CachedRender> => {
+  // flat (2D) retry; both outcomes are cached. M18: at the quality asked
+  // for. A full result serves a preview request too (better, and free), a
+  // preview that lowered nothing is stored as the full render, and an
+  // unmeasured part whose full render looks cheap from its preview is
+  // rendered in full straight away (see likelyFastAtFull).
+  const renderCached = useCallback(async (source: string, flatSource: string, quality: Quality = FULL, promote = false): Promise<CachedRender> => {
     const cache = renderCache.current;
     const stats = renderStats();
-    const hit = cache.get(source);
-    if (hit) {
+    const fullHit = cache.get(source);
+    if (fullHit) {
       stats.cacheHits++;
-      return hit;
+      return fullHit;
     }
+    const key = cacheKey(source, quality);
+    if (quality.kind === 'preview') {
+      const hit = cache.get(key);
+      if (hit) {
+        stats.cacheHits++;
+        return hit;
+      }
+    }
+    const segments = quality.kind === 'preview' ? quality.segments : null;
+    const attempt = async (src: string): Promise<CachedRender> => {
+      stats.engineCalls++;
+      const r = await window.scadstudio.renderMesh(src, segments);
+      if (!r.reduced) timingsRef.current.set(source, r.engineMs);
+      return { bytes: r.bytes, reduced: r.reduced, engineMs: r.engineMs, detailFactor: r.detailFactor };
+    };
     let result: CachedRender;
     try {
-      stats.engineCalls++;
-      result = { bytes: await window.scadstudio.renderScad(source) };
+      result = await attempt(source);
     } catch (firstError) {
       // M10a: Cancel is not a result of this source; don't cache it.
       if (isRenderCancelled(firstError)) throw firstError;
@@ -615,15 +649,20 @@ export function App() {
         result = { firstError, secondError: firstError };
       } else {
         try {
-          stats.engineCalls++;
-          result = { bytes: await window.scadstudio.renderScad(flatSource) };
+          result = await attempt(flatSource);
         } catch (secondError) {
           if (isRenderCancelled(secondError)) throw secondError;
           result = { firstError, secondError };
         }
       }
     }
-    cache.set(source, result);
+    if ('bytes' in result && result.reduced) {
+      cache.set(key, result);
+      if (promote && likelyFastAtFull(result.engineMs ?? Infinity, result.detailFactor ?? 1)) return renderCached(source, flatSource, FULL);
+    } else {
+      // A failure is cached at the quality that produced it.
+      cache.set('bytes' in result ? source : key, result);
+    }
     return result;
   }, []);
 
@@ -638,6 +677,11 @@ export function App() {
           if (cancelGenRef.current !== generation) throw new Error(RENDER_CANCELLED);
         };
         renderingRef.current = true;
+        // M18: Render (F6) asks for this one run at full detail.
+        const forceFull = forceFullRef.current;
+        forceFullRef.current = false;
+        const { mode: previewMode, segments: previewSegments } = previewSettingsRef.current;
+        let reducedParts = 0;
         const startedAt = performance.now();
         renderProgressRef.current = { startedAt, part: 0, parts: 0, stage: null, context: false };
         setRenderStartedAt(startedAt);
@@ -672,6 +716,15 @@ export function App() {
           // First node that failed both render attempts, shown in the status
           // bar so a failure says which node and why (QC audit M4).
           let firstFailure: string | null = null;
+          // M18: every part's isolated render, and its full-detail timing
+          // (carried from before the edit for a part whose text changed).
+          const jobs = set.nodes.map((node) => isolatedRender(set, node, graph.context));
+          const prevTiming = prevTimingSetRef.current;
+          const timings = timingsRef.current.forSet(
+            { fingerprints: set.fingerprints, sources: jobs.map((j) => j.source) },
+            prevTiming && prevTiming.epoch === focusEpochRef.current ? prevTiming : null,
+          );
+          if (isCurrent) prevTimingSetRef.current = { epoch: focusEpochRef.current, fingerprints: set.fingerprints, sources: jobs.map((j) => j.source) };
           for (const [position, node] of set.nodes.entries()) {
             renderProgressRef.current = { startedAt, part: position + 1, parts: set.nodes.length, stage: null, context: false };
             // `*` (disable) — real OpenSCAD never evaluates disabled
@@ -696,11 +749,14 @@ export function App() {
             // instead of being baked into the rendered geometry (see
             // targetedPatch.ts's decomposeNode for why), inside the working
             // set's frame when drilled in (drillIn.ts).
-            const job = isolatedRender(set, node, graph.context);
-            const result = await renderCached(job.source, job.flatSource);
+            const job = jobs[position];
+            const quality = chooseQuality(previewMode, previewSegments, timings[position], forceFull || toolFullIndicesRef.current.has(node.index));
+            const result = await renderCached(job.source, job.flatSource, quality, previewMode === 'auto' && timings[position] === undefined);
             checkCancelled();
             if ('bytes' in result) {
+              if (result.reduced) reducedParts++;
               meshes.push({
+                reduced: result.reduced === true,
                 index: node.index,
                 bytes: result.bytes,
                 transform: job.transform,
@@ -770,9 +826,12 @@ export function App() {
               const job = isolatedRender(level, node, graph.context);
               contextDone++;
               renderProgressRef.current = { startedAt, part: contextDone, parts: contextTotal, stage: null, context: true };
-              const result = await renderCached(job.source, job.flatSource);
+              const known = timingsRef.current.get(job.source);
+              const quality = chooseQuality(previewMode, previewSegments, known, forceFull);
+              const result = await renderCached(job.source, job.flatSource, quality, previewMode === 'auto' && known === undefined);
               checkCancelled();
               if ('bytes' in result) {
+                if (result.reduced) reducedParts++;
                 context.push({
                   index: -1,
                   key: `${depth}:${node.index}`,
@@ -791,6 +850,8 @@ export function App() {
           }
           renderStats().workingMeshes = meshes.length;
           renderStats().contextMeshes = context.length;
+          renderStats().previewMeshes = reducedParts;
+          setRenderDetail({ parts: meshes.length + context.length, reduced: reducedParts });
 
           const expected = set.nodes.length - disabledCount - emptyCount;
           const suffixParts = [
@@ -802,7 +863,7 @@ export function App() {
           setStatus(
             lostPrefix +
               (meshes.length === expected
-                ? `Rendered${disabledSuffix}`
+                ? `Rendered${reducedParts > 0 ? ' (preview)' : ''}${disabledSuffix}`
                 : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}${firstFailure ? ` — ${firstFailure}` : ''}`),
           );
         } catch (err) {
@@ -872,6 +933,7 @@ export function App() {
         // A used file changed: its modules may have, and so may the
         // geometry of every call into it.
         renderCache.current.clear();
+        timingsRef.current.clear();
         setLibraryVersion((v) => v + 1);
         runRender(sourceRef.current);
       }),
@@ -940,6 +1002,7 @@ export function App() {
   // resolve from somewhere else.
   useEffect(() => {
     renderCache.current.clear();
+    timingsRef.current.clear();
   }, [filePath]);
 
   useEffect(() => {
@@ -998,6 +1061,22 @@ export function App() {
     cancelGenRef.current++;
     void window.scadstudio.cancelRender();
   }, []);
+
+  // M18: Render (F6): everything on screen at full detail, once. Later
+  // edits go back to the Auto rule (parts measured slow render as previews).
+  const handleFullRender = useCallback(() => {
+    forceFullRef.current = true;
+    runRender(sourceRef.current);
+  }, [runRender]);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'F6' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      e.preventDefault();
+      handleFullRender();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleFullRender]);
 
   // M10a: the step the render process is on, for the overlay.
   useEffect(
@@ -1588,7 +1667,7 @@ export function App() {
   }, [selectedArgs, customTools]);
 
   // M15: persisted app settings (Settings > Fonts: the code editor's font).
-  const [settings, setSettings] = useState<EditorFontSettings>({ editorFontFamily: '', editorFontSize: 13 });
+  const [settings, setSettings] = useState<AppSettingsState>({ editorFontFamily: '', editorFontSize: 13, previewMode: 'auto', previewSegments: 24 });
   const [settingsOpen, setSettingsOpen] = useState(false);
   useEffect(() => {
     void window.scadstudio
@@ -1596,7 +1675,15 @@ export function App() {
       .then(setSettings)
       .catch((err) => console.error('[scadstudio] settings', err));
   }, []);
-  const handleSettingsChange = useCallback((patch: Partial<EditorFontSettings>) => {
+  // M18: the preview settings reach the render loop through a ref; a change
+  // re-renders (from the cache where it can).
+  useEffect(() => {
+    const prev = previewSettingsRef.current;
+    if (prev.mode === settings.previewMode && prev.segments === settings.previewSegments) return;
+    previewSettingsRef.current = { mode: settings.previewMode, segments: settings.previewSegments };
+    runRender(sourceRef.current);
+  }, [settings.previewMode, settings.previewSegments, runRender]);
+  const handleSettingsChange = useCallback((patch: Partial<AppSettingsState>) => {
     setSettings((s) => ({ ...s, ...patch }));
     void window.scadstudio
       .updateSettings(patch)
@@ -1864,6 +1951,16 @@ export function App() {
     setTool(null);
     setMakeVar(null);
   }, [toolFocusDepth]);
+  // M18: a part an open Distance / Align / Pattern tool sizes from its mesh
+  // must be the full render (a coarser circle is smaller). While the tool is
+  // open its parts always render in full; if one on screen is a preview,
+  // render it again now.
+  useEffect(() => {
+    const parts = !tool ? [] : tool.kind === 'pattern' ? [tool.part] : [tool.move, tool.reference];
+    const indices = new Set(parts.filter((i): i is number => i !== null));
+    toolFullIndicesRef.current = indices;
+    if (nodeMeshes.some((m) => m.reduced && indices.has(m.index))) runRender(sourceRef.current);
+  }, [tool, nodeMeshes, runRender]);
   const measureIndex = useCallback((index: number) => () => meshBox(nodeMeshes.find((m) => m.index === index)), [nodeMeshes]);
   // Distance's default: the distance the parts are at now.
   useEffect(() => {
@@ -2448,7 +2545,7 @@ export function App() {
         <button onClick={() => focusSelectionRef.current()} title="Frame the selected part, keeping the view angle (F)">
           Focus
         </button>
-        <button onClick={() => setSettingsOpen(true)} title="Settings (editor font)">
+        <button onClick={() => setSettingsOpen(true)} title="Settings (editor font, quick preview)">
           Settings
         </button>
         <button onClick={() => setVariablesOpen((o) => !o)} aria-pressed={variablesOpen} title="Show or hide the variables panel">
@@ -2923,6 +3020,7 @@ export function App() {
         </div>
         <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333', position: 'relative' }}>
           {renderStartedAt !== null && renderIsSlow && <RenderProgressOverlay progressRef={renderProgressRef} onCancel={handleCancelRender} />}
+          <RenderDetailBadge detail={renderDetail} rendering={renderStartedAt !== null} onRender={handleFullRender} />
           <ErrorBoundary label="The 3D view" resetKey={nodeMeshes}>
             <Viewport
               meshes={nodeMeshes}

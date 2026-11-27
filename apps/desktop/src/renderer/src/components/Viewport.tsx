@@ -235,6 +235,8 @@ export interface NodeMesh {
   transformEditable?: boolean;
   // Unique key for context (dimmed) meshes, which have no working-set index.
   key?: string;
+  // M18: rendered as a quick preview (curve detail lowered).
+  reduced?: boolean;
   // M10a: text, which has an up and a reading direction (its local +Y and
   // +X, seen from +Z). Focus faces it square and level.
   upright?: boolean;

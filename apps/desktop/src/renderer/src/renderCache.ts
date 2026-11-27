@@ -10,7 +10,9 @@
 // edit to it adds another entry, so a count-only cache could hold gigabytes
 // and take the window down with it. Least recently used entries go first.
 
-export type CachedRender = { bytes: Uint8Array } | { firstError: unknown; secondError: unknown };
+// M18: `reduced` marks a preview (curve detail lowered); `engineMs` is how
+// long the engine took.
+export type CachedRender = { bytes: Uint8Array; reduced?: boolean; engineMs?: number; detailFactor?: number } | { firstError: unknown; secondError: unknown };
 
 // Failed renders hold no mesh; count them as a nominal size so a flood of
 // failures is still bounded by the entry limit.

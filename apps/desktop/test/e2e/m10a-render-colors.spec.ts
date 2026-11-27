@@ -221,6 +221,8 @@ translate([0, 16, 0]) difference() { color("goldenrod") cube(10); color("red") t
 
   test('a long render shows progress over a greyed-out model, and Cancel keeps the last finished render', async ({ scad }) => {
     test.setTimeout(240_000);
+    // A full-detail render, so it is long enough to cancel (M18).
+    await scad.setQuickPreview('off');
     expect(await scad.load('color("goldenrod") cube(10);')).toBe('Rendered');
     await scad.resetView();
     const goldBefore = await countPixels(scad, isGold);

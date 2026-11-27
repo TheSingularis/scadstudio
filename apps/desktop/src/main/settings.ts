@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { PREVIEW_SEGMENT_CHOICES } from './previewDetail';
 
 // M15: the app's first persisted settings (Settings > Fonts sets the code
 // editor's font, decided with Jordan 2026-11-25). Fonts used *in models*
@@ -11,11 +12,22 @@ export interface AppSettings {
   // CSS font-family name, or '' for the built-in default.
   editorFontFamily: string;
   editorFontSize: number;
+  // M18 (decided with Jordan 2026-11-27): when edits render at reduced
+  // curve detail. 'auto': parts whose last full render took 2 s or more
+  // (and parts not measured yet); 'always': every part; 'off': never.
+  previewMode: PreviewMode;
+  // Segments per full circle a preview caps curves at.
+  previewSegments: number;
 }
+
+export type PreviewMode = 'auto' | 'always' | 'off';
+export const PREVIEW_MODES: readonly PreviewMode[] = ['auto', 'always', 'off'];
 
 export const DEFAULT_SETTINGS: AppSettings = {
   editorFontFamily: '',
   editorFontSize: 13,
+  previewMode: 'auto',
+  previewSegments: 24,
 };
 
 export const MIN_EDITOR_FONT_SIZE = 8;
@@ -26,9 +38,13 @@ export function normalizeSettings(raw: unknown): AppSettings {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Partial<Record<keyof AppSettings, unknown>>;
   const family = typeof r.editorFontFamily === 'string' ? r.editorFontFamily.replace(/["\\;{}]/g, '').trim().slice(0, 200) : '';
   const size = typeof r.editorFontSize === 'number' && Number.isFinite(r.editorFontSize) ? Math.round(r.editorFontSize) : DEFAULT_SETTINGS.editorFontSize;
+  const mode = PREVIEW_MODES.includes(r.previewMode as PreviewMode) ? (r.previewMode as PreviewMode) : DEFAULT_SETTINGS.previewMode;
+  const segments = (PREVIEW_SEGMENT_CHOICES as readonly unknown[]).includes(r.previewSegments) ? (r.previewSegments as number) : DEFAULT_SETTINGS.previewSegments;
   return {
     editorFontFamily: family,
     editorFontSize: Math.min(MAX_EDITOR_FONT_SIZE, Math.max(MIN_EDITOR_FONT_SIZE, size)),
+    previewMode: mode,
+    previewSegments: segments,
   };
 }
 
