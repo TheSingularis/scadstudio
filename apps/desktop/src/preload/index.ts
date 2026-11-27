@@ -47,7 +47,16 @@ export interface AppSettings {
 }
 
 const api = {
+  // Binary STL with a per-face color trailer (src/main/offMesh.ts).
   renderScad: (source: string): Promise<Uint8Array> => ipcRenderer.invoke('scad:render', source),
+  // M10a: stop the render in progress (and any queued behind it).
+  cancelRender: (): Promise<boolean> => ipcRenderer.invoke('scad:cancelRender'),
+  // M10a: which step the current render is on.
+  onRenderStage: (callback: (stage: 'preparing' | 'engine' | 'mesh') => void): (() => void) => {
+    const listener = (_event: unknown, stage: 'preparing' | 'engine' | 'mesh') => callback(stage);
+    ipcRenderer.on('scad:renderStage', listener);
+    return () => ipcRenderer.removeListener('scad:renderStage', listener);
+  },
   openFile: (): Promise<OpenFileResult | OpenFileSaveFirst | null> => ipcRenderer.invoke('scad:openFile'),
   // M9: open a known file (a library module's source) without a dialog.
   openPath: (filePath: string): Promise<OpenFileResult | OpenFileSaveFirst | null> => ipcRenderer.invoke('scad:openPath', filePath),

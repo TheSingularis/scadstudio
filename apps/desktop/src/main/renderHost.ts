@@ -1,5 +1,5 @@
-import { ScadRenderError, type RenderOptions } from './scadRender';
-import type { RenderReply, RenderRequest } from './renderWorker';
+import { ScadRenderError, type RenderOptions, type RenderStage } from './scadRender';
+import { isStageMessage, type RenderRequest, type RenderWorkerMessage } from './renderWorker';
 
 // Runs renders in a separate render process (renderWorker.ts), one at a
 // time, and keeps the app alive whatever happens to it.
@@ -15,11 +15,12 @@ import type { RenderReply, RenderRequest } from './renderWorker';
 
 // Keep in step with src/renderer/src/renderErrors.ts (unit-tested).
 export const ENGINE_CRASH_PREFIX = 'The OpenSCAD engine stopped';
+export const RENDER_CANCELLED_MESSAGE = 'Render cancelled';
 
 /** The parts of Electron's UtilityProcess this uses (a test can fake them). */
 export interface RenderChild {
   postMessage(message: RenderRequest): void;
-  on(event: 'message', listener: (message: RenderReply) => void): unknown;
+  on(event: 'message', listener: (message: RenderWorkerMessage) => void): unknown;
   on(event: 'exit', listener: (code: number) => void): unknown;
   kill(): boolean;
 }
@@ -35,6 +36,7 @@ interface Pending {
   id: number;
   resolve: (bytes: Uint8Array) => void;
   reject: (err: Error) => void;
+  onStage?: (stage: RenderStage) => void;
 }
 
 export function engineCrashMessage(code: number | null): string {
@@ -52,6 +54,7 @@ export class RenderHost {
   // Renders run one after another: each is CPU-bound, and a single process
   // keeps memory predictable.
   private queue: Promise<unknown> = Promise.resolve();
+  private cancelGeneration = 0;
   /** Render processes started so far (for tests and diagnostics). */
   spawnCount = 0;
 
@@ -60,10 +63,33 @@ export class RenderHost {
     private readonly options: RenderHostOptions = {},
   ) {}
 
-  render(source: string, options: RenderOptions = {}): Promise<Uint8Array> {
-    const run = this.queue.then(() => this.renderNow(source, options));
+  render(source: string, options: RenderOptions = {}, onStage?: (stage: RenderStage) => void): Promise<Uint8Array> {
+    const generation = this.cancelGeneration;
+    const run = this.queue.then(() => {
+      // Queued before a Cancel: it is part of what was cancelled.
+      if (generation !== this.cancelGeneration) throw new ScadRenderError(RENDER_CANCELLED_MESSAGE, []);
+      return this.renderNow(source, options, onStage);
+    });
     this.queue = run.catch(() => {});
     return run;
+  }
+
+  /**
+   * M10a: stop the render in progress (the user pressed Cancel). The engine
+   * can't be interrupted inside its process, so the process is killed; the
+   * next render starts a fresh one, which costs a fraction of a second.
+   * Renders queued behind it are cancelled too. Returns whether a render
+   * was running.
+   */
+  cancel(): boolean {
+    this.cancelGeneration++;
+    const p = this.pending;
+    if (!p) return false;
+    const child = this.child;
+    this.pending = null;
+    if (child) this.retire(child);
+    p.reject(new ScadRenderError(RENDER_CANCELLED_MESSAGE, []));
+    return true;
   }
 
   /** Stop the render process (rejecting a render in progress). */
@@ -82,6 +108,10 @@ export class RenderHost {
       if (child !== this.child) return;
       const p = this.pending;
       if (!p || reply.id !== p.id) return;
+      if (isStageMessage(reply)) {
+        p.onStage?.(reply.stage);
+        return;
+      }
       this.pending = null;
       const limit = this.options.recycleAboveBytes;
       if (limit !== undefined && reply.rss > limit) this.retire(child);
@@ -109,7 +139,7 @@ export class RenderHost {
     p?.reject(err);
   }
 
-  private renderNow(source: string, options: RenderOptions): Promise<Uint8Array> {
+  private renderNow(source: string, options: RenderOptions, onStage?: (stage: RenderStage) => void): Promise<Uint8Array> {
     return new Promise<Uint8Array>((resolve, reject) => {
       let child: RenderChild;
       try {
@@ -119,7 +149,7 @@ export class RenderHost {
         return;
       }
       const id = this.nextId++;
-      this.pending = { id, resolve, reject };
+      this.pending = { id, resolve, reject, onStage };
       try {
         child.postMessage({ id, source, options });
       } catch {

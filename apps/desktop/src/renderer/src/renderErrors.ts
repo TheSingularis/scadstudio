@@ -14,3 +14,13 @@ export const ENGINE_CRASH_PREFIX = 'The OpenSCAD engine stopped';
 export function isEngineCrash(err: unknown): boolean {
   return renderErrorMessage(err).includes(ENGINE_CRASH_PREFIX);
 }
+
+// M10a: the message a render is rejected with when the user pressed Cancel
+// (src/main/renderHost.ts keeps the same text; a unit test holds the two in
+// step).
+export const RENDER_CANCELLED_MESSAGE = 'Render cancelled';
+
+/** Whether a render failed because the user cancelled it. */
+export function isRenderCancelled(err: unknown): boolean {
+  return renderErrorMessage(err).startsWith(RENDER_CANCELLED_MESSAGE);
+}

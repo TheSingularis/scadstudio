@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentRef, type ReactNode, type RefObject } from 'react';
-import { Canvas, useThree } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges, Html } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import type { ThreeEvent } from '@react-three/fiber';
-import { Color, Mesh, Vector3, Quaternion, PerspectiveCamera, type BufferGeometry, type Group } from 'three';
+import { Box3, Sphere, BufferGeometry, Color, DirectionalLight, SRGBColorSpace, EdgesGeometry, Mesh, MeshStandardMaterial, Vector3, Quaternion, PerspectiveCamera, type Group } from 'three';
+import { readFaceColors, summarizeFaceColors, vertexColorAttribute } from '../meshColors';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 
 const DEFAULT_MESH_COLOR = '#4a90d9';
+// The same, as sRGB bytes, for faces nothing colored (meshColors.ts).
+const DEFAULT_MESH_RGB: [number, number, number] = [0x4a, 0x90, 0xd9];
 // A single selection (or the *first*-clicked shape in a multi-select) reads
 // as the "base" — the thing difference() subtracts from, union()/
 // intersection()'s first argument, etc. Every other selected shape reads as
@@ -18,6 +24,25 @@ export const OPERAND_MESH_COLOR = '#d9534f';
 // selection-role colors above so it reads unambiguously regardless of
 // whether the highlighted node is also currently selected.
 export const HIGHLIGHT_MESH_COLOR = '#a855f7';
+// M10a: selection, boolean roles, `#` and hover are a tint over the part's
+// own colors (and, for selection, its crease edges drawn in the role color),
+// not a replacement color, so a selected part still shows what color it is.
+// A part with no colors of its own (the default blue) is still drawn fully
+// in the highlight color, as before.
+// How far each pulls the surface color toward its highlight color:
+const SELECTED_TINT = 0.45;
+const HIGHLIGHT_TINT = 0.5;
+const HOVER_TINT = 0.18;
+const HOVER_TINT_COLOR = '#ffffff';
+// Edges sharper than this get the role-colored outline when selected. Much
+// coarser than the shading mode's 1 degree, so a dense curved surface shows
+// its outline and creases, not every facet.
+const SELECTION_EDGE_THRESHOLD_DEG = 35;
+// M10a: while a render is running, the parts on screen are the previous
+// render's: they are pulled most of the way toward grey, so it reads as out
+// of date until the new meshes arrive.
+const STALE_TINT_COLOR = '#7d828a';
+const STALE_TINT = 0.65;
 // `%` (background/ghost) opacity — real OpenSCAD renders these translucent
 // and excludes them from the final CSG output; this app only ever renders
 // top-level statements independently (no single merged CSG output to
@@ -71,6 +96,100 @@ function geometryFor(bytes: Uint8Array): BufferGeometry {
   return geom;
 }
 
+// M10a: the same geometry with the render's own face colors as a vertex
+// color attribute (meshColors.ts), or null when it has none worth drawing
+// (no color trailer, or every face uncolored, which draws in the default
+// color as before). Shares position/normal with geometryFor's geometry, so
+// the GPU holds those once.
+interface ColoredGeometry {
+  geometry: BufferGeometry;
+  translucent: boolean;
+}
+const coloredCache = new WeakMap<Uint8Array, ColoredGeometry | null>();
+function coloredGeometryFor(bytes: Uint8Array): ColoredGeometry | null {
+  if (coloredCache.has(bytes)) return coloredCache.get(bytes)!;
+  const faces = readFaceColors(bytes);
+  let result: ColoredGeometry | null = null;
+  if (faces) {
+    const summary = summarizeFaceColors(faces);
+    if (!summary.allDefault || summary.translucent) {
+      const base = geometryFor(bytes);
+      const geometry = new BufferGeometry();
+      geometry.setAttribute('position', base.getAttribute('position'));
+      geometry.setAttribute('normal', base.getAttribute('normal'));
+      geometry.setAttribute('color', vertexColorAttribute(faces, DEFAULT_MESH_RGB));
+      result = { geometry, translucent: summary.translucent };
+    }
+  }
+  coloredCache.set(bytes, result);
+  return result;
+}
+
+// M10a: crease edges for the selection outline, computed once per geometry,
+// as wide lines (plain WebGL lines are one pixel, too thin to notice).
+const selectionEdgesCache = new WeakMap<BufferGeometry, LineSegmentsGeometry>();
+function selectionEdgesFor(geometry: BufferGeometry): LineSegmentsGeometry {
+  let edges = selectionEdgesCache.get(geometry);
+  if (!edges) {
+    edges = new LineSegmentsGeometry().fromEdgesGeometry(new EdgesGeometry(geometry, SELECTION_EDGE_THRESHOLD_DEG));
+    selectionEdgesCache.set(geometry, edges);
+  }
+  return edges;
+}
+const SELECTION_EDGE_WIDTH_PX = 2.5;
+
+function SelectionEdges({ geometry, color, opacity }: { geometry: LineSegmentsGeometry; color: string; opacity: number }) {
+  const size = useThree((state) => state.size);
+  const material = useMemo(() => new LineMaterial({ linewidth: SELECTION_EDGE_WIDTH_PX, transparent: true }), []);
+  const line = useMemo(() => {
+    const l = new LineSegments2(geometry, material);
+    l.raycast = () => {};
+    return l;
+  }, [geometry, material]);
+  useEffect(() => () => material.dispose(), [material]);
+  material.color.set(color);
+  material.opacity = opacity;
+  material.resolution.set(size.width, size.height);
+  return <primitive object={line} />;
+}
+
+// M10a: MeshStandardMaterial plus one step after the base color is known:
+// mix it toward uTint by uTintAmount. That is what lets selection, hover and
+// the stale state tint a part's real colors (vertex colors included) instead
+// of replacing them. One shader program for every mesh (the cache key), and
+// changing the tint only updates two uniforms.
+function useTintedMaterial(): { material: MeshStandardMaterial; setTint: (color: string | null, amount: number) => void } {
+  const material = useMemo(() => {
+    // Pushed back a little in depth, so edge lines drawn on the surface
+    // (selection outline, Shaded + edges) win over the faces they lie on.
+    const m = new MeshStandardMaterial({ polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+    const uniforms = { uTint: { value: new Color() }, uTintAmount: { value: 0 } };
+    m.userData.tint = uniforms;
+    m.onBeforeCompile = (shader) => {
+      shader.uniforms.uTint = uniforms.uTint;
+      shader.uniforms.uTintAmount = uniforms.uTintAmount;
+      shader.fragmentShader =
+        'uniform vec3 uTint;\nuniform float uTintAmount;\n' +
+        shader.fragmentShader.replace(
+          '#include <color_fragment>',
+          '#include <color_fragment>\n\tdiffuseColor.rgb = mix(diffuseColor.rgb, uTint, uTintAmount);',
+        );
+    };
+    m.customProgramCacheKey = () => 'scadstudio-tint';
+    return m;
+  }, []);
+  useEffect(() => () => material.dispose(), [material]);
+  const setTint = useCallback(
+    (color: string | null, amount: number) => {
+      const u = material.userData.tint as { uTint: { value: Color }; uTintAmount: { value: number } };
+      if (color) u.uTint.value.set(color);
+      u.uTintAmount.value = color ? amount : 0;
+    },
+    [material],
+  );
+  return { material, setTint };
+}
+
 // M7.5 point 5: how meshes draw. 'edges' overlays each mesh's facet edges
 // (EdgesGeometry, so coplanar triangle diagonals from the STL triangulation
 // are dropped and only real polygon boundaries show — the same facets real
@@ -116,6 +235,9 @@ export interface NodeMesh {
   transformEditable?: boolean;
   // Unique key for context (dimmed) meshes, which have no working-set index.
   key?: string;
+  // M10a: text, which has an up and a reading direction (its local +Y and
+  // +X, seen from +Z). Focus faces it square and level.
+  upright?: boolean;
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
@@ -145,6 +267,9 @@ interface ViewportProps {
   // parameter) don't yank the camera around. App.tsx changes it only when a
   // genuinely new file is opened or the user explicitly clicks "Reset View".
   fitToken: string;
+  // M10a: frame this node once its mesh is on screen (a shape a sketch just
+  // added or changed). A new token asks again.
+  focusRequest?: FocusRequest | null;
   // M7.5: null outside sketch mode (free orbit, as today). Non-null drives
   // the camera to that plane's canonical view (SketchController) and locks
   // orbit rotation (pan/zoom still work) for the duration — see PLAN.md
@@ -214,6 +339,9 @@ interface ViewportProps {
   // see-through and a click that passes through it picks the cutter behind
   // it, so subtracted shapes inside the base can be seen and selected.
   cuttersFirst?: boolean;
+  // M10a: a render is running and has taken long enough to notice, so the
+  // meshes on screen are out of date: they are drawn greyed out.
+  stale?: boolean;
 }
 
 // M9: places a working set's nodes in their parent's frame. A plain group
@@ -275,9 +403,17 @@ function NodeModel({
   onDrill,
   flashToken,
   cuttersFirst = false,
+  hovered = false,
+  onHover,
+  stale = false,
 }: {
   mesh: NodeMesh;
   cuttersFirst?: boolean;
+  // M10a: the pointer is over this part (a light tint), and whether the
+  // viewport shows an older render while a new one runs (grey tint).
+  hovered?: boolean;
+  onHover?: (index: number | null) => void;
+  stale?: boolean;
   role: SelectionRole;
   shading: ShadingMode;
   onDrill?: (index: number) => void;
@@ -312,21 +448,46 @@ function NodeModel({
   // manual pivot/bounding-box math and no reset-on-render hack are needed:
   // these props are always driven fresh from the parsed source, exactly like
   // a normal declarative React prop.
-  const geometry = useMemo(() => geometryFor(mesh.bytes), [mesh.bytes]);
+  //
+  // M10a: the render's own face colors draw as vertex colors, unless the
+  // node has an outer color() of its own, which in OpenSCAD wins over every
+  // color inside it (meshColors.ts), so then the whole mesh takes that one.
+  const plainGeometry = useMemo(() => geometryFor(mesh.bytes), [mesh.bytes]);
+  const colored = useMemo(() => (mesh.transform.color ? null : coloredGeometryFor(mesh.bytes)), [mesh.bytes, mesh.transform.color]);
+  const geometry = colored?.geometry ?? plainGeometry;
 
   const quaternion = useMemo(() => transformToQuaternion(mesh.transform.rotateDeg), [mesh.transform.rotateDeg]);
-  // OpenSCAD's color() takes 0-1 floats, which is exactly what three.js's
-  // Color(r, g, b) constructor expects — no conversion needed.
-  const materialColor = useMemo(() => {
-    if (role === 'base') return SELECTED_MESH_COLOR;
-    if (role === 'operand') return OPERAND_MESH_COLOR;
-    if (mesh.modifier === '#') return HIGHLIGHT_MESH_COLOR;
+  // OpenSCAD's color() takes 0-1 sRGB values. three.js's Color(r, g, b)
+  // reads them as linear, which washed every color() out (found in M10a,
+  // comparing with the same color drawn from the render's face colors), so
+  // they are given as sRGB.
+  const ownColor = useMemo(() => {
     const c = mesh.transform.color;
-    return c ? new Color(c[0], c[1], c[2]) : DEFAULT_MESH_COLOR;
-  }, [role, mesh.modifier, mesh.transform.color]);
+    return c ? new Color().setRGB(c[0], c[1], c[2], SRGBColorSpace) : DEFAULT_MESH_COLOR;
+  }, [mesh.transform.color]);
+  // The highlight this part wears: selection role first, then `#`, then hover.
+  const roleColor = role === 'base' ? SELECTED_MESH_COLOR : role === 'operand' ? OPERAND_MESH_COLOR : null;
+  const highlightColor = roleColor ?? (mesh.modifier === '#' ? HIGHLIGHT_MESH_COLOR : null);
+  // Wireframe has no surface to tint, so its lines carry the highlight.
+  const wireColor = highlightColor ?? ownColor;
   // color([r,g,b,a])'s alpha, shown translucent the way OpenSCAD's preview
   // shows it (QC audit M2).
   const colorAlpha = mesh.transform.color?.length === 4 ? Math.min(1, Math.max(0, mesh.transform.color[3])) : 1;
+  const { material, setTint } = useTintedMaterial();
+  // A part with no colors of its own draws in the app's default blue, which
+  // isn't a color the user chose: there the highlight replaces it fully, as
+  // before M10a (a half tint of amber over blue comes out a muddy grey).
+  const hasOwnColors = !!colored || !!mesh.transform.color;
+  useEffect(() => {
+    if (highlightColor) setTint(highlightColor, !hasOwnColors ? 1 : roleColor ? SELECTED_TINT : HIGHLIGHT_TINT);
+    else if (hovered) setTint(HOVER_TINT_COLOR, HOVER_TINT);
+    else if (stale) setTint(STALE_TINT_COLOR, STALE_TINT);
+    else setTint(null, 0);
+  }, [highlightColor, roleColor, hovered, stale, setTint, hasOwnColors]);
+  const selectionEdges = useMemo(
+    () => (roleColor && shading === 'shaded' ? selectionEdgesFor(plainGeometry) : null),
+    [roleColor, shading, plainGeometry],
+  );
   // `%` stays translucent regardless of selection/highlight — it's a
   // persistent "ghost reference" state, not something selecting the node
   // should visually override.
@@ -350,7 +511,10 @@ function NodeModel({
 
   return (
     <group
-      ref={(g) => onGroupRef(mesh.index, g)}
+      ref={(g) => {
+        if (g) g.userData.mesh = mesh;
+        onGroupRef(mesh.index, g);
+      }}
       position={mesh.transform.translate}
       quaternion={[quaternion.x, quaternion.y, quaternion.z, quaternion.w]}
       scale={mesh.transform.scale}
@@ -390,14 +554,23 @@ function NodeModel({
           e.stopPropagation();
           onDrill(clickedIndex(e));
         }}
+        onPointerOver={(e: ThreeEvent<PointerEvent>) => {
+          if (sketchActive || !onHover) return;
+          e.stopPropagation();
+          onHover(mesh.index);
+        }}
+        onPointerOut={() => onHover?.(null)}
         userData={{ scadIndex: mesh.index }}
       >
-        <meshStandardMaterial
-          color={materialColor}
+        <primitive
+          object={material}
+          attach="material"
+          color={colored ? '#ffffff' : ownColor}
+          vertexColors={!!colored}
           emissive={flashing ? FLASH_EMISSIVE : '#000000'}
           emissiveIntensity={flashing ? 0.55 : 0}
           side={2}
-          transparent={isGhost || colorAlpha < 1 || seeThroughBase}
+          transparent={isGhost || colorAlpha < 1 || seeThroughBase || !!colored?.translucent}
           opacity={editing ? EDITING_REFERENCE_OPACITY : isGhost ? GHOST_OPACITY : seeThroughBase ? SEE_THROUGH_BASE_OPACITY : colorAlpha}
           depthWrite={!editing && !seeThroughBase}
           // Hidden surface still raycasts (only drawing is skipped, same
@@ -405,12 +578,13 @@ function NodeModel({
           // in wireframe mode.
           visible={shading !== 'wireframe'}
         />
+        {selectionEdges && <SelectionEdges geometry={selectionEdges} color={roleColor!} opacity={isGhost ? GHOST_OPACITY : 1} />}
         {shading !== 'shaded' && (
           <Edges
             threshold={EDGE_THRESHOLD_DEG}
             // Wireframe carries the selection/highlight color on the edges
             // themselves, since there's no surface left to show it.
-            color={shading === 'wireframe' ? materialColor : EDGE_OVERLAY_COLOR}
+            color={shading === 'wireframe' ? wireColor : roleColor ?? EDGE_OVERLAY_COLOR}
             lineWidth={shading === 'wireframe' ? 1.5 : 1}
             transparent={isGhost}
             opacity={isGhost ? GHOST_OPACITY : 1}
@@ -419,6 +593,37 @@ function NodeModel({
       </mesh>
     </group>
   );
+}
+
+// M10a lighting. With real model colors on screen they should look the way
+// OpenSCAD shows them, and the old fixed light (from +Y, behind the default
+// front-right-top view) left every face facing the camera in shadow, about
+// half its color. A light that rides with the camera (as OpenSCAD's own
+// viewer and most CAD viewers do) keeps whatever faces you look at lit,
+// from slightly above and to the left so the faces still read apart.
+const AMBIENT_LIGHT = 0.7;
+const HEADLIGHT = 1.6;
+const HEADLIGHT_OFFSET = new Vector3(-0.35, 0.5, 0); // camera-space: left, up
+function HeadLight() {
+  const light = useMemo(() => new DirectionalLight('#ffffff', HEADLIGHT), []);
+  const camera = useThree((state) => state.camera);
+  const scene = useThree((state) => state.scene);
+  useEffect(() => {
+    scene.add(light.target);
+    return () => {
+      scene.remove(light.target);
+    };
+  }, [scene, light]);
+  const forward = useMemo(() => new Vector3(), []);
+  const offset = useMemo(() => new Vector3(), []);
+  useFrame(() => {
+    camera.getWorldDirection(forward);
+    offset.copy(HEADLIGHT_OFFSET).applyQuaternion(camera.quaternion);
+    light.position.copy(camera.position).add(offset);
+    light.target.position.copy(camera.position).add(forward);
+    light.target.updateMatrixWorld();
+  });
+  return <primitive object={light} />;
 }
 
 // Matches <Canvas camera={{ position: DEFAULT_CAMERA_POSITION, ... }}> below —
@@ -505,7 +710,20 @@ const GLOBAL_SKETCH_PLANE_VIEWS: Record<'XY' | 'XZ' | 'YZ', CameraView> = {
   XZ: NAMED_VIEWS.front,
   YZ: NAMED_VIEWS.right,
 };
+// Camera distance for a sketch plane on an empty scene. With content, the
+// distance fits it instead (M10a: the fixed 60 was too close for a large
+// model and too far for a small one; see sketchCameraDistance).
 const SKETCH_CAMERA_DISTANCE = 60;
+const SKETCH_CAMERA_MIN_DISTANCE = 10;
+
+// M10a: far enough back to see everything on screen from `target`: the
+// distance Bounds would fit the content at, plus how far the content's
+// center is from where the camera looks.
+function sketchCameraDistance(bounds: BoundsApi, target: Vec3): number {
+  const { center, distance } = bounds.refresh().getSize();
+  if (!Number.isFinite(distance) || distance <= 0) return SKETCH_CAMERA_DISTANCE;
+  return Math.max(SKETCH_CAMERA_MIN_DISTANCE, distance + center.distanceTo(new Vector3(...target)));
+}
 
 // The actual world-space mapping each rotation produces per axis is a
 // documented side effect of the rotation math, not something independently
@@ -579,14 +797,26 @@ function animateCameraTo(bounds: BoundsApi, target: Vec3, view: CameraView, dist
 
 // Sibling to FitController, same "lives inside <Bounds> for useBounds, fires
 // on prop change only" shape.
-function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSketchPlane | null }) {
+//
+// M10a: entering sketch mode saves the view, and leaving puts it back
+// (it used to reset to the default view, which threw away the user's angle;
+// Jordan, 2026-11-27). A shape added in the sketch is then framed by
+// FocusController once it has rendered.
+function SketchController({ activeSketchPlane, viewApiRef }: { activeSketchPlane: ActiveSketchPlane | null; viewApiRef: RefObject<ViewApi | null> }) {
   const bounds = useBounds();
+  const savedRef = useRef<SavedView | null>(null);
   useEffect(() => {
-    if (!activeSketchPlane) return;
+    if (!activeSketchPlane) {
+      const saved = savedRef.current;
+      savedRef.current = null;
+      if (saved) viewApiRef.current?.restore(saved);
+      return;
+    }
+    if (!savedRef.current) savedRef.current = viewApiRef.current?.snapshot() ?? null;
     const { kind, rotationDeg } = activeSketchPlane;
     const focus = activeSketchPlane.focus ?? activeSketchPlane.origin;
     if (kind !== 'face') {
-      animateCameraTo(bounds, [0, 0, 0], GLOBAL_SKETCH_PLANE_VIEWS[kind], SKETCH_CAMERA_DISTANCE);
+      animateCameraTo(bounds, [0, 0, 0], GLOBAL_SKETCH_PLANE_VIEWS[kind], sketchCameraDistance(bounds, [0, 0, 0]));
       return;
     }
     // Face-derived plane: no hand-picked view to preserve, so the view is
@@ -600,9 +830,67 @@ function SketchController({ activeSketchPlane }: { activeSketchPlane: ActiveSket
       bounds,
       focus,
       { direction: [normal.x, normal.y, normal.z], up: [up.x, up.y, up.z] },
-      SKETCH_CAMERA_DISTANCE,
+      sketchCameraDistance(bounds, focus),
     );
+    // viewApiRef is a stable ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSketchPlane, bounds]);
+  return null;
+}
+
+// M10a: frame some parts, keeping the view's angle (like Unity's F): the
+// Focus button / F key on the selection, and a shape a sketch just added
+// or changed once its new mesh is on screen. Waits (a few frames at most)
+// for each part's group to hold its current mesh, since the Canvas mounts
+// a new one a frame or so after the meshes change. The box is the parts'
+// world bounds, so their own translate/rotate and any drill-in frame count.
+export interface FocusRequest {
+  token: number;
+  indices: number[];
+}
+function FocusController({
+  request,
+  meshes,
+  groupsByIndex,
+  viewApiRef,
+}: {
+  request: FocusRequest | null;
+  meshes: NodeMesh[];
+  groupsByIndex: RefObject<Map<number, Group>>;
+  viewApiRef: RefObject<ViewApi | null>;
+}) {
+  const pending = useRef<{ indices: number[]; frames: number } | null>(null);
+  useEffect(() => {
+    pending.current = request && request.indices.length > 0 ? { indices: request.indices, frames: 0 } : null;
+  }, [request?.token]); // eslint-disable-line react-hooks/exhaustive-deps
+  useFrame(() => {
+    const p = pending.current;
+    if (!p) return;
+    if (++p.frames > 120) {
+      pending.current = null;
+      return;
+    }
+    const box = new Box3();
+    for (const index of p.indices) {
+      const mesh = meshes.find((m) => m.index === index);
+      const group = groupsByIndex.current?.get(index);
+      if (!mesh || !group || group.userData.mesh !== mesh) return;
+      box.expandByObject(group);
+    }
+    if (box.isEmpty()) return;
+    pending.current = null;
+    // One upright part (text): look at its face, its up as screen-up.
+    let facing: CameraView | undefined;
+    const only = p.indices.length === 1 ? meshes.find((m) => m.index === p.indices[0]) : undefined;
+    const group = only?.upright ? groupsByIndex.current?.get(only.index) : undefined;
+    if (group) {
+      const q = group.getWorldQuaternion(new Quaternion());
+      const n = new Vector3(0, 0, 1).applyQuaternion(q);
+      const up = new Vector3(0, 1, 0).applyQuaternion(q);
+      facing = { direction: [n.x, n.y, n.z], up: [up.x, up.y, up.z] };
+    }
+    viewApiRef.current?.frameBox(box, facing);
+  });
   return null;
 }
 
@@ -618,10 +906,28 @@ const VIEW_STEPS: { step: ViewStep; glyph: string; title: string; dx: number; dy
   { step: 'rollCw', glyph: '↻', title: 'Roll view clockwise 90°', dx: 58, dy: -58 },
 ];
 
+interface SavedView {
+  view: CameraView;
+  target: Vec3;
+  distance: number;
+}
 interface ViewApi {
   orient: (view: CameraView) => void;
   step: (step: ViewStep) => void;
+  // M10a: the view as it is now (or where it's animating to), and a move
+  // back to one saved earlier. Sketch mode saves on entry and restores on
+  // leaving, instead of resetting to the default view.
+  snapshot: () => SavedView;
+  restore: (saved: SavedView) => void;
+  // M10a: keeps the view's direction and centers on `box`, close enough to
+  // fill the view with it (a new sketch shape, after leaving sketch mode).
+  // With `view`, turns to that direction and screen-up as well.
+  frameBox: (box: Box3, view?: CameraView) => void;
 }
+
+// How much room frameBox leaves around the box (same as <Bounds margin>).
+const FRAME_MARGIN = 1.2;
+const FRAME_MIN_DISTANCE = 5;
 
 // Bounds' default animation length (its maxDuration prop, left unset below).
 const VIEW_ANIMATION_MS = 1000;
@@ -690,6 +996,22 @@ function ViewController({ apiRef }: { apiRef: RefObject<ViewApi | null> }) {
           up.applyAxisAngle(direction, step === 'rollCw' ? quarter : -quarter);
         }
         go({ direction: [direction.x, direction.y, direction.z], up: [up.x, up.y, up.z] }, target, distance);
+      },
+      snapshot: () => {
+        const { view, target, distance } = current();
+        return { view, target, distance };
+      },
+      restore: (saved) => go(saved.view, saved.target, saved.distance),
+      frameBox: (box, facing) => {
+        const view = facing ?? current().view;
+        const sphere = box.getBoundingSphere(new Sphere());
+        const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
+        const aspect = camera instanceof PerspectiveCamera ? camera.aspect : 1;
+        // The narrower of the two view angles decides how far back to sit.
+        const halfV = (fov * Math.PI) / 360;
+        const half = Math.min(halfV, Math.atan(Math.tan(halfV) * aspect));
+        const distance = Math.max(FRAME_MIN_DISTANCE, (sphere.radius * FRAME_MARGIN) / Math.sin(half));
+        go(view, [sphere.center.x, sphere.center.y, sphere.center.z], distance);
       },
     };
     return () => {
@@ -1080,6 +1402,7 @@ export function Viewport({
   rotateSpace,
   onTransformCommit,
   fitToken,
+  focusRequest = null,
   activeSketchPlane,
   pickingFace,
   onPickFace,
@@ -1101,7 +1424,13 @@ export function Viewport({
   editable = true,
   freeAxes,
   cuttersFirst = false,
+  stale = false,
 }: ViewportProps) {
+  // M10a: the part under the pointer, for the hover tint.
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  // A new set of meshes may not have the hovered one any more (and an index
+  // can mean another part now); the next pointer move sets it again.
+  useEffect(() => setHoveredIndex(null), [meshes]);
   // `!` ("show only this") — real OpenSCAD discards everything else from the
   // render entirely when any statement is marked. Nothing stops marking more
   // than one, so this shows the union of all of them rather than assuming a
@@ -1288,8 +1617,8 @@ export function Viewport({
           if (!isTransformingRef.current) onSelect(null, 'replace');
         }}
       >
-        <ambientLight intensity={0.6} />
-        <directionalLight position={[10, 20, 10]} intensity={0.8} />
+        <ambientLight intensity={AMBIENT_LIGHT} />
+        <HeadLight />
         {
           // Unconditional now (previously gated on visibleMeshes.length > 0):
           // that gate meant FitController/SketchController never mounted on an
@@ -1309,8 +1638,9 @@ export function Viewport({
         }
         <Bounds margin={1.2}>
           <FitController fitToken={fitToken} orbitControlsRef={orbitControlsRef} />
-          <SketchController activeSketchPlane={activeSketchPlane} />
+          <SketchController activeSketchPlane={activeSketchPlane} viewApiRef={viewApiRef} />
           <ViewController apiRef={viewApiRef} />
+          <FocusController request={focusRequest} meshes={visibleMeshes} groupsByIndex={groupsByIndex} viewApiRef={viewApiRef} />
           <Center>
             {contextMeshes.map((mesh) => (
               <ContextModel key={mesh.key ?? `ctx-${mesh.index}`} mesh={mesh} shading={shading} />
@@ -1333,6 +1663,9 @@ export function Viewport({
                     onDrill={onDrill}
                     flashToken={role === 'none' ? undefined : flashToken}
                     cuttersFirst={cuttersFirst}
+                    hovered={hoveredIndex === mesh.index && activeSketchPlane === null}
+                    onHover={setHoveredIndex}
+                    stale={stale}
                   />
                 </FrameGroup>
               );
@@ -1435,12 +1768,16 @@ export function Viewport({
               // truth for placement. color isn't part of the gizmo drag at
               // all, so it's carried forward unchanged from the node's last
               // known transform rather than dropped.
+              // colorText too (M10a): without it a drag rewrote
+              // color("goldenrod") as numbers (Jordan, 2026-11-27).
               const p = transformTarget.position;
               const s = transformTarget.scale;
+              const last = meshes.find((m) => m.index === primaryIndex)?.transform;
               const transform: NodeTransform = {
                 translate: [p.x, p.y, p.z],
                 rotateDeg: quaternionToRotateDeg(q),
-                color: meshes.find((m) => m.index === primaryIndex)?.transform.color ?? null,
+                color: last?.color ?? null,
+                colorText: last?.colorText,
                 scale: [s.x, s.y, s.z],
               };
               onTransformCommit(primaryIndex, transform);

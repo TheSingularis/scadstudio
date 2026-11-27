@@ -2,7 +2,7 @@
 // where they should be, checked against the engine's own render, and keep
 // doing so after a variable they read changes.
 import { describe, expect, it } from 'vitest';
-import { renderScadToStl } from '../../src/main/scadRender';
+import { renderScadToMesh } from '../../src/main/scadRender';
 import { bbox, parseStl } from '../helpers/stl';
 import { expectCleanParse, parse } from '../helpers/parse';
 import { buildSceneGraph } from '../../src/renderer/src/sceneGraph';
@@ -11,7 +11,7 @@ import { decomposeNode } from '../../src/renderer/src/targetedPatch';
 import { readVariables, setVariableValue } from '../../src/renderer/src/variables';
 
 async function boxOf(source: string) {
-  return bbox(parseStl(await renderScadToStl(source)));
+  return bbox(parseStl(await renderScadToMesh(source)));
 }
 
 async function relate(source: string, req: Partial<RelateRequest> & Pick<RelateRequest, 'axis' | 'moveEdge' | 'referenceEdge'>, moveIndex = 1, refIndex = 0) {

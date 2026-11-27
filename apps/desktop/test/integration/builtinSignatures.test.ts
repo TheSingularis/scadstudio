@@ -2,7 +2,7 @@
 // BUILTIN_SIGNATURES. Each order is pinned here against the bundled engine,
 // by rendering a positional call and its named equivalent and comparing.
 import { describe, expect, it } from 'vitest';
-import { renderScadToStl } from '../../src/main/scadRender';
+import { renderScadToMesh } from '../../src/main/scadRender';
 import { bbox, parseStl } from '../helpers/stl';
 import { BUILTIN_SIGNATURES } from '../../src/renderer/src/tools';
 
@@ -21,7 +21,7 @@ const CASES: { name: string; values: string[]; wrap?: (call: string) => string }
 ];
 
 function box(source: string) {
-  return renderScadToStl(source).then((stl) => bbox(parseStl(stl)));
+  return renderScadToMesh(source).then((stl) => bbox(parseStl(stl)));
 }
 
 describe('M8 built-in positional signatures (engine-checked)', () => {

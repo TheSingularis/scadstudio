@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import type { BufferGeometry } from 'three';
 import type { Node } from 'web-tree-sitter';
-import { renderScadToStl } from '../../src/main/scadRender';
+import { renderScadToMesh } from '../../src/main/scadRender';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { bbox, parseStl, triangleCount } from '../helpers/stl';
@@ -20,7 +20,7 @@ import { convertToBosl2 } from '../../src/renderer/src/bosl2Convert';
 import { bosl2NamesFromSources, usesBosl2, withoutUnusedBosl2 } from '../../src/renderer/src/bosl2Usage';
 
 const INC = 'include <BOSL2/std.scad>\n';
-const render = (source: string) => renderScadToStl(source, { libraryDirs: [LIBRARIES_DIR] }).then(parseStl);
+const render = (source: string) => renderScadToMesh(source, { libraryDirs: [LIBRARIES_DIR] }).then(parseStl);
 
 function volume(g: BufferGeometry): number {
   const p = g.getAttribute('position');
