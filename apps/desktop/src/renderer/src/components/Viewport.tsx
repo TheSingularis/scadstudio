@@ -1653,12 +1653,16 @@ export function Viewport({
               // truth for placement. color isn't part of the gizmo drag at
               // all, so it's carried forward unchanged from the node's last
               // known transform rather than dropped.
+              // colorText too (M10a): without it a drag rewrote
+              // color("goldenrod") as numbers (Jordan, 2026-11-27).
               const p = transformTarget.position;
               const s = transformTarget.scale;
+              const last = meshes.find((m) => m.index === primaryIndex)?.transform;
               const transform: NodeTransform = {
                 translate: [p.x, p.y, p.z],
                 rotateDeg: quaternionToRotateDeg(q),
-                color: meshes.find((m) => m.index === primaryIndex)?.transform.color ?? null,
+                color: last?.color ?? null,
+                colorText: last?.colorText,
                 scale: [s.x, s.y, s.z],
               };
               onTransformCommit(primaryIndex, transform);

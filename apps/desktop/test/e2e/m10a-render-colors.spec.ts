@@ -58,6 +58,26 @@ translate([0, 16, 0]) difference() { color("goldenrod") cube(10); color("red") t
     await expect.poll(() => countPixels(scad, isBlue)).toBeLessThan(200);
   });
 
+  test('dragging the gizmo keeps a named color as written', async ({ scad }) => {
+    // Jordan, 2026-11-27: a drag turned color("goldenrod") into numbers.
+    expect(await scad.load('color("goldenrod") cube(10);\ntranslate([20, 0, 0]) color("#336699", 0.5) cube(8);\n')).toBe('Rendered');
+    await scad.resetView();
+    for (const line of [1, 2]) {
+      await scad.clickEditorLine(line);
+      await expect.poll(() => scad.selectedCall()).toBe('cube');
+      const handle = await scad.axisHandle('x');
+      expect(handle.count).toBeGreaterThan(20);
+      const len = Math.hypot(handle.dx, handle.dy);
+      const before = await scad.source();
+      await scad.rendersAfter(() => scad.dragViewport(handle, { dx: handle.dx + (handle.dx / len) * 60, dy: handle.dy + (handle.dy / len) * 60 }));
+      const after = await scad.source();
+      expect(after).not.toBe(before);
+      expect(after).toContain('color("goldenrod")');
+      expect(after).toContain('color("#336699", 0.5)');
+    }
+    expect(scad.pageErrors).toEqual([]);
+  });
+
   test('a long render shows progress over a greyed-out model, and Cancel keeps the last finished render', async ({ scad }) => {
     test.setTimeout(240_000);
     expect(await scad.load('color("goldenrod") cube(10);')).toBe('Rendered');
