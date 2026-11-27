@@ -315,7 +315,7 @@ export function ToolPanel(props: ToolPanelProps) {
         <RelateFields tool={tool} labelOf={labelOf} onChange={onChange} />
       )}
       {props.preview && (
-        <div data-testid="tool-preview" style={{ fontFamily: 'monospace', fontSize: 11, opacity: 0.9, borderTop: '1px solid #34495c', paddingTop: 6, overflowWrap: 'anywhere' }}>
+        <div data-testid="tool-preview" style={{ fontFamily: 'monospace', fontSize: 11, opacity: 0.9, borderTop: '1px solid #34495c', paddingTop: 6, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
           {props.preview.ok ? (
             <>
               {props.preview.lines.map((l, i) => (
