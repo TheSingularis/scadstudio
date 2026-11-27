@@ -293,6 +293,86 @@ The findings and the reasoning behind each placement follow. What happens today 
    - *Quick fix (M10b)*: disable (or hide) Extrude when the selection is 3D, with a tooltip saying why. The render path already knows which nodes only rendered through the 2D fallback, which is the 2D test. In M10b the extrudes move into a tool-first floating window anyway, whose slot would only accept 2D profiles, so this falls out of that rework if it isn't done before.
    - *Face selection*: today a face can only be clicked in Pick Face (to start a sketch on it); normal selection is always a whole part. Selecting a face (and edges) as a selection of its own is the primitive M13 needs for BOSL2 edges and M10d needs for Distance, and the plan already says to build it once and reuse it. Extruding a picked face of a solid (push/pull) then builds on it: sketch on the face's plane with the face's outline, extrude, and union with the part. Seeding that outline parametrically is the `projection()` item already in M17 (it needs a spike: a cut just inside the face also picks up anything standing on it); a baked outline from the mesh is simpler but stops following the part. Home: the selection primitive stays in M13/M10d as planned; face extrude goes into **M17** with item 3.
 
+## Fast preview and full render (proposed M18, raised by Jordan 2026-11-27; plan only, not decided)
+
+Jordan (2026-11-27): "like how openscad has a soft rerender then a full rerender, can we run a quick not 100% accurate re-render when refreshing for small changes, then a full real one on demand/export". Read as OpenSCAD's F5 (Preview) vs F6 (Render). This section is a proposal: the options, what this engine can actually do (measured), a recommendation, the UI, where it fits in the build order, and the questions for Jordan. Nothing here is decided yet. The milestone list and the build-order line are left alone until Jordan picks a slot, because the open PRs #22 and #26 both edit those lines.
+
+### How rendering works today
+
+- Every render is one engine call in the render process (`renderWorker.ts` via `renderHost.ts`), one at a time, each in a fresh engine instance (`scadRender.ts`, M0 finding). There is only one quality: real OpenSCAD with Manifold, `$preview` false, exporting the mesh (OFF with colors once PR #26 merges).
+- The renderer (`App.tsx` `runRender`) sends each top-level node of the working set as its own isolated render (`drillIn.ts` `isolatedRender`), then the dimmed context nodes of a drill-in. Each goes through `RenderCache`, keyed on the exact source sent, so an edit re-renders only the nodes whose source changed. A coalescing runner keeps at most one document render in flight.
+- What this does not help: a file whose geometry is one top-level node, like the gag trophy (`test/fixtures/gag_trophy1.scad`). Every edit anywhere in it re-renders the whole model: about 30 s in the cloud test machine, about 75 s on Jordan's machine.
+- **There is no Export yet.** The app saves `.scad` only; no STL/3MF export exists in the app or in any milestone. "A full render on export" therefore means building Export too (see the recommendation).
+
+### What OpenSCAD's own F5 does, and why it doesn't carry over as is
+
+Desktop OpenSCAD's F5 never computes the booleans. It evaluates the tree, meshes each primitive, and draws the result with OpenCSG, a GPU technique that fakes `difference()`/`intersection()` in the depth buffer, so holes look cut although no cut mesh exists. F6 computes the real mesh, which is what export needs. F5 also sets `$preview` to true, so files can show a different pose or helper geometry in it.
+
+The OpenSCAD WASM build here has no GPU preview: it only writes files (STL, OFF, 3MF, CSG, ...). Its PNG preview export (`--preview=throwntogether -o x.png`) fails (checked: exit code 1, no file). An F5 look-alike would mean writing image-based CSG in three.js ourselves.
+
+### Measurements (2026-11-27, cloud test machine, `@lofcz/openscad-wasm` 0.0.2 in Node, Manifold)
+
+Gag trophy, full model in one call:
+
+| Variant | Time | Triangles | Notes |
+|---|---|---|---|
+| Today (full) | 32.5 s | 437,510 | The file sets `$fn = 120` at the top level |
+| `-D '$fn=24'` | 5.2 s | 93,402 | Overrides only the top-level `$fn` |
+| CSG dump only (`-o x.csg`) | 0.26 s | n/a | Evaluated tree as text, no geometry |
+| Render of the CSG dump, unchanged | 29.9 s | 437,510 | Same as rendering the source |
+| CSG dump with every `$fn` capped at 32 / 24 / 16 | 5.9 / 4.1 / 3.1 s | 124,268 / 93,402 / 66,344 | 5x to 10x faster |
+| CSG dump with `difference`/`intersection` turned into `group` | 11.3 s | 130,736 | Booleans are about two thirds of the time, but the holes are not cut |
+| CSG dump with `hull` turned into `group` | 25.0 s | 547,178 | Little saved, wrong shape |
+
+The rack mount fixture (`rack_mount_single_keystone.scad`, per-call `$fn = 64` and `$fn = 6`): 0.51 s full, 0.53 s with `-D '$fn=24'` (no effect: `-D` doesn't reach per-call `$fn`), 0.55 s with the CSG cap (its time is booleans, not facets). `spikes/fixtures/basics.scad`: 0.09 s. Small files are already fast and gain nothing.
+
+Engine facts checked on the way:
+- **The CSG dump is the right place to reduce detail.** `-o x.csg` writes the fully evaluated tree: every module call, loop, `children()` and variable is resolved, and every primitive carries its own `$fn`, `$fa`, `$fs` as literals (`circle($fn = 120, $fa = 12, $fs = 2, r = 3)`). Capping those numbers in the text catches per-call `$fn` arguments and values computed in code, which `-D` doesn't. Colors come through as `color([r, g, b, a])` nodes.
+- **The CSG dump runs with `$preview` true** (checked with `echo($preview)`); `-D '$preview=false'` makes it false. The preview pass must pass it, so preview and full render take the same `if ($preview)` branches (M9 follow-up decision: the app always shows the exported part).
+- **An engine instance still can't render twice**: a second `callMain` on the same instance fails with "program has already aborted!". So OpenSCAD's own geometry cache (which makes repeated F6 fast on the desktop) is thrown away after every render here.
+- **`import()` of an OFF keeps face colors**, so a cached part's mesh can be fed back into a later render. But importing the trophy's 20 MB OFF takes 11.3 s by itself (OFF is text), so this only pays for small meshes that are expensive to compute.
+
+### Options
+
+1. **Reduced-detail preview (recommended).** Two engine calls per preview render, both in the render process: dump the CSG with `-D '$preview=false'`, cap curve detail in that text, then render the capped CSG to OFF as today. Capping: any `$fn` above the cap comes down to the cap; where `$fn` is 0, `$fa` goes up to at least 360 / cap (which bounds the segment count whatever `$fs` and `r` are). Values at or below the cap are never touched, so the low-`$fn` twist crash ("Known engine bug" above) can't be caused by the preview, and the cap itself (16 or more) is outside the crashing values. Library code that builds its own polygons from `$fn` (BOSL2 builds point lists in SCAD) is already baked into `polyhedron()` points in the dump, so for that the first pass also gets `-D` caps for the file's top-level `$fn`/`$fa`/`$fs` when they are literals finer than the cap. Cost: 0.07 to 0.26 s for the extra pass. Real OpenSCAD geometry throughout, only coarser curves. Gag trophy: 32.5 s to about 4.3 s.
+2. **F5-style "thrown together" preview.** Draw operands without computing booleans, cutters as translucent ghosts (or image-based CSG in three.js to make holes look cut). Not recommended: OpenCSG-style rendering in three.js is its own project, hulls and extrudes still need the engine at full detail (11.3 s on the trophy with no booleans at all), the result can't be picked or measured like a real mesh, and the trophy without cuts is visibly wrong.
+3. **Skipping `hull()`/`minkowski()`.** Not recommended: wrong shapes, and on the trophy only 32.5 s to 25 s. Capping the detail of their operands (option 1) is the safe form; `minkowski()` cost grows with both operands' facet counts.
+4. **Reusing unchanged subtrees inside one heavy node.** Two forms, both deferred:
+   - The engine's own geometry cache across renders needs an engine build whose instance survives `callMain` (an Emscripten build that doesn't exit). Upstream work, like the font fix.
+   - Our own subtree cache: render an expensive, context-free subtree of the CSG dump (its text is a complete key) once, then splice `import("cache/<hash>.off")` into later renders. Works and keeps colors, but OFF import is slow for big meshes (11.3 s for the trophy's), so it only pays for small-but-expensive parts. Worth a spike after v1 if heavy models are still slow at full detail.
+5. **A faster engine for preview.** The OpenRSCAD experiment (M16, post-v1, PR #22) would plug in exactly here: as a preview engine with OpenSCAD for Render and Export. Post-v1, as Jordan decided.
+
+### Recommendation
+
+Option 1, plus Export, as its own milestone:
+
+- **Preview by default, only where it matters ("Auto").** A part renders at reduced detail when its last full render took over about 1 s, or, the first time (nothing measured yet), when its CSG dump contains detail finer than the cap. Everything else renders at full detail as today, so small files never show a preview and the indicator stays "Full" for most use. Settings gets *Preview: Auto / Always / Off* and *Preview detail: 16 / 24 / 32* (24 proposed).
+- **Render (F6) on demand.** A Render button and F6 render every part of the working set and context at full detail, through the same queue, progress overlay and Cancel as M10a. Full results go into the cache under their own key; a preview request is satisfied by a cached full result when there is one (better and free), so after one Render only the parts edited since go back to preview.
+- **Export always renders in full.** File > Export (STL, and 3MF which keeps colors) renders the whole document in one engine call (OpenSCAD's own top-level union, `$preview` false), never from the per-part cache or a preview, with progress and Cancel, then a save dialog. Exporting is real OpenSCAD output, like F6 + Export in OpenSCAD.
+- **Tools that measure a mesh wait for a full render of that part.** M11's Distance/Align/Pattern write a measured number for parts whose size isn't an expression (custom modules, booleans, text); a coarser circle is smaller, so they must measure the full mesh. Same for M10d/M13 face and edge picking on curved faces. Camera fit and selection can use the preview.
+- **Drags stay as today**: rigid transforms already skip the engine during the drag.
+
+### UI
+
+- A badge at the viewport's bottom-left corner, next to M10a's progress overlay: **Preview** (amber, with "reduced detail on 2 of 8 parts" on hover) or **Full** (neutral). Preview meshes get no other styling, so colors and highlights look the same.
+- A **Render** button beside the badge (and on the toolbar), shortcut F6 as in OpenSCAD; it shows the full render's progress in the same overlay and can be cancelled. Disabled when everything shown is already full.
+- The status line says "Rendered (preview)" or "Rendered"; e2e tests that wait for "Rendered" keep working.
+- File > Export… with a format choice; the progress overlay reads "Exporting (full render)".
+
+### Where it fits
+
+It changes the same render path as M10a (`scadRender.ts`, `renderHost.ts`, `renderCached` in `App.tsx`, the progress overlay), so it can't start until PR #26 merges, and it doesn't need M10b's floating windows (its UI is a badge, a button and a menu item). Recommended slot: **right after M10a, as its own release (0.1.8)**, because the heavy-file edit loop is the slowest thing in the app today. That moves M10b to 0.1.9, M13 to 0.1.10 and M10c–M10f to 0.1.11–0.1.14. Named M18 (next free number, M16 and M17 are taken) rather than a new M10 letter, so the letters keep following the build order; it counts towards v1 if Jordan wants Export in v1. Alternatives: after M10b (if Jordan wants the window rework first), or after v1.
+
+Estimated size: one PR. The CSG rewrite and two-pass render in the render process; quality in the request and cache key; Auto rule from per-part timing (carried by node identity across edits); badge, Render button, F6; Export menu, dialog and full-document render; Settings entries. Tests: unit tests for the CSG cap rewrite (numbers above the cap only, `$fa` raise, strings and comments untouched); integration on the gag trophy (preview under 8 s here, bounding box within a small tolerance of full, colors kept, `$preview` false) and on the rack mount (preview equals full, no `$fn` above the cap); e2e for the badge, Render, and an exported STL/3MF that matches a direct OpenSCAD render.
+
+### Open questions for Jordan
+
+1. **Slot**: right after M10a as 0.1.8 (recommended), after M10b, or after v1?
+2. **Export formats**: STL and 3MF (keeps colors) to start, or others (OFF, AMF)? And should Export count as part of v1?
+3. **Automatic full render**: only on Render/F6 and Export, as asked (recommended), or also on its own after the model has been idle for a while?
+4. **When preview kicks in**: Auto, only for slow parts (recommended), or every edit like OpenSCAD's F5?
+5. **Preview detail**: cap curves at 24 segments (recommended; 16 is faster, 32 closer to the real shape), and should it be in Settings?
+
 ## M10 UX/polish backlog (ongoing — append here as ideas come up)
 
 M10 itself doesn't start until the earlier milestones (M0-M9) are done, but UI/usability ideas keep surfacing *while* building those — usually as "this works, but a real CAD tool would present it better" observations made in passing, not as their own milestone-sized detour at the time. Rather than losing them or scope-creeping them into whatever milestone happened to be in progress, they get written up here in full (the actual idea, why it's not just done immediately, and what it'd touch) and left for M10 itself to triage and scope for real. Each entry should be dated and stand alone — don't assume the reader has the conversation that prompted it.
