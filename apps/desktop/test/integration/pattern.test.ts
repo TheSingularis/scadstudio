@@ -2,7 +2,7 @@
 // they belong (engine-checked), read back for the pattern panel, and stay
 // movable with the gizmo (linear).
 import { describe, expect, it } from 'vitest';
-import { renderScadToStl } from '../../src/main/scadRender';
+import { renderScadToMesh } from '../../src/main/scadRender';
 import { bbox, parseStl } from '../helpers/stl';
 import { expectCleanParse, parse } from '../helpers/parse';
 import { buildSceneGraph } from '../../src/renderer/src/sceneGraph';
@@ -23,7 +23,7 @@ async function info(source: string, index = 0) {
   return { tree, node: buildSceneGraph(tree, source).nodes[index], pattern: readPattern(tree, buildSceneGraph(tree, source).nodes[index]) };
 }
 
-const box = async (s: string) => bbox(parseStl(await renderScadToStl(s)));
+const box = async (s: string) => bbox(parseStl(await renderScadToMesh(s)));
 
 describe('M11 patterns (engine-checked)', () => {
   it('linear: 4 copies at 15 mm pitch along X, outside the part rotation', async () => {

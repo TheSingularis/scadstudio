@@ -19,6 +19,8 @@ export interface MainProcessHarness {
   invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
   /** Channels the main process sent to the renderer (webContents.send), oldest first. */
   sent: string[];
+  /** Messages sent back to the invoking renderer (event.sender.send), oldest first. */
+  replies: { channel: string; args: unknown[] }[];
 }
 
 export async function loadMainProcess(): Promise<MainProcessHarness> {
@@ -27,6 +29,7 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
   const engineLog: string[][] = [];
   const dialog = { showOpenDialog: vi.fn(), showSaveDialog: vi.fn() };
   const sent: string[] = [];
+  const replies: { channel: string; args: unknown[] }[] = [];
   // The one window events reach (e.g. M8's modules:changed).
   const fakeWindow = { webContents: { send: (channel: string) => sent.push(channel) } };
 
@@ -62,7 +65,11 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
       }
       postMessage(request: unknown) {
         void import('../../src/main/renderWorker')
-          .then((m) => m.handleRenderRequest(request as Parameters<typeof m.handleRenderRequest>[0]))
+          .then((m) =>
+            m.handleRenderRequest(request as Parameters<typeof m.handleRenderRequest>[0], (stage) =>
+              this.listeners['message']?.forEach((fn) => fn(stage)),
+            ),
+          )
           .then((reply) => this.listeners['message']?.forEach((fn) => fn(reply)));
       }
       kill() {
@@ -107,7 +114,7 @@ export async function loadMainProcess(): Promise<MainProcessHarness> {
   const invoke = async (channel: string, ...args: unknown[]) => {
     const fn = handlers.get(channel);
     if (!fn) throw new Error(`no IPC handler for ${channel}`);
-    return fn({ sender: {} }, ...args);
+    return fn({ sender: { isDestroyed: () => false, send: (channel: string, ...rest: unknown[]) => replies.push({ channel, args: rest }) } }, ...args);
   };
-  return { handlers, engineLog, dialog, invoke, sent };
+  return { handlers, engineLog, dialog, invoke, sent, replies };
 }

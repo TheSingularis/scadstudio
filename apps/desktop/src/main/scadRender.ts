@@ -2,10 +2,11 @@ import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { createEngine, type EngineFS } from './engine';
+import { offToColoredStl } from './offMesh';
 import { isFontPath } from './fonts';
 import { FONT_ROOT, bundledFontFiles, fontFileCache } from './fontStore';
 
-// Everything the main process needs to turn OpenSCAD source into STL bytes,
+// Everything the main process needs to turn OpenSCAD source into mesh bytes,
 // kept free of Electron imports so it can be exercised directly from Node.
 //
 // Two things this does that a bare `renderToStl()` call does not:
@@ -24,9 +25,12 @@ import { FONT_ROOT, bundledFontFiles, fontFileCache } from './fontStore';
 //    for desktop OpenSCAD, and library folders are handed to OpenSCAD through
 //    its own OPENSCADPATH lookup.
 //
-// 3. It exports binary STL, not OpenSCAD's default ASCII: about a quarter of
-//    the size and much cheaper for the viewport to parse. A detailed model
-//    (the gag-trophy crash report, 2026-11-25) came out as 122 MB of ASCII.
+// 3. It exports OFF, which carries a color per face (M10a, 2026-11-26), and
+//    turns it into binary STL plus a color trailer (offMesh.ts) before it
+//    leaves the render process. Binary, not ASCII: a detailed model (the
+//    gag-trophy crash report, 2026-11-25) came out as 122 MB of ASCII STL.
+//    Before M10a this exported binary STL straight from the engine, which
+//    has no colors.
 
 export interface RenderOptions {
   // Absolute path of the document being rendered, or null for an unsaved
@@ -37,6 +41,16 @@ export interface RenderOptions {
   // M15: installed font files this render may need (chosen by the main
   // process from its system font index, see fonts.ts fontFilesWanted).
   fontFiles?: string[];
+}
+
+// M10a: what a render is doing, for the progress bar. The engine prints
+// nothing while it works (this build has no progress output; checked on the
+// gag trophy, 2026-11-26: silent for 22 s, then the summary), so these are
+// the steps around it.
+export type RenderStage = 'preparing' | 'engine' | 'mesh';
+
+export interface RenderHooks {
+  onStage?: (stage: RenderStage) => void;
 }
 
 export class ScadRenderError extends Error {
@@ -54,7 +68,7 @@ const VIRTUAL_ROOT = '/host';
 // Name the source is written under, next to where the real document lives.
 // Unusual enough that it can't shadow a real file the document includes.
 const INPUT_NAME = '__scadstudio_render__.scad';
-const OUTPUT_PATH = '/__scadstudio_output__.stl';
+const OUTPUT_PATH = '/__scadstudio_output__.off';
 // Guards against runaway include graphs (a library that pulls in thousands
 // of files, or a pathological loop the visited set somehow misses).
 const MAX_DEPENDENCY_FILES = 2000;
@@ -293,7 +307,10 @@ export function summarizeLog(log: string[]): string {
 
 // M0 spike finding: a single createOpenSCAD() instance corrupts state after
 // one render, so every render gets its own fresh instance.
-export async function renderScadToStl(source: string, options: RenderOptions = {}): Promise<Uint8Array> {
+//
+// Returns binary STL with a per-face color trailer (see offMesh.ts).
+export async function renderScadToMesh(source: string, options: RenderOptions = {}, hooks: RenderHooks = {}): Promise<Uint8Array> {
+  hooks.onStage?.('preparing');
   const documentPath = options.documentPath ? path.resolve(options.documentPath) : null;
   const documentDir = documentPath ? path.dirname(documentPath) : null;
   const libraryDirs = (options.libraryDirs ?? []).map((d) => path.resolve(d));
@@ -325,8 +342,9 @@ export async function renderScadToStl(source: string, options: RenderOptions = {
   FS.writeFile(inputPath, source);
 
   let exitCode: number;
+  hooks.onStage?.('engine');
   try {
-    exitCode = instance.callMain([inputPath, '--backend=Manifold', '--export-format=binstl', '-o', OUTPUT_PATH]);
+    exitCode = instance.callMain([inputPath, '--backend=Manifold', '--export-format=off', '-o', OUTPUT_PATH]);
   } catch (err) {
     // Emscripten throws its own non-Error objects (ExitStatus, a bare
     // number) on abort, which used to reach the renderer as
@@ -334,14 +352,19 @@ export async function renderScadToStl(source: string, options: RenderOptions = {
     const detail = err instanceof Error ? err.message : JSON.stringify(err);
     throw new ScadRenderError(`${summarizeLog(log)}${detail ? `\n(${detail})` : ''}`, log);
   }
-  let stl: Uint8Array | null = null;
+  let off: Uint8Array | null = null;
   try {
-    stl = FS.readFile(OUTPUT_PATH);
+    off = FS.readFile(OUTPUT_PATH);
   } catch {
-    stl = null;
+    off = null;
   }
-  if (exitCode !== 0 || !stl || stl.byteLength === 0) {
+  if (exitCode !== 0 || !off || off.byteLength === 0) {
     throw new ScadRenderError(summarizeLog(log), log);
   }
-  return stl;
+  hooks.onStage?.('mesh');
+  try {
+    return offToColoredStl(off);
+  } catch (err) {
+    throw new ScadRenderError(err instanceof Error ? err.message : String(err), log);
+  }
 }
