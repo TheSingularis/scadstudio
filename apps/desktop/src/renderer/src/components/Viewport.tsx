@@ -235,6 +235,9 @@ export interface NodeMesh {
   transformEditable?: boolean;
   // Unique key for context (dimmed) meshes, which have no working-set index.
   key?: string;
+  // M10a: text, which has an up and a reading direction (its local +Y and
+  // +X, seen from +Z). Focus faces it square and level.
+  upright?: boolean;
 }
 
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
@@ -876,7 +879,17 @@ function FocusController({
     }
     if (box.isEmpty()) return;
     pending.current = null;
-    viewApiRef.current?.frameBox(box);
+    // One upright part (text): look at its face, its up as screen-up.
+    let facing: CameraView | undefined;
+    const only = p.indices.length === 1 ? meshes.find((m) => m.index === p.indices[0]) : undefined;
+    const group = only?.upright ? groupsByIndex.current?.get(only.index) : undefined;
+    if (group) {
+      const q = group.getWorldQuaternion(new Quaternion());
+      const n = new Vector3(0, 0, 1).applyQuaternion(q);
+      const up = new Vector3(0, 1, 0).applyQuaternion(q);
+      facing = { direction: [n.x, n.y, n.z], up: [up.x, up.y, up.z] };
+    }
+    viewApiRef.current?.frameBox(box, facing);
   });
   return null;
 }
@@ -908,7 +921,8 @@ interface ViewApi {
   restore: (saved: SavedView) => void;
   // M10a: keeps the view's direction and centers on `box`, close enough to
   // fill the view with it (a new sketch shape, after leaving sketch mode).
-  frameBox: (box: Box3) => void;
+  // With `view`, turns to that direction and screen-up as well.
+  frameBox: (box: Box3, view?: CameraView) => void;
 }
 
 // How much room frameBox leaves around the box (same as <Bounds margin>).
@@ -988,8 +1002,8 @@ function ViewController({ apiRef }: { apiRef: RefObject<ViewApi | null> }) {
         return { view, target, distance };
       },
       restore: (saved) => go(saved.view, saved.target, saved.distance),
-      frameBox: (box) => {
-        const { view } = current();
+      frameBox: (box, facing) => {
+        const view = facing ?? current().view;
         const sphere = box.getBoundingSphere(new Sphere());
         const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
         const aspect = camera instanceof PerspectiveCamera ? camera.aspect : 1;

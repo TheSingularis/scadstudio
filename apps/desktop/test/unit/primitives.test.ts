@@ -58,3 +58,20 @@ describe('sketch-mode Text (M15)', () => {
     expect(sketchTextStatement([0, 0, 10], [0, 0, 0], [1, 2])).toBe('translate([1, 2, 10]) text("Text", size=10, font="Liberation Sans");');
   });
 });
+
+describe('isTextNode (M10a Focus faces text)', () => {
+  it('is true for text, under transforms, linear_extrude or offset, and false otherwise', async () => {
+    const { isTextNode } = await import('../../src/renderer/src/targetedPatch');
+    const src = [
+      'text("a");',
+      'translate([1, 2, 3]) rotate([90, 0, 0]) text("b", size = 5);',
+      'color("red") linear_extrude(2) text("c");',
+      'linear_extrude(1) offset(r = 0.5) text("d");',
+      'cube(5);',
+      'linear_extrude(1) square(3);',
+      'linear_extrude(1) { text("e"); square(2); }',
+    ].join('\n');
+    const parsed = await expectCleanParse(src);
+    expect(parsed.graph.nodes.map((n) => isTextNode(parsed.tree.rootNode, n))).toEqual([true, true, true, true, false, false, false]);
+  });
+});

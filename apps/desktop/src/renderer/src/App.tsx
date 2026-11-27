@@ -25,6 +25,7 @@ import {
   primitiveOnlySlice,
   wrapAsThinExtrude,
   decomposeNode,
+  isTextNode,
   primitiveArgs,
   patchArgument,
   addNamedArgument,
@@ -706,6 +707,7 @@ export function App() {
                 modifier,
                 frame: set.frame,
                 transformEditable: job.transformEditable,
+                upright: !set.readOnly && isTextNode(parsedTree.rootNode, node),
               });
             } else if (isEmptyResult(result)) {
               emptyCount++;

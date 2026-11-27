@@ -31,11 +31,12 @@ const isBlue = (r: number, g: number, b: number) => b > 120 && b - r > 60 && b -
 
 // Amber (selection color) pixels: how many, and their centroid as a
 // fraction of the viewport (0.5, 0.5 is the center).
-async function amberSpot(scad: ScadApp): Promise<{ n: number; fx: number; fy: number; frac: number }> {
+async function amberSpot(scad: ScadApp): Promise<{ n: number; fx: number; fy: number; frac: number; w: number; h: number; leftY: number; rightY: number }> {
   const img = decodePng(await scad.viewportShot());
   let n = 0;
   let sx = 0;
   let sy = 0;
+  let [x0, x1, y0, y1] = [Infinity, -Infinity, Infinity, -Infinity];
   for (let y = 0; y < img.height; y++) {
     for (let x = 0; x < img.width; x++) {
       const i = (y * img.width + x) * 4;
@@ -44,10 +45,42 @@ async function amberSpot(scad: ScadApp): Promise<{ n: number; fx: number; fy: nu
         n++;
         sx += x;
         sy += y;
+        x0 = Math.min(x0, x);
+        x1 = Math.max(x1, x);
+        y0 = Math.min(y0, y);
+        y1 = Math.max(y1, y);
       }
     }
   }
-  return { n, fx: n ? sx / n / img.width : NaN, fy: n ? sy / n / img.height : NaN, frac: n / (img.width * img.height) };
+  return {
+    n,
+    fx: n ? sx / n / img.width : NaN,
+    fy: n ? sy / n / img.height : NaN,
+    frac: n / (img.width * img.height),
+    w: x1 - x0 + 1,
+    h: y1 - y0 + 1,
+    ...halves(),
+  };
+  // Mean row of the spot's left and right halves.
+  function halves(): { leftY: number; rightY: number } {
+    const mid = (x0 + x1) / 2;
+    let [ln, ly, rn, ry] = [0, 0, 0, 0];
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const i = (y * img.width + x) * 4;
+        const [r, g, b] = [img.data[i], img.data[i + 1], img.data[i + 2]];
+        if (!(r > 150 && g > 90 && g < 200 && b < 110 && r - b > 90)) continue;
+        if (x < mid) {
+          ln++;
+          ly += y;
+        } else {
+          rn++;
+          ry += y;
+        }
+      }
+    }
+    return { leftY: ln ? ly / ln : NaN, rightY: rn ? ry / rn : NaN };
+  }
 }
 
 const progress = (scad: ScadApp) => scad.page.getByTestId('render-progress');
@@ -177,6 +210,28 @@ translate([0, 16, 0]) difference() { color("goldenrod") cube(10); color("red") t
     expect(Math.abs(cube.fy - 0.5)).toBeLessThan(0.1);
     // The key only moved the camera.
     expect(await scad.source()).toBe('cube([200, 20, 10]);\ntranslate([150, 120, 0]) sphere(5);\n');
+    expect(scad.pageErrors).toEqual([]);
+  });
+
+  test('Focus on text turns the camera to face it, square and level', async ({ scad }) => {
+    // Jordan, 2026-11-27: text has an implied up, so Focus should line the
+    // camera up with it. This text stands up (rotate 90 about X) and is
+    // turned 30 degrees, so from the default view it reads at a slant.
+    expect(await scad.load('cube(10);\ntranslate([40, 0, 0]) rotate([90, 0, 30]) linear_extrude(1) text("HIIIII", size = 10);\n')).toBe('Rendered');
+    await scad.resetView();
+    const v = await scad.viewport();
+    await scad.clickEditorLine(2);
+    await expect.poll(() => scad.selectedCall()).toBe('linear_extrude');
+    await scad.button('Focus').click();
+    await scad.page.waitForTimeout(1500);
+    await scad.page.mouse.move(v.x + 5, v.y + 5);
+    const spot = await amberSpot(scad);
+    expect(Math.abs(spot.fx - 0.5)).toBeLessThan(0.08);
+    expect(Math.abs(spot.fy - 0.5)).toBeLessThan(0.08);
+    // Level: the left and right halves of the text sit at the same height
+    // (from the default view this line of text climbs to the right).
+    expect(Math.abs(spot.leftY - spot.rightY)).toBeLessThan(0.1 * spot.h);
+    expect(spot.w / spot.h).toBeGreaterThan(2);
     expect(scad.pageErrors).toEqual([]);
   });
 

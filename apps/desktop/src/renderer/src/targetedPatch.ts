@@ -897,6 +897,21 @@ function readLiteralPaths(vec: Node): number[][] | null {
 //   a scaled sketch would need the scale folded into every dragged point),
 // - rotate_extrude isn't accepted: its profile's XY plane gets revolved
 //   into XZ, so the on-plane handles wouldn't line up with the solid.
+// M10a: whether a node is text (bare, or under linear_extrude/offset), so it
+// has a reading direction: Focus turns the camera to face it square and
+// level (Jordan, 2026-11-27). Text lies in its local XY plane, reading
+// along +X with +Y up, seen from +Z.
+export function isTextNode(root: Node, node: SceneNode): boolean {
+  let call: Node | null = decomposeNode(root, node)?.primitiveNode ?? null;
+  for (let depth = 0; call && depth < 4; depth++) {
+    const name = call.childForFieldName('name')?.text;
+    if (name === 'text') return true;
+    if (name !== 'linear_extrude' && name !== 'offset') return false;
+    call = soleChildCall(call);
+  }
+  return false;
+}
+
 export function readSketchProfile(root: Node, node: SceneNode): SketchProfile | null {
   const decomposed = decomposeNode(root, node);
   if (!decomposed) return null;
