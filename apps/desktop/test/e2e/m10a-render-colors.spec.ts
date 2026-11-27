@@ -33,54 +33,38 @@ const isBlue = (r: number, g: number, b: number) => b > 120 && b - r > 60 && b -
 // fraction of the viewport (0.5, 0.5 is the center).
 async function amberSpot(scad: ScadApp): Promise<{ n: number; fx: number; fy: number; frac: number; w: number; h: number; leftY: number; rightY: number }> {
   const img = decodePng(await scad.viewportShot());
-  let n = 0;
-  let sx = 0;
-  let sy = 0;
-  let [x0, x1, y0, y1] = [Infinity, -Infinity, Infinity, -Infinity];
+  const xs: number[] = [];
+  const ys: number[] = [];
   for (let y = 0; y < img.height; y++) {
     for (let x = 0; x < img.width; x++) {
       const i = (y * img.width + x) * 4;
       const [r, g, b] = [img.data[i], img.data[i + 1], img.data[i + 2]];
       if (r > 150 && g > 90 && g < 200 && b < 110 && r - b > 90) {
-        n++;
-        sx += x;
-        sy += y;
-        x0 = Math.min(x0, x);
-        x1 = Math.max(x1, x);
-        y0 = Math.min(y0, y);
-        y1 = Math.max(y1, y);
+        xs.push(x);
+        ys.push(y);
       }
     }
   }
+  const n = xs.length;
+  const mean = (a: number[]) => a.reduce((t, v) => t + v, 0) / a.length;
+  // Extents from the 2nd to the 98th percentile, so a few stray
+  // amber-ish pixels (the gizmo's handles, antialiasing) don't count.
+  const pct = (a: number[], q: number) => [...a].sort((u, v) => u - v)[Math.floor(q * (a.length - 1))];
+  const [x0, x1, y0, y1] = n ? [pct(xs, 0.02), pct(xs, 0.98), pct(ys, 0.02), pct(ys, 0.98)] : [0, 0, 0, 0];
+  // Mean row of the spot's left and right halves.
+  const mid = (x0 + x1) / 2;
+  const left = ys.filter((_, k) => xs[k] >= x0 && xs[k] < mid && ys[k] >= y0 && ys[k] <= y1);
+  const right = ys.filter((_, k) => xs[k] >= mid && xs[k] <= x1 && ys[k] >= y0 && ys[k] <= y1);
   return {
     n,
-    fx: n ? sx / n / img.width : NaN,
-    fy: n ? sy / n / img.height : NaN,
+    fx: n ? mean(xs) / img.width : NaN,
+    fy: n ? mean(ys) / img.height : NaN,
     frac: n / (img.width * img.height),
     w: x1 - x0 + 1,
     h: y1 - y0 + 1,
-    ...halves(),
+    leftY: left.length ? mean(left) : NaN,
+    rightY: right.length ? mean(right) : NaN,
   };
-  // Mean row of the spot's left and right halves.
-  function halves(): { leftY: number; rightY: number } {
-    const mid = (x0 + x1) / 2;
-    let [ln, ly, rn, ry] = [0, 0, 0, 0];
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const i = (y * img.width + x) * 4;
-        const [r, g, b] = [img.data[i], img.data[i + 1], img.data[i + 2]];
-        if (!(r > 150 && g > 90 && g < 200 && b < 110 && r - b > 90)) continue;
-        if (x < mid) {
-          ln++;
-          ly += y;
-        } else {
-          rn++;
-          ry += y;
-        }
-      }
-    }
-    return { leftY: ln ? ly / ln : NaN, rightY: rn ? ry / rn : NaN };
-  }
 }
 
 const progress = (scad: ScadApp) => scad.page.getByTestId('render-progress');
