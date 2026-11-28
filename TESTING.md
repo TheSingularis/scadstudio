@@ -31,8 +31,8 @@ The end-to-end tests launch real Electron windows. On a Linux machine
 without a display (CI, a cloud container, SSH), wrap them in Xvfb:
 
 ```sh
-xvfb-run -a npm run test:e2e -w @scadstudio/desktop
-cd apps/desktop && xvfb-run -a npx playwright test -g "sketch"   # one group, app already built
+xvfb-run -a --server-args="-screen 0 1920x1080x24" npm run test:e2e -w @scadstudio/desktop
+cd apps/desktop && xvfb-run -a --server-args="-screen 0 1920x1080x24" npx playwright test -g "sketch"   # one group, app already built
 ```
 
 Each e2e test starts its own app, so the suite takes a few minutes. On a

@@ -5,6 +5,8 @@ import {
   DEFAULT_SNAP_SETTINGS,
   EMPTY_PLANE_SNAP_GEOMETRY,
   extractOnPlaneGeometry,
+  loadSnapSettings,
+  saveSnapSettings,
   snapSketchPoint,
   type PlaneSnapGeometry,
 } from '../../src/renderer/src/sketchSnap';
@@ -53,11 +55,55 @@ describe('snapSketchPoint (M7.5 snapping)', () => {
   });
 
   it('aligns horizontally/vertically with already-placed points before gridding', () => {
-    const r = snapSketchPoint([5.2, 3.7], [[5.3, 0]], EMPTY_PLANE_SNAP_GEOMETRY, DEFAULT_SNAP_SETTINGS, TOL);
+    const r = snapSketchPoint([5.2, 3.7], [[5.3, 0]], EMPTY_PLANE_SNAP_GEOMETRY, { ...DEFAULT_SNAP_SETTINGS, grid: true }, TOL);
     expect(r.kind).toBe('align');
     expect(r.point).toEqual([5.3, 4]);
     expect(r.alignedU).toEqual([5.3, 0]);
     expect(r.alignedV).toBeNull();
+  });
+});
+
+describe('snap settings (M10b: grid off by default, remembered)', () => {
+  const memoryStorage = () => {
+    const map = new Map<string, string>();
+    return { getItem: (k: string) => map.get(k) ?? null, setItem: (k: string, v: string) => void map.set(k, v), map };
+  };
+
+  it('defaults to grid off with point/edge snapping on', () => {
+    expect(DEFAULT_SNAP_SETTINGS).toEqual({ grid: false, gridSize: 1, geometry: true });
+    expect(loadSnapSettings(null)).toEqual(DEFAULT_SNAP_SETTINGS);
+    expect(loadSnapSettings(memoryStorage())).toEqual(DEFAULT_SNAP_SETTINGS);
+  });
+
+  it('with the defaults, a click away from geometry is not rounded', () => {
+    expect(snapSketchPoint([2.4, 3.3], [], EMPTY_PLANE_SNAP_GEOMETRY, DEFAULT_SNAP_SETTINGS, TOL)).toMatchObject({ kind: 'none', point: [2.4, 3.3] });
+  });
+
+  it('round-trips what was saved', () => {
+    const storage = memoryStorage();
+    saveSnapSettings(storage, { grid: true, gridSize: 5, geometry: false });
+    expect(loadSnapSettings(storage)).toEqual({ grid: true, gridSize: 5, geometry: false });
+  });
+
+  it('falls back field by field on bad stored data', () => {
+    const storage = memoryStorage();
+    storage.setItem('scadstudio.sketchSnap', '{"grid":true,"gridSize":-3,"geometry":"yes"}');
+    expect(loadSnapSettings(storage)).toEqual({ grid: true, gridSize: 1, geometry: true });
+    storage.setItem('scadstudio.sketchSnap', 'not json');
+    expect(loadSnapSettings(storage)).toEqual(DEFAULT_SNAP_SETTINGS);
+  });
+
+  it('survives storage that throws', () => {
+    const throwing = {
+      getItem: () => {
+        throw new Error('denied');
+      },
+      setItem: () => {
+        throw new Error('denied');
+      },
+    };
+    expect(loadSnapSettings(throwing)).toEqual(DEFAULT_SNAP_SETTINGS);
+    expect(() => saveSnapSettings(throwing, DEFAULT_SNAP_SETTINGS)).not.toThrow();
   });
 });
 

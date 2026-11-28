@@ -16,10 +16,14 @@ function polygonPoints(src: string): number[][] {
   return JSON.parse(m[1]);
 }
 
-async function drawTriangleOnXY(scad: ScadApp) {
+async function drawTriangleOnXY(scad: ScadApp, { gridOnly = false } = {}) {
   await scad.button('XY').click();
   await expect(scad.page.getByText(/Sketching on XY plane/)).toBeVisible();
   await scad.page.waitForTimeout(1500); // camera animates onto the plane
+  await scad.setGridSnap(true); // M10b: off by default
+  // Only the grid: at the e2e window size a triangle corner lands near the
+  // cube's edge, and an edge snap keeps the exact point along the edge.
+  if (gridOnly) await scad.page.getByRole('checkbox', { name: 'Points/edges' }).uncheck();
   for (const p of TRIANGLE_PX) await scad.clickViewport(p.dx, p.dy);
   await expect(scad.page.getByTestId('sketch-hint')).toContainText(/ 3 points\)/);
 }
@@ -27,7 +31,7 @@ async function drawTriangleOnXY(scad: ScadApp) {
 test.describe('M7.5 sketch mode', () => {
   test('draw on XY, Finish Sketch writes a grid-snapped polygon()', async ({ scad }) => {
     await scad.load('cube(1);\n');
-    await drawTriangleOnXY(scad);
+    await drawTriangleOnXY(scad, { gridOnly: true });
     const status = await scad.rendersAfter(() => scad.button('Finish Sketch').click());
     expect(status).toBe('Rendered');
     const src = await scad.source();
@@ -91,7 +95,8 @@ test.describe('M7.5 sketch mode', () => {
     await scad.load('cube(1);\n');
     await drawTriangleOnXY(scad);
     await scad.rendersAfter(() => scad.button('Finish Sketch').click());
-    const status = await scad.rendersAfter(() => scad.button('Linear Extrude').click());
+    await scad.startExtrude('Linear');
+    const status = await scad.applyTool();
     expect(status).toBe('Rendered');
     expect(await scad.source()).toMatch(/linear_extrude\(height=10\) \{\n {4}polygon\(points=/);
     await expect(scad.button('Edit Sketch')).toBeVisible();

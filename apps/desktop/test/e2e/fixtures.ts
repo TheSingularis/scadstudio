@@ -138,10 +138,9 @@ export class ScadApp {
   /** Name of the selected node's call in the parameter panel, or null when nothing is selected. */
   async selectedCall(): Promise<string | null> {
     if (!(await this.button('Mirror X').isVisible())) return null;
-    return this.page.evaluate(() => {
-      const label = [...document.querySelectorAll('span')].find((s) => /^[a-z_]+:$/.test(s.textContent ?? '') && (s as HTMLElement).style.opacity === '0.7');
-      return label ? label.textContent!.slice(0, -1) : '';
-    });
+    // M10b: the Properties window's title is the selected call's name.
+    const title = (await this.propertiesWindow().getByTestId('window-title-bar').locator('strong').textContent()) ?? '';
+    return /^[A-Za-z_$][\w$]*$/.test(title) ? title : '';
   }
 
   /** The toolbar's Position X/Y/Z fields for the selected node. */
@@ -153,6 +152,39 @@ export class ScadApp {
   async clickEditorLine(line: number): Promise<void> {
     await this.page.locator('.monaco-editor .view-line').nth(line - 1).click({ position: { x: 4, y: 5 } });
     await this.page.waitForTimeout(200);
+  }
+
+  /** M10b: the open tool window (Boolean, Extrude, Distance, Align, Pattern). */
+  toolWindow() {
+    return this.page.getByTestId('tool-window');
+  }
+
+  /** M10b: the selected part's Properties window. */
+  propertiesWindow() {
+    return this.page.getByTestId('properties-window');
+  }
+
+  /** M10b: open the Boolean window on `op` (the toolbar button opens on the last one used). */
+  async startBoolean(op: 'Union' | 'Difference' | 'Intersection'): Promise<void> {
+    await this.button('Boolean').click();
+    await this.toolWindow().getByRole('group', { name: 'Boolean operation' }).getByRole('button', { name: op, exact: true }).click();
+  }
+
+  /** M10b: open the Extrude window on Linear or Rotate. */
+  async startExtrude(kind: 'Linear' | 'Rotate' = 'Linear'): Promise<void> {
+    await this.button('Extrude').click();
+    await this.toolWindow().getByRole('group', { name: 'Extrude kind' }).getByRole('button', { name: kind, exact: true }).click();
+  }
+
+  /** M10b: Apply the open tool window and wait for the render it starts. */
+  async applyTool(): Promise<string> {
+    return this.rendersAfter(() => this.toolWindow().getByRole('button', { name: /^(Apply|Insert new)$/ }).click());
+  }
+
+  /** M10b: grid snap is off by default; sketch tests that expect whole-number points turn it on. */
+  async setGridSnap(on: boolean): Promise<void> {
+    const box = this.page.getByRole('checkbox', { name: 'Grid' });
+    if ((await box.isChecked()) !== on) await box.click();
   }
 
   /** Put the caret at the very end of the editor and type with real key presses. */
@@ -196,7 +228,7 @@ export class ScadApp {
    */
   async axisHandle(axis: 'x' | 'y' | 'z'): Promise<{ dx: number; dy: number; count: number }> {
     const v = await this.viewport();
-    const img = decodePng(await this.page.screenshot({ clip: v }));
+    const img = decodePng(await this.canvasShot(v));
     const ch = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
     let sx = 0;
     let sy = 0;
@@ -220,7 +252,21 @@ export class ScadApp {
 
   /** PNG of the viewport only, for before/after comparisons. */
   async viewportShot(): Promise<Buffer> {
-    return this.page.screenshot({ clip: await this.viewport() });
+    return this.canvasShot(await this.viewport());
+  }
+
+  /**
+   * M10b: the 3D view's own pixels. The floating windows over it are hidden
+   * for the capture (and only then), so pixel counts and centroids measure
+   * the model, not a window that happens to cover part of it.
+   */
+  private async canvasShot(clip: Box): Promise<Buffer> {
+    await this.page.evaluate(() => document.querySelectorAll<HTMLElement>('[data-floating-window]').forEach((el) => (el.style.visibility = 'hidden')));
+    try {
+      return await this.page.screenshot({ clip });
+    } finally {
+      await this.page.evaluate(() => document.querySelectorAll<HTMLElement>('[data-floating-window]').forEach((el) => (el.style.visibility = '')));
+    }
   }
 }
 
@@ -239,6 +285,10 @@ export const test = base.extend<{ scad: ScadApp; tmpDir: string }>({
       },
     });
     const page = await app.firstWindow();
+    // M10b: tool and Properties windows float over the viewport's top-left
+    // corner; at 1600 px the viewport's centre (where most tests click) is
+    // clear of them, as on a typical desktop screen. CI's Xvfb is 1920x1080.
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setContentSize(1600, 900));
     const scad = new ScadApp(app, page);
     await expect.poll(() => scad.status(), { timeout: 90_000 }).toMatch(/^Rendered/);
     await use(scad);
