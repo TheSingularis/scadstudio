@@ -20,6 +20,9 @@ test.describe('crash safety (crash report 2026-11-25)', () => {
   test('opening the gag trophy at full detail keeps the app responsive and renders it', async ({ scad }) => {
     // Over a minute on a fast machine; leave room for slow CI runners.
     test.setTimeout(420_000);
+    // At full detail: the long render is the point (M18's quick preview
+    // would otherwise make it take seconds).
+    await scad.setQuickPreview('off');
     await scad.stubDialogs({ open: FIXTURE });
     await scad.button('Open .scad file...').click();
     await expect.poll(() => scad.status()).toBe('Rendering...');
@@ -52,6 +55,7 @@ test.describe('crash safety (crash report 2026-11-25)', () => {
 
   test('if the render process dies mid-render, the app says so and the next render works', async ({ scad }) => {
     test.setTimeout(240_000);
+    await scad.setQuickPreview('off');
     const heavy = readFileSync(FIXTURE, 'utf8');
     await scad.page.evaluate((s) => (window as unknown as { __testSetSource(v: string): void }).__testSetSource(s), heavy);
     await expect.poll(() => scad.status()).toBe('Rendering...');

@@ -10,6 +10,7 @@ import {
   type SelectMode,
   type SketchPlaneKind,
   type ActiveSketchPlane,
+  type FocusRequest,
   SELECTED_MESH_COLOR,
   OPERAND_MESH_COLOR,
   buildGlobalSketchPlane,
@@ -24,6 +25,7 @@ import {
   primitiveOnlySlice,
   wrapAsThinExtrude,
   decomposeNode,
+  isTextNode,
   primitiveArgs,
   patchArgument,
   addNamedArgument,
@@ -34,7 +36,9 @@ import {
   readSketchProfile,
   patchSketchPoints,
   IDENTITY_TRANSFORM,
+  formatNumber,
   type NodeTransform,
+  type TransformExprs,
   type BooleanOp,
   type ExtrudeOp,
   type Modifier,
@@ -66,12 +70,40 @@ import { BUILTIN_SIGNATURES, BUILTIN_TOOL_DEFINITIONS, LIST_UNSET_BUILTINS, addU
 import { analyzeSource, toolsFromAnalyzed, type AnalyzedSource } from './moduleIntrospection';
 import { panelFields, parseVec3, quoteScadString, unquoteScadString, type PanelField } from './paramPanel';
 import { findOption, fontGroups, isFontAvailable, type FontEntry } from './fontOptions';
-import { SettingsDialog, type EditorFontSettings } from './components/SettingsDialog';
+import { SettingsDialog, type AppSettingsState } from './components/SettingsDialog';
+import { drivenAxes, positionAnchors } from './linkedDrag';
+import { VariablesPanel, type IncludedSection, type ModuleSection, type VariableScope } from './components/VariablesPanel';
+import { ToolPanel, type ToolState } from './components/ToolPanel';
+import {
+  applyEdits,
+  deleteVariable,
+  insertVariable,
+  isValidName,
+  makeVariable,
+  moduleAt,
+  nameAvailable,
+  readModuleVariables,
+  readVariables,
+  renameVariable,
+  setVariableValue,
+  uniqueName,
+  variableReferences,
+  type VariableInfo,
+} from './variables';
+import { currentOffset, planRelate } from './relate';
+import { patternCountEdits, patternSpacingEdits, readPattern, wrapInPattern, type PatternOptions } from './pattern';
+import { geometryBox, partExtents, translateComponents } from './extents';
+import { add, constant, format as formatLin, fromTerm, sub, term, value as linValue } from './linExpr';
+import { gizmoAxes } from './gizmoLocks';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
 type ModuleSourceFile = Awaited<ReturnType<Window['scadstudio']['scanModules']>>[number];
 import { createCoalescingRunner } from './coalescingRunner';
 import { RenderCache, type CachedRender } from './renderCache';
-import { isEngineCrash, renderErrorMessage } from './renderErrors';
+import { cacheKey, chooseQuality, FULL, likelyFastAtFull, PartTimings, type PreviewMode, type Quality } from './renderQuality';
+import { RenderDetailBadge } from './components/RenderDetailBadge';
+import { isEngineCrash, isRenderCancelled, renderErrorMessage } from './renderErrors';
+import { RenderProgressOverlay, useRenderIsSlow, type RenderProgress } from './components/RenderProgress';
 import {
   EMPTY_SKETCH,
   addProfile,
@@ -219,6 +251,42 @@ function rgbToHex(rgb: ColorVector | null): string {
   return `#${toHex(rgb[0])}${toHex(rgb[1])}${toHex(rgb[2])}`;
 }
 
+// M11: whether `text` is one OpenSCAD expression.
+function isExpression(text: string): boolean {
+  const tree = parseScadSync(`__m11_check = ${text};`);
+  if (!tree) return false;
+  try {
+    return !tree.rootNode.hasError && tree.rootNode.namedChildCount === 1;
+  } finally {
+    tree.delete();
+  }
+}
+
+const NUMBER_TEXT = /^\s*-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?\s*$/i;
+
+function copyExprs(t: NodeTransform): TransformExprs {
+  return t.exprs
+    ? { translate: [...t.exprs.translate], rotateDeg: [...t.exprs.rotateDeg], scale: [...t.exprs.scale] }
+    : { translate: [null, null, null], rotateDeg: [null, null, null], scale: [null, null, null] };
+}
+
+// M11: a part's own geometry box (rotate/scale applied, not translate),
+// for the relate and pattern tools when a part's size can't be written as
+// an expression.
+function meshBox(mesh: NodeMesh | undefined): { min: number[]; max: number[] } | null {
+  if (!mesh) return null;
+  const geometry = new STLLoader().parse(mesh.bytes.slice().buffer as ArrayBuffer);
+  try {
+    return geometryBox(geometry, mesh.transform.rotateDeg, mesh.transform.scale);
+  } finally {
+    geometry.dispose();
+  }
+}
+
+// M10a: thrown inside a render when Cancel was pressed between parts (same
+// text as the main process's, so isRenderCancelled matches both).
+const RENDER_CANCELLED = 'Render cancelled';
+
 const DEFAULT_SOURCE = `// scadstudio — drag the gizmo (Move/Rotate/Scale), insert primitives, click
 // to select, or shift-click to multi-select two+ shapes for a boolean op
 module bracket(w=20, h=10, thickness=3) {
@@ -258,10 +326,12 @@ interface RenderStats {
   // Meshes in the working set and in the dimmed context after the last render.
   workingMeshes: number;
   contextMeshes: number;
+  // M18: meshes on screen that are previews.
+  previewMeshes: number;
 }
 function renderStats(): RenderStats {
   const w = window as unknown as { __scadstudioRenderStats?: RenderStats };
-  w.__scadstudioRenderStats ??= { engineCalls: 0, cacheHits: 0, flashes: 0, workingMeshes: 0, contextMeshes: 0 };
+  w.__scadstudioRenderStats ??= { engineCalls: 0, cacheHits: 0, flashes: 0, workingMeshes: 0, contextMeshes: 0, previewMeshes: 0 };
   return w.__scadstudioRenderStats;
 }
 
@@ -304,6 +374,11 @@ export function App() {
   // on screen before the render (the previous document), so a large part
   // opened with the camera inside it.
   const fitAfterRenderRef = useRef(false);
+  // M10a: set when leaving sketch mode with a new or changed shape. Once it
+  // has rendered, the view frames it (keeping the angle the user had before
+  // the sketch), rather than resetting the whole view (Jordan, 2026-11-27).
+  const focusAfterRenderRef = useRef(false);
+  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
   // M7.5: null outside sketch mode. See Viewport.tsx's ActiveSketchPlane/
   // SketchController for the camera-lock/animate-to-plane behavior this
   // drives. Generalized (slice 3) from a fixed XY/XZ/YZ enum to an arbitrary
@@ -344,14 +419,72 @@ export function App() {
   const [editingSketchIndex, setEditingSketchIndex] = useState<number | null>(null);
   const [sceneNodes, setSceneNodes] = useState<SceneNode[]>([]);
   const [nodeMeshes, setNodeMeshes] = useState<NodeMesh[]>([]);
+  const nodeMeshesRef = useRef(nodeMeshes);
+  nodeMeshesRef.current = nodeMeshes;
   // See Viewport.tsx's SelectMode/ViewportProps.selectedIndices comments for
   // ordering. The last entry is the "primary" selection that gizmo/mirror/
   // color/parameter-panel editing (all single-target operations) act on.
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const primarySelectedIndex = selectedIndices.length > 0 ? selectedIndices[selectedIndices.length - 1] : null;
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>('translate');
+  // M11: the variables sidebar, the Distance/Align/Pattern tool panel and
+  // the Make variable name prompt.
+  // M11: the editor cursor's offset (a user move), for the module scope.
+  const [cursorOffset, setCursorOffset] = useState<number | null>(null);
+  // M11: files the document includes, for their variables.
+  const [includedFiles, setIncludedFiles] = useState<{ path: string; contents: string; via: string }[]>([]);
+  // M11: the variables sidebar remembers whether it was last shown.
+  const [variablesOpen, setVariablesOpenState] = useState(() => {
+    try {
+      return localStorage.getItem('scadstudio.variablesOpen') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const setVariablesOpen = useCallback((next: boolean | ((open: boolean) => boolean)) => {
+    setVariablesOpenState((open) => {
+      const value = typeof next === 'function' ? next(open) : next;
+      try {
+        localStorage.setItem('scadstudio.variablesOpen', String(value));
+      } catch {
+        // Storage unavailable: the choice lasts for this session only.
+      }
+      return value;
+    });
+  }, []);
+  const [tool, setTool] = useState<ToolState | null>(null);
+  const toolRef = useRef<ToolState | null>(null);
+  toolRef.current = tool;
+  const [makeVar, setMakeVar] = useState<{
+    target: { kind: 'arg'; argIndex: number | null; label: string; defaultText: string | null } | { kind: 'position'; axis: 0 | 1 | 2 };
+    name: string;
+    error: string | null;
+  } | null>(null);
   const [rotateSpace, setRotateSpace] = useState<RotateSpace>('local');
   const [status, setStatus] = useState('Rendering...');
+  // M10a: the render in progress (null when idle), for the progress overlay
+  // and the greyed-out stale meshes. cancelGenRef counts Cancel presses; a
+  // render that sees it change stops between parts.
+  // The progress itself lives in a ref the overlay reads on its own timer,
+  // so a working set of many (mostly cached) parts doesn't re-render the
+  // whole app once per part; only the start and end are React state.
+  const [renderStartedAt, setRenderStartedAt] = useState<number | null>(null);
+  const renderProgressRef = useRef<RenderProgress | null>(null);
+  const renderIsSlow = useRenderIsSlow(renderStartedAt);
+  const renderingRef = useRef(false);
+  const cancelGenRef = useRef(0);
+  // M18: fast preview. How long each part took at full detail, the
+  // previous working set (to carry timings through an edit), Render's
+  // one-shot "everything at full detail", the parts an open Distance /
+  // Align / Pattern tool measures (always full: a coarser circle is
+  // smaller), and the preview settings (from Settings > Rendering).
+  const timingsRef = useRef(new PartTimings());
+  const prevTimingSetRef = useRef<{ epoch: number; fingerprints: NodeFingerprint[]; sources: string[] } | null>(null);
+  const forceFullRef = useRef(false);
+  const toolFullIndicesRef = useRef<Set<number>>(new Set());
+  const previewSettingsRef = useRef<{ mode: PreviewMode; segments: number }>({ mode: 'auto', segments: 24 });
+  // Parts on screen after the last render, and how many are previews.
+  const [renderDetail, setRenderDetail] = useState<{ parts: number; reduced: number } | null>(null);
   const [parseErrorCount, setParseErrorCount] = useState<number | null>(null);
   // Reactive mirror of treeRef below, purely so the parameter panel (a
   // useMemo over tree+sceneNodes+selection) can recompute when a render
@@ -468,20 +601,40 @@ export function App() {
   }, [deriveFocus]);
 
   // One isolated render through the cache: the normal attempt, then M7's
-  // flat (2D) retry; both outcomes are cached.
-  const renderCached = useCallback(async (source: string, flatSource: string): Promise<CachedRender> => {
+  // flat (2D) retry; both outcomes are cached. M18: at the quality asked
+  // for. A full result serves a preview request too (better, and free), a
+  // preview that lowered nothing is stored as the full render, and an
+  // unmeasured part whose full render looks cheap from its preview is
+  // rendered in full straight away (see likelyFastAtFull).
+  const renderCached = useCallback(async (source: string, flatSource: string, quality: Quality = FULL, promote = false): Promise<CachedRender> => {
     const cache = renderCache.current;
     const stats = renderStats();
-    const hit = cache.get(source);
-    if (hit) {
+    const fullHit = cache.get(source);
+    if (fullHit) {
       stats.cacheHits++;
-      return hit;
+      return fullHit;
     }
+    const key = cacheKey(source, quality);
+    if (quality.kind === 'preview') {
+      const hit = cache.get(key);
+      if (hit) {
+        stats.cacheHits++;
+        return hit;
+      }
+    }
+    const segments = quality.kind === 'preview' ? quality.segments : null;
+    const attempt = async (src: string): Promise<CachedRender> => {
+      stats.engineCalls++;
+      const r = await window.scadstudio.renderMesh(src, segments);
+      if (!r.reduced) timingsRef.current.set(source, r.engineMs);
+      return { bytes: r.bytes, reduced: r.reduced, engineMs: r.engineMs, detailFactor: r.detailFactor };
+    };
     let result: CachedRender;
     try {
-      stats.engineCalls++;
-      result = { bytes: await window.scadstudio.renderScad(source) };
+      result = await attempt(source);
     } catch (firstError) {
+      // M10a: Cancel is not a result of this source; don't cache it.
+      if (isRenderCancelled(firstError)) throw firstError;
       // M7: a pure-2D node (bare square/circle/polygon, a 2D boolean, ...)
       // fails here every time — real OpenSCAD can't STL-export 2D geometry.
       // Retry once wrapped in a hairline linear_extrude (see
@@ -496,14 +649,20 @@ export function App() {
         result = { firstError, secondError: firstError };
       } else {
         try {
-          stats.engineCalls++;
-          result = { bytes: await window.scadstudio.renderScad(flatSource) };
+          result = await attempt(flatSource);
         } catch (secondError) {
+          if (isRenderCancelled(secondError)) throw secondError;
           result = { firstError, secondError };
         }
       }
     }
-    cache.set(source, result);
+    if ('bytes' in result && result.reduced) {
+      cache.set(key, result);
+      if (promote && likelyFastAtFull(result.engineMs ?? Infinity, result.detailFactor ?? 1)) return renderCached(source, flatSource, FULL);
+    } else {
+      // A failure is cached at the quality that produced it.
+      cache.set('bytes' in result ? source : key, result);
+    }
     return result;
   }, []);
 
@@ -511,6 +670,21 @@ export function App() {
     () =>
       createCoalescingRunner(async (src: string) => {
         setStatus('Rendering...');
+        // M10a: progress, and a way to stop between parts on Cancel (the
+        // render process itself is killed by the main process).
+        const generation = cancelGenRef.current;
+        const checkCancelled = () => {
+          if (cancelGenRef.current !== generation) throw new Error(RENDER_CANCELLED);
+        };
+        renderingRef.current = true;
+        // M18: Render (F6) asks for this one run at full detail.
+        const forceFull = forceFullRef.current;
+        forceFullRef.current = false;
+        const { mode: previewMode, segments: previewSegments } = previewSettingsRef.current;
+        let reducedParts = 0;
+        const startedAt = performance.now();
+        renderProgressRef.current = { startedAt, part: 0, parts: 0, stage: null, context: false };
+        setRenderStartedAt(startedAt);
         try {
           const { tree: parsedTree, errorCount } = await parseScad(src);
           const isCurrent = src === sourceRef.current;
@@ -542,7 +716,17 @@ export function App() {
           // First node that failed both render attempts, shown in the status
           // bar so a failure says which node and why (QC audit M4).
           let firstFailure: string | null = null;
-          for (const node of set.nodes) {
+          // M18: every part's isolated render, and its full-detail timing
+          // (carried from before the edit for a part whose text changed).
+          const jobs = set.nodes.map((node) => isolatedRender(set, node, graph.context));
+          const prevTiming = prevTimingSetRef.current;
+          const timings = timingsRef.current.forSet(
+            { fingerprints: set.fingerprints, sources: jobs.map((j) => j.source) },
+            prevTiming && prevTiming.epoch === focusEpochRef.current ? prevTiming : null,
+          );
+          if (isCurrent) prevTimingSetRef.current = { epoch: focusEpochRef.current, fingerprints: set.fingerprints, sources: jobs.map((j) => j.source) };
+          for (const [position, node] of set.nodes.entries()) {
+            renderProgressRef.current = { startedAt, part: position + 1, parts: set.nodes.length, stage: null, context: false };
             // `*` (disable) — real OpenSCAD never evaluates disabled
             // geometry at all, so skip the WASM call entirely rather than
             // rendering it and hiding it after the fact. The node stays
@@ -565,16 +749,21 @@ export function App() {
             // instead of being baked into the rendered geometry (see
             // targetedPatch.ts's decomposeNode for why), inside the working
             // set's frame when drilled in (drillIn.ts).
-            const job = isolatedRender(set, node, graph.context);
-            const result = await renderCached(job.source, job.flatSource);
+            const job = jobs[position];
+            const quality = chooseQuality(previewMode, previewSegments, timings[position], forceFull || toolFullIndicesRef.current.has(node.index));
+            const result = await renderCached(job.source, job.flatSource, quality, previewMode === 'auto' && timings[position] === undefined);
+            checkCancelled();
             if ('bytes' in result) {
+              if (result.reduced) reducedParts++;
               meshes.push({
+                reduced: result.reduced === true,
                 index: node.index,
                 bytes: result.bytes,
                 transform: job.transform,
                 modifier,
                 frame: set.frame,
                 transformEditable: job.transformEditable,
+                upright: !set.readOnly && isTextNode(parsedTree.rootNode, node),
               });
             } else if (isEmptyResult(result)) {
               emptyCount++;
@@ -594,13 +783,20 @@ export function App() {
           // otherwise the selection follows its nodes through the edit
           // (nodeIdentity.ts), within one drill-in epoch.
           const prev = prevSetRef.current;
+          const focusIndex = (index: number) => {
+            if (!focusAfterRenderRef.current) return;
+            focusAfterRenderRef.current = false;
+            setFocusRequest((r) => ({ token: (r?.token ?? 0) + 1, indices: [index] }));
+          };
           if (pendingSelectLast.current) {
             pendingSelectLast.current = false;
             setSelectedIndices(set.nodes.length > 0 ? [set.nodes.length - 1] : []);
+            if (set.nodes.length > 0) focusIndex(set.nodes.length - 1);
           } else if (pendingSelectAfterEdit.current !== null) {
             const idx = pendingSelectAfterEdit.current;
             pendingSelectAfterEdit.current = null;
             setSelectedIndices(idx < set.nodes.length ? [idx] : []);
+            if (idx < set.nodes.length) focusIndex(idx);
           } else if (prev && prev.epoch === focusEpochRef.current) {
             const next = remapIndices(prev.fingerprints, set.fingerprints, selectedRef.current);
             setSelectedIndices(next);
@@ -618,6 +814,8 @@ export function App() {
           // M9: the dimmed context, after the working set so that one is
           // interactive first: every other node at each level above it.
           const context: NodeMesh[] = [];
+          const contextTotal = r.focus.reduce((n, _f, depth) => n + r.sets[depth].nodes.length - 1, 0);
+          let contextDone = 0;
           for (let depth = 0; depth < r.focus.length; depth++) {
             const level = r.sets[depth];
             for (const node of level.nodes) {
@@ -626,8 +824,14 @@ export function App() {
               if (modifier === '*' || modifier === '%') continue;
               if (guardInactive(level.guards[node.index] ?? null)) continue;
               const job = isolatedRender(level, node, graph.context);
-              const result = await renderCached(job.source, job.flatSource);
+              contextDone++;
+              renderProgressRef.current = { startedAt, part: contextDone, parts: contextTotal, stage: null, context: true };
+              const known = timingsRef.current.get(job.source);
+              const quality = chooseQuality(previewMode, previewSegments, known, forceFull);
+              const result = await renderCached(job.source, job.flatSource, quality, previewMode === 'auto' && known === undefined);
+              checkCancelled();
               if ('bytes' in result) {
+                if (result.reduced) reducedParts++;
                 context.push({
                   index: -1,
                   key: `${depth}:${node.index}`,
@@ -646,6 +850,8 @@ export function App() {
           }
           renderStats().workingMeshes = meshes.length;
           renderStats().contextMeshes = context.length;
+          renderStats().previewMeshes = reducedParts;
+          setRenderDetail({ parts: meshes.length + context.length, reduced: reducedParts });
 
           const expected = set.nodes.length - disabledCount - emptyCount;
           const suffixParts = [
@@ -657,12 +863,21 @@ export function App() {
           setStatus(
             lostPrefix +
               (meshes.length === expected
-                ? `Rendered${disabledSuffix}`
+                ? `Rendered${reducedParts > 0 ? ' (preview)' : ''}${disabledSuffix}`
                 : `Rendered ${meshes.length}/${expected} nodes${disabledSuffix}${firstFailure ? ` — ${firstFailure}` : ''}`),
           );
         } catch (err) {
-          setStatus(`Render failed: ${(err as Error).message}`);
-          console.error('[scadstudio] render failed', err);
+          if (isRenderCancelled(err)) {
+            // The last finished render stays on screen (no longer greyed).
+            setStatus('Render cancelled');
+          } else {
+            setStatus(`Render failed: ${(err as Error).message}`);
+            console.error('[scadstudio] render failed', err);
+          }
+        } finally {
+          renderingRef.current = false;
+          renderProgressRef.current = null;
+          setRenderStartedAt(null);
         }
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -697,12 +912,28 @@ export function App() {
       cancelled = true;
     };
   }, [useKey, filePath, libraryVersion]);
+  // M11: the included files, rescanned on the same triggers.
+  useEffect(() => {
+    if (useKey === null) return;
+    let cancelled = false;
+    window.scadstudio
+      .scanIncludes(sourceRef.current)
+      .then((files) => {
+        if (!cancelled) setIncludedFiles(files);
+      })
+      .catch((err) => console.error('[scadstudio] include scan failed', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [useKey, filePath, libraryVersion]);
+  useEffect(() => setCursorOffset(null), [filePath]);
   useEffect(
     () =>
       window.scadstudio.onModulesChanged(() => {
         // A used file changed: its modules may have, and so may the
         // geometry of every call into it.
         renderCache.current.clear();
+        timingsRef.current.clear();
         setLibraryVersion((v) => v + 1);
         runRender(sourceRef.current);
       }),
@@ -771,6 +1002,7 @@ export function App() {
   // resolve from somewhere else.
   useEffect(() => {
     renderCache.current.clear();
+    timingsRef.current.clear();
   }, [filePath]);
 
   useEffect(() => {
@@ -822,6 +1054,39 @@ export function App() {
     [filePath],
   );
 
+  // M10a: the progress overlay's Cancel. Stops the render process (main) and
+  // the per-part loop here; what was on screen before stays.
+  const handleCancelRender = useCallback(() => {
+    if (!renderingRef.current) return;
+    cancelGenRef.current++;
+    void window.scadstudio.cancelRender();
+  }, []);
+
+  // M18: Render (F6): everything on screen at full detail, once. Later
+  // edits go back to the Auto rule (parts measured slow render as previews).
+  const handleFullRender = useCallback(() => {
+    forceFullRef.current = true;
+    runRender(sourceRef.current);
+  }, [runRender]);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'F6' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      e.preventDefault();
+      handleFullRender();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleFullRender]);
+
+  // M10a: the step the render process is on, for the overlay.
+  useEffect(
+    () =>
+      window.scadstudio.onRenderStage((stage) => {
+        if (renderProgressRef.current) renderProgressRef.current = { ...renderProgressRef.current, stage };
+      }),
+    [],
+  );
+
   const openWith = useCallback(async (open: () => ReturnType<Window['scadstudio']['openFile']>) => {
     let result = await open();
     if (result && 'saveFirst' in result) {
@@ -830,6 +1095,15 @@ export function App() {
     }
     if (!result || 'saveFirst' in result) return;
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    // M10a: the previous file's render is no use now (it would otherwise
+    // run to the end first, over a minute for the gag trophy), and its
+    // meshes must not show under the new file's name.
+    if (renderingRef.current) {
+      cancelGenRef.current++;
+      void window.scadstudio.cancelRender();
+    }
+    setNodeMeshes([]);
+    setContextMeshes([]);
     // A new document starts at its top level.
     focusRef.current = [];
     focusEpochRef.current++;
@@ -917,7 +1191,6 @@ export function App() {
     setPickingFace(false);
     setEditingSketchIndex(null);
     resetSketch();
-    setResetViewToken((t) => t + 1);
   }, [resetSketch]);
 
   // M7.5 slice 3: "Pick Face" click → enters the picking-a-face window (free
@@ -1008,7 +1281,9 @@ export function App() {
           if (leave) {
             setActiveSketchPlane(null);
             resetSketch();
-            setResetViewToken((t) => t + 1);
+            // M10a: the view goes back to where it was before the sketch,
+            // then frames the new text once it has rendered.
+            focusAfterRenderRef.current = true;
           }
           return;
         }
@@ -1103,7 +1378,7 @@ export function App() {
     runRender(next);
     setActiveSketchPlane(null);
     resetSketch();
-    setResetViewToken((t) => t + 1);
+    focusAfterRenderRef.current = true;
   }, [activeSketchPlane, runRender, resetSketch]);
 
   // M7.5 on-plane editing: the selected node, when it's a sketch this app can
@@ -1157,7 +1432,7 @@ export function App() {
     setActiveSketchPlane(null);
     setEditingSketchIndex(null);
     resetSketch();
-    setResetViewToken((t) => t + 1);
+    focusAfterRenderRef.current = true;
   }, [editingSketchIndex, runRender, resetSketch]);
 
   // M4/M5: gizmo drag-end -> targeted patch -> same re-parse/re-render
@@ -1171,7 +1446,29 @@ export function App() {
       const tree = treeRef.current;
       const node = sceneNodesRef.current.find((n) => n.index === index);
       if (!tree || !node) return;
-      const patched = patchTransform(sourceRef.current, tree, node, transform);
+      let patched = patchTransform(sourceRef.current, tree, node, transform);
+      // M11 linked drag: an expression axis that moves with a position
+      // variable moves that variable, so the linked parts come along.
+      const mesh = nodeMeshesRef.current.find((m) => m.index === index);
+      if (mesh?.transform.exprs) {
+        const anchors = positionAnchors(readVariables(tree.rootNode), nodeMeshesRef.current.map((m) => m.transform));
+        const moved = new Map<string, number>();
+        for (const d of drivenAxes(tree, node, mesh.transform, anchors)) {
+          const delta = transform.translate[d.axis] - mesh.transform.translate[d.axis];
+          const base = moved.get(d.anchor.name) ?? Number(d.anchor.display);
+          if (Math.abs(delta) > 1e-9 && Number.isFinite(base)) moved.set(d.anchor.name, base + delta);
+        }
+        if (moved.size > 0) {
+          const parsed = parseScadSync(patched);
+          if (parsed) {
+            const edits = readVariables(parsed.rootNode)
+              .filter((v) => moved.has(v.name))
+              .map((v) => ({ start: v.valueStart, end: v.valueEnd, text: formatNumber(moved.get(v.name)!) }));
+            parsed.delete();
+            patched = applyEdits(patched, edits);
+          }
+        }
+      }
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       setSource(patched);
       runRender(patched);
@@ -1207,7 +1504,8 @@ export function App() {
       const b = parseInt(hex.slice(5, 7), 16) / 255;
       // Keep an existing alpha: the picker only chooses the RGB part.
       const color: ColorVector = current.color?.length === 4 ? [r, g, b, current.color[3]] : [r, g, b];
-      handleTransformCommit(primarySelectedIndex, { ...current, color });
+      // A new color is written as a vector, replacing a name or hex string.
+      handleTransformCommit(primarySelectedIndex, { ...current, color, colorText: undefined });
     },
     [primarySelectedIndex, nodeMeshes, handleTransformCommit],
   );
@@ -1216,7 +1514,7 @@ export function App() {
     if (primarySelectedIndex === null) return;
     const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
     if (!current) return;
-    handleTransformCommit(primarySelectedIndex, { ...current, color: null });
+    handleTransformCommit(primarySelectedIndex, { ...current, color: null, colorText: undefined });
   }, [primarySelectedIndex, nodeMeshes, handleTransformCommit]);
 
   // Position fields in the toolbar: same single-field-edit-of-current-
@@ -1228,11 +1526,23 @@ export function App() {
       if (primarySelectedIndex === null) return;
       const current = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform;
       if (!current) return;
-      const value = Number(valueText);
-      if (!Number.isFinite(value)) return; // invalid input — ignore, leave source untouched
+      const text = valueText.trim();
+      if (text === '') return;
       const translate = [...current.translate] as [number, number, number];
-      translate[axis] = value;
-      handleTransformCommit(primarySelectedIndex, { ...current, translate });
+      const exprs = copyExprs(current);
+      // M11: a number places the axis (and detaches an expression); any
+      // other valid expression is written as is.
+      if (NUMBER_TEXT.test(text)) {
+        translate[axis] = Number(text);
+        exprs.translate[axis] = null;
+      } else if (isExpression(text)) {
+        if (exprs.translate[axis] === text) return;
+        exprs.translate[axis] = text;
+      } else {
+        setStatus(`Not an OpenSCAD expression: ${text}`);
+        return;
+      }
+      handleTransformCommit(primarySelectedIndex, { ...current, translate, exprs });
     },
     [primarySelectedIndex, nodeMeshes, handleTransformCommit],
   );
@@ -1265,6 +1575,21 @@ export function App() {
   // matches document order — no separate lookup needed.
   const selectionAnchor = useRef<number | null>(null);
   const handleSelect = useCallback((index: number | null, mode: SelectMode) => {
+    // M11: while a tool panel is open, a click fills the slot being picked
+    // (and otherwise leaves the slots alone).
+    const active = toolRef.current;
+    if (active) {
+      if (index === null || !active.picking) return;
+      if (active.kind === 'pattern') {
+        setTool({ ...active, part: index, picking: null, spacing: active.part === index ? active.spacing : '' });
+      } else {
+        const next = { ...active, [active.picking]: index };
+        const picking = active.picking === 'move' && next.reference === null ? 'reference' : null;
+        // A new pair gets a fresh default distance.
+        setTool({ ...next, picking, offset: active.kind === 'distance' ? '' : active.offset });
+      }
+      return;
+    }
     if (index === null) {
       selectionAnchor.current = null;
       setSelectedIndices([]);
@@ -1342,7 +1667,7 @@ export function App() {
   }, [selectedArgs, customTools]);
 
   // M15: persisted app settings (Settings > Fonts: the code editor's font).
-  const [settings, setSettings] = useState<EditorFontSettings>({ editorFontFamily: '', editorFontSize: 13 });
+  const [settings, setSettings] = useState<AppSettingsState>({ editorFontFamily: '', editorFontSize: 13, previewMode: 'auto', previewSegments: 24 });
   const [settingsOpen, setSettingsOpen] = useState(false);
   useEffect(() => {
     void window.scadstudio
@@ -1350,7 +1675,15 @@ export function App() {
       .then(setSettings)
       .catch((err) => console.error('[scadstudio] settings', err));
   }, []);
-  const handleSettingsChange = useCallback((patch: Partial<EditorFontSettings>) => {
+  // M18: the preview settings reach the render loop through a ref; a change
+  // re-renders (from the cache where it can).
+  useEffect(() => {
+    const prev = previewSettingsRef.current;
+    if (prev.mode === settings.previewMode && prev.segments === settings.previewSegments) return;
+    previewSettingsRef.current = { mode: settings.previewMode, segments: settings.previewSegments };
+    runRender(sourceRef.current);
+  }, [settings.previewMode, settings.previewSegments, runRender]);
+  const handleSettingsChange = useCallback((patch: Partial<AppSettingsState>) => {
     setSettings((s) => ({ ...s, ...patch }));
     void window.scadstudio
       .updateSettings(patch)
@@ -1410,6 +1743,356 @@ export function App() {
       runRender(patched);
     },
     [primarySelectedIndex, runRender],
+  );
+
+  // M11: every visual edit below ends the same way.
+  const commitEdit = useCallback(
+    (next: string) => {
+      if (next === sourceRef.current) return;
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      setSource(next);
+      runRender(next);
+    },
+    [runRender, setSource],
+  );
+
+  // M11: the document's variables, from the last rendered parse.
+  const variables = useMemo(() => (tree ? readVariables(tree.rootNode) : []), [tree]);
+  // M11 visible scopes: variables from included files, read-only. Their
+  // uses are this document's reads of them (none once it assigns the name
+  // again, since OpenSCAD keeps the last assignment).
+  const includedParsed = useMemo(
+    () =>
+      includedFiles.flatMap((file) => {
+        const parsed = parseScadSync(file.contents);
+        if (!parsed) return [];
+        const vars = readVariables(parsed.rootNode).map((v) => ({ ...v, uses: [] as VariableInfo['uses'] }));
+        parsed.delete();
+        return [{ path: file.path, via: file.via, variables: vars }];
+      }),
+    [includedFiles],
+  );
+  const includedSections = useMemo((): IncludedSection[] => {
+    if (!tree) return [];
+    const assigned = new Map(variables.map((v) => [v.name, v.line]));
+    return includedParsed.map((file) => {
+      const overridden = new Map<string, number>();
+      const vars = file.variables.map((v) => {
+        const line = assigned.get(v.name);
+        if (line !== undefined) {
+          overridden.set(v.name, line);
+          return v;
+        }
+        return { ...v, uses: variableReferences(tree.rootNode, v.name).map((id) => ({ start: id.startIndex, end: id.endIndex, line: id.startPosition.row })) };
+      });
+      return { path: file.path, via: file.via, variables: vars, overridden };
+    });
+  }, [tree, variables, includedParsed]);
+  // The assignment block a scope names, in the current text.
+  const scopeContainer = useCallback((scope: VariableScope) => {
+    const t = treeRef.current;
+    if (!t) return null;
+    if (scope.kind === 'file') return t.rootNode;
+    const def = moduleAt(t.rootNode, scope.definitionStart);
+    return def && def.startIndex === scope.definitionStart ? def.childForFieldName('body') : null;
+  }, []);
+  // The same variable in the current text (it may have moved since).
+  const liveVariable = useCallback(
+    (v: VariableInfo, scope: VariableScope = { kind: 'file' }): VariableInfo | null => {
+      const t = treeRef.current;
+      const container = scopeContainer(scope);
+      if (!t || !container) return null;
+      const all = readVariables(t.rootNode, container).filter((x) => x.name === v.name);
+      return all.find((x) => x.line === v.line) ?? all[all.length - 1] ?? null;
+    },
+    [scopeContainer],
+  );
+  const handleVariableSet = useCallback(
+    (v: VariableInfo, valueText: string, scope: VariableScope = { kind: 'file' }) => {
+      const live = liveVariable(v, scope);
+      if (!live) return;
+      if (!isExpression(valueText)) {
+        setStatus(`Not an OpenSCAD expression: ${valueText}`);
+        return;
+      }
+      commitEdit(setVariableValue(sourceRef.current, live, valueText));
+    },
+    [liveVariable, commitEdit],
+  );
+  const handleVariableAdd = useCallback(
+    (name: string, valueText: string): string | null => {
+      const t = treeRef.current;
+      if (!t) return 'The file is still loading.';
+      if (!isValidName(name)) return 'A name starts with a letter or _ and has only letters, digits and _.';
+      if (!nameAvailable(t.rootNode, name)) return `${name} is already used in this file.`;
+      if (!isExpression(valueText)) return `Not an OpenSCAD expression: ${valueText}`;
+      commitEdit(insertVariable(sourceRef.current, t.rootNode, name, valueText));
+      return null;
+    },
+    [commitEdit],
+  );
+  const handleVariableRename = useCallback(
+    (v: VariableInfo, newName: string, scope: VariableScope = { kind: 'file' }): string | null => {
+      const t = treeRef.current;
+      const container = scopeContainer(scope);
+      if (!t || !container) return 'The file is still loading.';
+      if (!isValidName(newName)) return 'A name starts with a letter or _ and has only letters, digits and _.';
+      if (!nameAvailable(t.rootNode, newName)) return `${newName} is already used in this file.`;
+      commitEdit(renameVariable(sourceRef.current, t.rootNode, v.name, newName, container));
+      return null;
+    },
+    [commitEdit, scopeContainer],
+  );
+  const handleVariableDelete = useCallback(
+    (v: VariableInfo, inline: boolean, scope: VariableScope = { kind: 'file' }) => {
+      const t = treeRef.current;
+      const container = scopeContainer(scope);
+      const live = liveVariable(v, scope);
+      if (!t || !live || !container) return;
+      commitEdit(deleteVariable(sourceRef.current, t.rootNode, live, inline, container));
+    },
+    [liveVariable, commitEdit, scopeContainer],
+  );
+  const handleReveal = useCallback((start: number, end: number) => {
+    setRevealRequest((prev) => ({ start, end, token: (prev?.token ?? 0) + 1 }));
+  }, []);
+
+  // M11 Make variable: the name prompt opens with a suggestion.
+  const startMakeVariable = useCallback(
+    (target: NonNullable<typeof makeVar>['target']) => {
+      const t = treeRef.current;
+      if (!t) return;
+      const call = selectedArgs?.callName ?? 'part';
+      const base = target.kind === 'position' ? `${call}_${'xyz'[target.axis]}` : `${call}_${/^#/.test(target.label) ? 'value' : target.label}`;
+      setMakeVar({ target, name: uniqueName(t.rootNode, base), error: null });
+    },
+    [selectedArgs],
+  );
+  const handleMakeVariable = useCallback(
+    (name: string) => {
+      const t = treeRef.current;
+      const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
+      if (!t || !node || !makeVar) return;
+      const fail = (error: string) => setMakeVar({ ...makeVar, name, error });
+      if (!isValidName(name)) return fail('A name starts with a letter or _ and has only letters, digits and _.');
+      if (!nameAvailable(t.rootNode, name)) return fail(`${name} is already used in this file.`);
+      const src = sourceRef.current;
+      let next: string | null = null;
+      const target = makeVar.target;
+      const thenInsert = (step: string, valueText: string) => {
+        const parsed = parseScadSync(step);
+        if (!parsed) return null;
+        try {
+          return insertVariable(step, parsed.rootNode, name, valueText);
+        } finally {
+          parsed.delete();
+        }
+      };
+      if (target.kind === 'arg') {
+        const args = primitiveArgs(t.rootNode, node);
+        const arg = target.argIndex !== null ? args?.args[target.argIndex] : null;
+        if (arg) next = makeVariable(src, t.rootNode, { start: arg.valueStart, end: arg.valueEnd }, name);
+        else if (target.defaultText !== null) next = thenInsert(addNamedArgument(src, t, node, target.label, name), target.defaultText);
+      } else {
+        const d = decomposeNode(t.rootNode, node);
+        const mesh = nodeMeshes.find((m) => m.index === node.index);
+        if (d && mesh) {
+          const comp = translateComponents(d)[target.axis];
+          if (comp) next = makeVariable(src, t.rootNode, { start: comp.startIndex, end: comp.endIndex }, name);
+          else {
+            const exprs = copyExprs(mesh.transform);
+            exprs.translate[target.axis] = name;
+            next = thenInsert(patchTransform(src, t, node, { ...mesh.transform, exprs }), formatNumber(mesh.transform.translate[target.axis]));
+          }
+        }
+      }
+      if (!next) return fail('This value can’t be made a variable here.');
+      setMakeVar(null);
+      commitEdit(next);
+    },
+    [makeVar, primarySelectedIndex, nodeMeshes, commitEdit],
+  );
+
+  // M11 tool panel: Distance, Align, Pattern. Slots start from the
+  // selection: the first selected part moves (it keeps the boolean tools'
+  // orange), the second is the reference (red).
+  const startTool = useCallback((kind: ToolState['kind']) => {
+    const sel = selectedRef.current;
+    setMakeVar(null);
+    if (kind === 'pattern') {
+      const part = sel.length > 0 ? sel[sel.length - 1] : null;
+      setTool({ kind, part, picking: part === null ? 'part' : null, mode: 'linear', axis: 0, count: '3', spacingMode: 'pitch', spacing: '', fullCircle: true, step: '30' });
+      return;
+    }
+    const move = sel[0] ?? null;
+    const reference = sel[1] ?? null;
+    setTool({
+      kind,
+      move,
+      reference,
+      picking: move === null ? 'move' : reference === null ? 'reference' : null,
+      axis: 0,
+      moveEdge: kind === 'distance' ? 'min' : 'center',
+      referenceEdge: kind === 'distance' ? 'max' : 'center',
+      offset: kind === 'distance' ? '' : '0',
+      offsetName: kind === 'distance' ? 'gap' : '',
+      follow: true,
+    });
+  }, []);
+  // The viewport highlights the slots in the panel's colors.
+  useEffect(() => {
+    if (!tool) return;
+    const slots = tool.kind === 'pattern' ? [tool.part] : [tool.move, tool.reference];
+    setSelectedIndices(slots.filter((i): i is number => i !== null));
+  }, [tool]);
+  // A drill in or out changes what the slots' indices mean.
+  const toolFocusDepth = resolved?.focus.length ?? 0;
+  useEffect(() => {
+    setTool(null);
+    setMakeVar(null);
+  }, [toolFocusDepth]);
+  // M18: a part an open Distance / Align / Pattern tool sizes from its mesh
+  // must be the full render (a coarser circle is smaller). While the tool is
+  // open its parts always render in full; if one on screen is a preview,
+  // render it again now.
+  useEffect(() => {
+    const parts = !tool ? [] : tool.kind === 'pattern' ? [tool.part] : [tool.move, tool.reference];
+    const indices = new Set(parts.filter((i): i is number => i !== null));
+    toolFullIndicesRef.current = indices;
+    if (nodeMeshes.some((m) => m.reduced && indices.has(m.index))) runRender(sourceRef.current);
+  }, [tool, nodeMeshes, runRender]);
+  const measureIndex = useCallback((index: number) => () => meshBox(nodeMeshes.find((m) => m.index === index)), [nodeMeshes]);
+  // Distance's default: the distance the parts are at now.
+  useEffect(() => {
+    if (tool?.kind !== 'distance' || tool.move === null || tool.reference === null || tool.offset !== '') return;
+    const t = treeRef.current;
+    const nodes = sceneNodesRef.current;
+    if (!t || !nodes[tool.move] || !nodes[tool.reference]) return;
+    const d = currentOffset(t, {
+      move: nodes[tool.move],
+      reference: nodes[tool.reference],
+      axis: tool.axis,
+      moveEdge: tool.moveEdge,
+      referenceEdge: tool.referenceEdge,
+      measureMove: measureIndex(tool.move),
+      measureReference: measureIndex(tool.reference),
+    });
+    setTool({ ...tool, offset: d === null ? '0' : String(d) });
+  }, [tool, measureIndex]);
+  // Pattern's default pitch: the part's width plus 5.
+  useEffect(() => {
+    if (tool?.kind !== 'pattern' || tool.part === null || tool.spacing !== '') return;
+    const t = treeRef.current;
+    const node = sceneNodesRef.current[tool.part];
+    if (!t || !node) return;
+    const ext = partExtents(t, node, measureIndex(tool.part));
+    const width = ext ? linValue(sub(ext.axes[tool.axis].max, ext.axes[tool.axis].min)) : NaN;
+    setTool({ ...tool, spacing: tool.spacingMode === 'gap' ? '5' : Number.isFinite(width) ? formatNumber(width + 5) : '10' });
+  }, [tool, measureIndex]);
+  const labelOf = useCallback(
+    (index: number | null) => {
+      if (index === null) return null;
+      const node = sceneNodes[index];
+      return node ? node.label.trim().replace(/\s+/g, ' ').slice(0, 28) : null;
+    },
+    [sceneNodes],
+  );
+  const toolPreview = useMemo(() => {
+    if (!tool) return null;
+    const t = treeRef.current;
+    const src = sourceRef.current;
+    const nodes = sceneNodesRef.current;
+    if (!t) return null;
+    if (tool.kind !== 'pattern') {
+      if (tool.move === null || tool.reference === null || !nodes[tool.move] || !nodes[tool.reference]) {
+        return { ok: false as const, reason: 'Pick both parts: click a slot, then a part in the viewport.' };
+      }
+      if (tool.offset.trim() !== '' && !isExpression(tool.offset)) return { ok: false as const, reason: `Not an OpenSCAD expression: ${tool.offset}` };
+      const r = planRelate(src, t, {
+        move: nodes[tool.move],
+        reference: nodes[tool.reference],
+        axis: tool.axis,
+        moveEdge: tool.moveEdge,
+        referenceEdge: tool.referenceEdge,
+        offsetText: tool.offset,
+        offsetName: tool.offsetName.trim() || null,
+        follow: tool.follow,
+        attach: tool.kind === 'distance',
+        measureMove: measureIndex(tool.move),
+        measureReference: measureIndex(tool.reference),
+      });
+      if (!r.ok) return r;
+      const notes: string[] = [];
+      if (r.plan.measured.reference) notes.push(`${labelOf(tool.reference)} can’t be sized from its code, so its measured size is used: the part follows when it moves, not when it changes size.`);
+      if (r.plan.measured.move) notes.push(`${labelOf(tool.move)} is sized from its rendered mesh: if it changes size, its edge won’t stay put.`);
+      if (!tool.follow) notes.push('Numbers are copied: the part won’t follow later changes.');
+      else if (tool.kind === 'distance') notes.push('Locked together: drag either part in any direction and the other follows. Change the distance in the Variables panel.');
+      return {
+        ok: true as const,
+        lines: [...r.plan.newVariables.map((v) => `${v.name} = ${v.valueText};`), `${labelOf(tool.move)} → translate ${'XYZ'[tool.axis]} = ${r.plan.expression}`],
+        notes,
+        source: r.plan.source,
+      };
+    }
+    if (tool.part === null || !nodes[tool.part]) return { ok: false as const, reason: 'Pick the part: click the slot, then a part in the viewport.' };
+    if (!isExpression(tool.count)) return { ok: false as const, reason: 'Enter a count.' };
+    const node = nodes[tool.part];
+    const notes: string[] = [];
+    let opts: PatternOptions;
+    if (tool.mode === 'linear') {
+      if (!isExpression(tool.spacing)) return { ok: false as const, reason: 'Enter a spacing.' };
+      let spacing = tool.spacing.trim();
+      if (tool.spacingMode === 'gap') {
+        const ext = partExtents(t, node, measureIndex(tool.part));
+        if (!ext) return { ok: false as const, reason: 'The part’s size isn’t known, so use Pitch.' };
+        const width = sub(ext.axes[tool.axis].max, ext.axes[tool.axis].min);
+        const gap = NUMBER_TEXT.test(spacing) ? constant(Number(spacing)) : fromTerm(term(spacing, NaN));
+        spacing = formatLin(add(width, gap));
+        if (ext.axes[tool.axis].measured) notes.push('The part’s width is measured, so the spacing won’t follow if it changes size.');
+      }
+      opts = { kind: 'linear', axis: tool.axis, count: tool.count, spacing };
+    } else {
+      if (!tool.fullCircle && !isExpression(tool.step)) return { ok: false as const, reason: 'Enter a step angle.' };
+      opts = { kind: 'circular', axis: tool.axis, count: tool.count, step: tool.fullCircle ? null : tool.step };
+      notes.push(`Copies turn about the ${'XYZ'[tool.axis]} axis through the origin.`);
+    }
+    const next = wrapInPattern(src, t, node, opts);
+    if (!next) return { ok: false as const, reason: 'This part can’t be patterned.' };
+    const written = next.slice(node.startIndex, node.endIndex + (next.length - src.length));
+    return { ok: true as const, lines: written.split('\n').slice(0, 3).map((l) => l.trim()), notes, source: next };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool, tree, nodeMeshes, source, measureIndex, labelOf]);
+  const handleApplyTool = useCallback(() => {
+    if (!tool || !toolPreview?.ok) return;
+    pendingSelectAfterEdit.current = tool.kind === 'pattern' ? tool.part : tool.move;
+    setTool(null);
+    commitEdit(toolPreview.source);
+  }, [tool, toolPreview, commitEdit]);
+  // Esc leaves the tool panel without writing anything.
+  useEffect(() => {
+    if (!tool) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setTool(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tool]);
+
+  // M11: a selected pattern's count and spacing, editable after the fact.
+  const selectedPattern = useMemo(() => {
+    if (!tree || primarySelectedIndex === null) return null;
+    const node = sceneNodes.find((n) => n.index === primarySelectedIndex);
+    return node ? readPattern(tree, node) : null;
+  }, [tree, sceneNodes, primarySelectedIndex]);
+  const handlePatternCommit = useCallback(
+    (field: 'count' | 'spacing', text: string) => {
+      const t = treeRef.current;
+      const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
+      const p = t && node ? readPattern(t, node) : null;
+      if (!p || !isExpression(text)) return;
+      commitEdit(applyEdits(sourceRef.current, field === 'count' ? patternCountEdits(p, text) : patternSpacingEdits(p, text)));
+    },
+    [primarySelectedIndex, commitEdit],
   );
 
   // M5: toolbar primitive insertion, reusing the same targeted-patch +
@@ -1548,12 +2231,23 @@ export function App() {
     const depth = resolvedRef.current?.focus.length ?? 0;
     if (depth > 0) handleStepOut(depth - 1);
   };
+  // M10a: Focus (F, like Unity's editor): frame the selected parts, keeping
+  // the view's angle. With nothing selected, the same as Reset View.
+  const focusSelectionRef = useRef<() => void>(() => {});
+  focusSelectionRef.current = () => {
+    const indices = selectedRef.current.filter((i) => nodeMeshesRef.current.some((m) => m.index === i));
+    if (indices.length === 0) setResetViewToken((t) => t + 1);
+    else setFocusRequest((r) => ({ token: (r?.token ?? 0) + 1, indices }));
+  };
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (e.defaultPrevented) return;
+      const isFocusKey = (e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey;
+      if (e.key !== 'Escape' && !isFocusKey) return;
       const target = e.target as HTMLElement | null;
       if (target?.closest('.monaco-editor, input, textarea, select, [contenteditable="true"]')) return;
-      escapeRef.current();
+      if (isFocusKey) focusSelectionRef.current();
+      else escapeRef.current();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -1562,6 +2256,27 @@ export function App() {
   const workingSet = currentSet(resolved);
   const focusDepth = resolved?.focus.length ?? 0;
   const readOnly = workingSet?.readOnly ?? null;
+
+  // M11 visible scopes: the module the drill-in or the editor cursor is
+  // inside. Drilled into a library module, its variables show read-only.
+  const variablesModule = useMemo((): ModuleSection | null => {
+    if (!tree) return null;
+    const container = workingSet?.container ?? null;
+    if (workingSet && container && workingSet.doc.kind === 'library') {
+      const def = moduleAt(workingSet.doc.tree.rootNode, container.body.start);
+      const info = def ? readModuleVariables(workingSet.doc.tree.rootNode, def) : null;
+      if (!info) return null;
+      const { body: _body, ...rest } = info;
+      return { ...rest, file: workingSet.doc.path };
+    }
+    const offset = workingSet?.editingModule && container ? container.body.start : cursorOffset;
+    if (offset === null) return null;
+    const def = moduleAt(tree.rootNode, offset);
+    const info = def ? readModuleVariables(tree.rootNode, def) : null;
+    if (!info) return null;
+    const { body: _body, ...rest } = info;
+    return { ...rest, file: null };
+  }, [tree, workingSet, cursorOffset]);
   // Transform edits need the working set's frame as a matrix (drillIn.ts);
   // sketches also need it rigid, since a sketch plane can't be scaled.
   const transformEditable = !readOnly && (workingSet?.bakedPrefix ?? '') === '';
@@ -1628,6 +2343,32 @@ export function App() {
     return null;
   }, [resolved]);
   const visibleCustomTools = workingSet?.editingModule ? customTools.filter((t) => t.callName !== workingSet.editingModule) : customTools;
+
+  // M11: say why some gizmo handles are missing.
+  // M11 linked drag: the selected part's axes that move a position variable.
+  const primaryDriven = useMemo(() => {
+    const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
+    const node = sceneNodesRef.current.find((n) => n.index === primarySelectedIndex);
+    if (!tree || !mesh || !node || readOnly) return [];
+    return drivenAxes(tree, node, mesh.transform, positionAnchors(variables, nodeMeshes.map((m) => m.transform)));
+  }, [tree, nodeMeshes, primarySelectedIndex, variables, readOnly]);
+  const primaryFreeAxes = useMemo(() => [0, 1, 2].map((axis) => primaryDriven.some((d) => d.axis === axis)), [primaryDriven]);
+  const lockNote = useMemo(() => {
+    const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
+    if (!mesh) return null;
+    const axes = gizmoAxes(mesh.transform, mesh.frame, gizmoMode, primaryFreeAxes);
+    if (axes.locked.length === 0) {
+      if (gizmoMode !== 'translate' || primaryDriven.length === 0) return null;
+      const names = [...new Set(primaryDriven.map((d) => d.anchor.name))];
+      const uses = new Set(primaryDriven.flatMap((d) => d.anchor.uses.map((u) => u.start))).size;
+      return `Linked: dragging moves ${names.join(', ')}, and every part that reads ${names.length > 1 ? 'them' : 'it'} moves too (${uses} use${uses === 1 ? '' : 's'}).`;
+    }
+    const what = axes.locked.map((l) => `${'XYZ'[l.axis]} = ${l.text}`).join(', ');
+    if (!axes.visible) return `${gizmoMode === 'rotate' ? 'Rotation' : gizmoMode === 'scale' ? 'Scale' : 'Position'} is set by an expression (${what}), so the ${gizmoMode} gizmo is off.`;
+    return `${what} (expression): the gizmo moves the other axes.`;
+  }, [nodeMeshes, primarySelectedIndex, gizmoMode, primaryFreeAxes, primaryDriven]);
+  // Make variable's prompt belongs to one selected part.
+  useEffect(() => setMakeVar(null), [primarySelectedIndex]);
 
   const breadcrumb =
     focusDepth > 0 || selectedCanDrill || showParts || selectedDefinition ? (
@@ -1801,8 +2542,14 @@ export function App() {
           Save As...
         </button>
         <button onClick={() => setResetViewToken((t) => t + 1)}>Reset View</button>
-        <button onClick={() => setSettingsOpen(true)} title="Settings (editor font)">
+        <button onClick={() => focusSelectionRef.current()} title="Frame the selected part, keeping the view angle (F)">
+          Focus
+        </button>
+        <button onClick={() => setSettingsOpen(true)} title="Settings (editor font, quick preview)">
           Settings
+        </button>
+        <button onClick={() => setVariablesOpen((o) => !o)} aria-pressed={variablesOpen} title="Show or hide the variables panel">
+          Variables{variables.length > 0 ? ` (${variables.length})` : ''}
         </button>
         <span title={dirty ? 'Unsaved changes' : undefined}>
           {filePath ?? '(unsaved default example)'}
@@ -1993,7 +2740,7 @@ export function App() {
             ))}
           </span>
         )}
-        {transformEditable && primarySelectedIndex !== null && (
+        {transformEditable && !tool && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             {MIRROR_AXIS_BUTTONS.map(({ axis, label }) => (
               <button key={axis} onClick={() => handleMirrorAxis(axis)}>
@@ -2002,7 +2749,7 @@ export function App() {
             ))}
           </span>
         )}
-        {!readOnly && primarySelectedIndex !== null && (
+        {!readOnly && !tool && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Modifier:
             {MODIFIER_BUTTONS.map(({ modifier, label }) => (
@@ -2016,33 +2763,59 @@ export function App() {
             ))}
           </span>
         )}
-        {transformEditable && primarySelectedIndex !== null && (
+        {transformEditable && !tool && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Position:
             {(['X', 'Y', 'Z'] as const).map((label, axis) => {
-              const translate = nodeMeshes.find((m) => m.index === primarySelectedIndex)?.transform.translate;
-              const value = translate?.[axis] ?? 0;
+              const mesh = nodeMeshes.find((m) => m.index === primarySelectedIndex);
+              const value = mesh?.transform.translate[axis] ?? 0;
+              // M11: an axis written as an expression shows (and edits) the
+              // expression; typing a number detaches it.
+              const expr = mesh?.transform.exprs?.translate[axis] ?? null;
+              const shown = expr ?? formatNumber(value);
               return (
                 <span key={label} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                   <span style={{ opacity: 0.6 }}>{label}:</span>
                   {/* Keyed on the value too, same reformat-after-commit reasoning as the parameter panel's inputs below. */}
                   <input
-                    key={`${primarySelectedIndex}-${axis}-${value}`}
-                    type="number"
-                    defaultValue={value}
-                    step="any"
-                    size={5}
-                    onBlur={(e) => handlePositionCommit(axis as 0 | 1 | 2, e.target.value)}
+                    key={`${primarySelectedIndex}-${axis}-${shown}`}
+                    type="text"
+                    inputMode="decimal"
+                    list={VARIABLE_DATALIST_ID}
+                    aria-label={`Position ${label}`}
+                    defaultValue={shown}
+                    size={expr ? Math.min(24, Math.max(5, expr.length + 1)) : 5}
+                    title={expr ? `Set by an expression (comes to ${formatNumber(value)}). Type a number to detach it.` : 'A number, a variable name or an expression'}
+                    style={expr ? { fontFamily: 'monospace', color: '#9cdcfe', fontStyle: 'italic' } : undefined}
+                    onBlur={(e) => {
+                      if (e.target.value.trim() !== shown) handlePositionCommit(axis as 0 | 1 | 2, e.target.value);
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') e.currentTarget.blur();
                     }}
                   />
+                  {!expr && (
+                    <button
+                      className="make-variable"
+                      aria-label={`Make position ${label} a variable`}
+                      title="Make variable: name this position at the top of the file"
+                      onClick={() => startMakeVariable({ kind: 'position', axis: axis as 0 | 1 | 2 })}
+                      style={{ fontSize: 11, padding: '0 4px', fontStyle: 'italic' }}
+                    >
+                      ƒx
+                    </button>
+                  )}
                 </span>
               );
             })}
+            {lockNote && (
+              <span role="note" data-testid="gizmo-lock-note" style={{ color: '#9cdcfe', opacity: 0.85 }}>
+                {lockNote}
+              </span>
+            )}
           </span>
         )}
-        {transformEditable && primarySelectedIndex !== null && (
+        {transformEditable && !tool && primarySelectedIndex !== null && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Color:
             <input
@@ -2055,7 +2828,7 @@ export function App() {
             )}
           </span>
         )}
-        {!readOnly && selectedIndices.length >= 2 && (
+        {!readOnly && !tool && selectedIndices.length >= 2 && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             Boolean ({selectedIndices.length} selected —
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
@@ -2074,7 +2847,102 @@ export function App() {
             ))}
           </span>
         )}
+        {transformEditable && !sketching && (
+          <span role="group" aria-label="Constrain" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            Constrain:
+            <button onClick={() => startTool('distance')} aria-pressed={tool?.kind === 'distance'} title="Place one part a distance from another, as an expression that follows it">
+              Distance
+            </button>
+            <button onClick={() => startTool('align')} aria-pressed={tool?.kind === 'align'} title="Line up one part's edge or center with another's, as an expression that follows it">
+              Align
+            </button>
+            <span
+              data-testid="constrain-experimental"
+              title="Distance and Align are temporary: they will be redone with a real constraint solver (picking faces, with dimension lines). What they write stays plain OpenSCAD."
+              style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5, color: '#e8a05a', border: '1px solid #e8a05a', borderRadius: 3, padding: '0 4px' }}
+            >
+              experimental
+            </span>
+            <button onClick={() => startTool('pattern')} aria-pressed={tool?.kind === 'pattern'} title="Copies of a part in a row or around an axis, as a for loop">
+              Pattern
+            </button>
+          </span>
+        )}
       </div>
+      {tool && (
+        <ToolPanel
+          tool={tool}
+          labelOf={labelOf}
+          onChange={setTool}
+          onApply={handleApplyTool}
+          onCancel={() => setTool(null)}
+          preview={toolPreview}
+          gapAvailable={tool.kind === 'pattern' && tool.part !== null}
+        />
+      )}
+      {makeVar && (
+        <form
+          aria-label="Make variable"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleMakeVariable(String(new FormData(e.currentTarget).get('name') ?? '').trim());
+          }}
+          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 12px', background: '#1f2a33', color: '#ddd', fontSize: 12, borderBottom: '1px solid #345' }}
+        >
+          Make variable named
+          <input name="name" aria-label="Variable name" defaultValue={makeVar.name} autoFocus size={14} style={{ fontFamily: 'monospace' }} />
+          <button type="submit">Make variable</button>
+          <button type="button" onClick={() => setMakeVar(null)}>
+            Cancel
+          </button>
+          <span style={{ opacity: 0.7 }}>It goes at the top of the file, and the name replaces the value here.</span>
+          {makeVar.error && (
+            <span role="alert" style={{ color: '#e8a05a' }}>
+              {makeVar.error}
+            </span>
+          )}
+        </form>
+      )}
+      {selectedPattern && !tool && (
+        <div
+          role="group"
+          aria-label="Pattern"
+          style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 12px', background: '#252526', color: '#ccc', fontSize: 12, borderBottom: '1px solid #333' }}
+        >
+          <span style={{ opacity: 0.7 }}>
+            {selectedPattern.kind === 'linear' ? `Linear pattern along ${'XYZ'[selectedPattern.axis]}` : `Circular pattern around ${'XYZ'[selectedPattern.axis]}`}:
+          </span>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            Count
+            <input
+              key={`count-${selectedPattern.countText}`}
+              aria-label="Pattern count"
+              list={VARIABLE_DATALIST_ID}
+              defaultValue={selectedPattern.countText}
+              size={5}
+              disabled={!!readOnly}
+              onBlur={(e) => e.target.value.trim() !== selectedPattern.countText && handlePatternCommit('count', e.target.value.trim())}
+              onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+            />
+          </label>
+          {selectedPattern.spacingText !== null && (
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              {selectedPattern.kind === 'linear' ? 'Pitch' : 'Step°'}
+              <input
+                key={`spacing-${selectedPattern.spacingText}`}
+                aria-label="Pattern spacing"
+                list={VARIABLE_DATALIST_ID}
+                defaultValue={selectedPattern.spacingText}
+                size={Math.max(5, selectedPattern.spacingText.length + 1)}
+                disabled={!!readOnly}
+                onBlur={(e) => e.target.value.trim() !== selectedPattern.spacingText && handlePatternCommit('spacing', e.target.value.trim())}
+                onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+              />
+            </label>
+          )}
+          {selectedPattern.kind === 'circular' && selectedPattern.spacingText === null && <span style={{ opacity: 0.7 }}>spread over the full circle</span>}
+        </div>
+      )}
       {panel && panel.fields.length > 0 && (
         <div
           style={{
@@ -2101,11 +2969,36 @@ export function App() {
               fonts={field.widget === 'font' ? fontList : undefined}
               disabled={!!readOnly}
               onCommit={(text) => (field.argIndex !== null ? handleArgCommit(field.argIndex, text) : handleAddArg(field.label, text))}
+              onMakeVariable={
+                readOnly || (field.valueText !== null && !/^\s*(-?[\d.]+(e[-+]?\d+)?|true|false|\[[-\d.,\s]+\])\s*$/i.test(field.valueText)) || (field.valueText === null && !field.param?.defaultText)
+                  ? undefined
+                  : () => startMakeVariable({ kind: 'arg', argIndex: field.argIndex, label: field.label, defaultText: field.param?.defaultText ?? null })
+              }
             />
           ))}
         </div>
       )}
+      <datalist id={VARIABLE_DATALIST_ID}>
+        {variables.map((v) => (
+          <option key={`${v.name}:${v.line}`} value={v.name} />
+        ))}
+      </datalist>
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        {variablesOpen && (
+          <VariablesPanel
+            variables={variables}
+            readOnly={false}
+            onSetValue={handleVariableSet}
+            onAdd={handleVariableAdd}
+            onRename={handleVariableRename}
+            onDelete={handleVariableDelete}
+            onReveal={handleReveal}
+            onOpenFile={handleOpenLibrary}
+            module={variablesModule}
+            included={includedSections}
+            onClose={() => setVariablesOpen(false)}
+          />
+        )}
         <div style={{ flex: 1, minWidth: 0 }}>
           <Editor
             value={source}
@@ -2121,10 +3014,13 @@ export function App() {
             fontSize={settings.editorFontSize}
             selectedIndex={readOnly ? null : primarySelectedIndex}
             onSelectNode={(index) => handleSelect(index, 'replace')}
+            onCursorOffset={setCursorOffset}
             documentKey={documentToken}
           />
         </div>
-        <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333' }}>
+        <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid #333', position: 'relative' }}>
+          {renderStartedAt !== null && renderIsSlow && <RenderProgressOverlay progressRef={renderProgressRef} onCancel={handleCancelRender} />}
+          <RenderDetailBadge detail={renderDetail} rendering={renderStartedAt !== null} onRender={handleFullRender} />
           <ErrorBoundary label="The 3D view" resetKey={nodeMeshes}>
             <Viewport
               meshes={nodeMeshes}
@@ -2134,6 +3030,7 @@ export function App() {
               rotateSpace={rotateSpace}
               onTransformCommit={handleTransformCommit}
               fitToken={`${filePath ?? 'default'}:${resetViewToken}`}
+              focusRequest={focusRequest}
               activeSketchPlane={activeSketchPlane}
               pickingFace={pickingFace}
               onPickFace={handlePickFace}
@@ -2152,8 +3049,10 @@ export function App() {
               onDrill={handleDrill}
               flashToken={flashToken}
               overlay={breadcrumb}
-              editable={!readOnly}
+              editable={!readOnly && !tool}
+              freeAxes={primaryFreeAxes}
               cuttersFirst={workingSet?.containerCall === 'difference'}
+              stale={renderStartedAt !== null && renderIsSlow}
             />
           </ErrorBoundary>
         </div>
@@ -2162,6 +3061,9 @@ export function App() {
     </div>
   );
 }
+
+// M11: the variable names offered while typing in a value field.
+const VARIABLE_DATALIST_ID = 'scad-variable-names';
 
 // M8: one parameter-panel field, its widget inferred from the parameter's
 // default (or the argument's own literal; see paramPanel.ts). Every widget
@@ -2172,12 +3074,15 @@ function ParamField({
   onCommit,
   disabled = false,
   fonts = null,
+  onMakeVariable,
 }: {
   field: PanelField;
   onCommit: (valueText: string) => void;
   disabled?: boolean;
   // M15: every font text() can use here, or null while still loading.
   fonts?: FontEntry[] | null;
+  // M11: offered for a value that is a literal (or not passed yet).
+  onMakeVariable?: () => void;
 }) {
   const unset = field.valueText === null;
   const shown = field.valueText ?? field.param?.defaultText ?? '';
@@ -2207,9 +3112,12 @@ function ParamField({
       control = (
         <>
           <input
-            type="number"
+            // M11: text, not number, so a variable name or an expression
+            // can be typed (names autocomplete from the variables list).
+            type="text"
+            inputMode="decimal"
+            list={VARIABLE_DATALIST_ID}
             aria-label={label}
-            step="any"
             size={5}
             style={{ width: 64 }}
             defaultValue={unset ? undefined : shown}
@@ -2254,9 +3162,10 @@ function ParamField({
           {(['X', 'Y', 'Z'] as const).map((axis, k) => (
             <input
               key={axis}
-              type="number"
+              type="text"
+              inputMode="decimal"
+              list={VARIABLE_DATALIST_ID}
               aria-label={`${label} ${axis}`}
-              step="any"
               style={{ width: 52 }}
               defaultValue={unset ? undefined : parts[k]}
               placeholder={unset ? parts[k] : axis}
@@ -2342,6 +3251,7 @@ function ParamField({
       control = (
         <input
           type="text"
+          list={VARIABLE_DATALIST_ID}
           aria-label={label}
           size={Math.max(4, shown.length)}
           defaultValue={unset ? undefined : shown}
@@ -2362,6 +3272,17 @@ function ParamField({
         {field.label}:
       </span>
       {control}
+      {onMakeVariable && (field.widget === 'number' || field.widget === 'angle' || field.widget === 'xyz' || field.widget === 'checkbox') && (
+        <button
+          className="make-variable"
+          aria-label={`Make ${field.label} a variable`}
+          title="Make variable: name this value at the top of the file and use the name here"
+          onClick={onMakeVariable}
+          style={{ fontSize: 11, padding: '0 4px', fontStyle: 'italic' }}
+        >
+          ƒx
+        </button>
+      )}
     </span>
     </fieldset>
   );

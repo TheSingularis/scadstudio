@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, utilityProcess } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, utilityProcess, type IpcMainInvokeEvent } from 'electron';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,7 +7,12 @@ import { collectDependencies, collectFontDependencies, defaultLibraryDirs } from
 import { BUNDLED_FONT_FACES, SystemFontIndex, fontFilesWanted, readFontFileFaces, type FontFace } from './fonts';
 import { SettingsStore, type AppSettings } from './settings';
 import { RenderHost, type RenderChild } from './renderHost';
-import { scanModuleSources } from './moduleSources';
+import { scanIncludes, scanModuleSources } from './moduleSources';
+import { PREVIEW_SEGMENT_CHOICES } from './previewDetail';
+
+function isPreviewSegments(value: unknown): value is number {
+  return typeof value === 'number' && (PREVIEW_SEGMENT_CHOICES as readonly number[]).includes(value);
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -269,19 +274,39 @@ interface FontListEntry extends FontFace {
 app.whenReady().then(() => {
   const settings = new SettingsStore(join(app.getPath('userData'), 'settings.json'));
 
-  ipcMain.handle('scad:render', async (_event, source: string) => {
+  const renderRequest = async (event: IpcMainInvokeEvent, source: string, previewSegments: number | null) => {
     const libraryDirs = defaultLibraryDirs(app.getPath('documents'));
     const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
     // Only system families the document (or a library it pulls in) names
     // in a string literal go to the render; see fontFilesWanted.
     const dependencies = await collectDependencies(source, documentDir, libraryDirs);
     const fontFiles = fontFilesWanted([source, ...dependencies.values()], await systemFonts.get());
-    return renderHost.render(source, {
-      documentPath: currentDocumentPath,
-      libraryDirs,
-      fontFiles,
-    });
-  });
+    return renderHost.renderResult(
+      source,
+      {
+        documentPath: currentDocumentPath,
+        libraryDirs,
+        fontFiles,
+        previewSegments,
+      },
+      // M10a: the progress bar's step label.
+      (stage) => {
+        if (!event.sender.isDestroyed()) event.sender.send('scad:renderStage', stage);
+      },
+    );
+  };
+
+  ipcMain.handle('scad:render', async (event, source: string) => (await renderRequest(event, source, null)).bytes);
+
+  // M18: a full render, or a preview with curve detail capped at
+  // `previewSegments` (see previewDetail.ts), with whether detail was
+  // actually lowered and how long the engine took.
+  ipcMain.handle('scad:renderMesh', async (event, source: string, previewSegments: unknown) =>
+    renderRequest(event, source, isPreviewSegments(previewSegments) ? previewSegments : null),
+  );
+
+  // M10a: the progress bar's Cancel button.
+  ipcMain.handle('scad:cancelRender', () => renderHost.cancel());
 
   // M15: every font text() can use from this document, for the Text
   // panel's font dropdown: bundled, the document's `use <font.ttf>` files,
@@ -310,6 +335,12 @@ app.whenReady().then(() => {
     const dependencies = await collectDependencies(source, documentDir, libraryDirs);
     watchLibraries([...scan.watchPaths, ...dependencies.keys()]);
     return scan.files;
+  });
+
+  // M11: the document's included files, for their variables.
+  ipcMain.handle('scad:scanIncludes', async (_event, source: string) => {
+    const documentDir = currentDocumentPath ? dirname(currentDocumentPath) : null;
+    return scanIncludes(source, documentDir, defaultLibraryDirs(app.getPath('documents')));
   });
 
   ipcMain.handle('scad:openFile', async (event) => {

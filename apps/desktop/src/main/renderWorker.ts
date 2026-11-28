@@ -1,4 +1,4 @@
-import { renderScadToStl, ScadRenderError, type RenderOptions } from './scadRender';
+import { renderScadToMeshResult, ScadRenderError, type RenderOptions, type RenderStage } from './scadRender';
 
 // The OpenSCAD render process (an Electron utilityProcess started by
 // renderHost.ts). OpenSCAD's WASM build runs synchronously, so a render used
@@ -15,13 +15,29 @@ export interface RenderRequest {
 }
 
 export type RenderReply =
-  | { id: number; ok: true; bytes: Uint8Array; rss: number }
+  | { id: number; ok: true; bytes: Uint8Array; reduced: boolean; engineMs: number; detailFactor: number; rss: number }
   | { id: number; ok: false; message: string; log: string[]; rss: number };
 
-export async function handleRenderRequest(request: RenderRequest): Promise<RenderReply> {
+// M10a: sent while a render runs, before its reply. Delivered even while the
+// engine blocks this process (Electron's utility-process port sends at once;
+// checked 2026-11-26).
+export interface RenderStageMessage {
+  id: number;
+  stage: RenderStage;
+}
+
+export type RenderWorkerMessage = RenderReply | RenderStageMessage;
+
+export function isStageMessage(message: RenderWorkerMessage): message is RenderStageMessage {
+  return 'stage' in message;
+}
+
+export async function handleRenderRequest(request: RenderRequest, onStage?: (message: RenderStageMessage) => void): Promise<RenderReply> {
   try {
-    const bytes = await renderScadToStl(request.source, request.options);
-    return { id: request.id, ok: true, bytes, rss: process.memoryUsage().rss };
+    const result = await renderScadToMeshResult(request.source, request.options, {
+      onStage: (stage) => onStage?.({ id: request.id, stage }),
+    });
+    return { id: request.id, ok: true, ...result, rss: process.memoryUsage().rss };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const log = err instanceof ScadRenderError ? err.log : [];
@@ -32,11 +48,11 @@ export async function handleRenderRequest(request: RenderRequest): Promise<Rende
 // Wiring, only when started as a utility process (tests import the handler).
 interface ParentPort {
   on(event: 'message', listener: (event: { data: RenderRequest }) => void): void;
-  postMessage(message: RenderReply): void;
+  postMessage(message: RenderWorkerMessage): void;
 }
 const parentPort = (process as unknown as { parentPort?: ParentPort }).parentPort;
 if (parentPort) {
   parentPort.on('message', (event) => {
-    void handleRenderRequest(event.data).then((reply) => parentPort.postMessage(reply));
+    void handleRenderRequest(event.data, (stage) => parentPort.postMessage(stage)).then((reply) => parentPort.postMessage(reply));
   });
 }

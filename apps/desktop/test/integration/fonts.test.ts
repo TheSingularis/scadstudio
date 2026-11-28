@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createEngine } from '../../src/main/engine';
-import { mountFonts, renderScadToStl } from '../../src/main/scadRender';
+import { mountFonts, renderScadToMesh } from '../../src/main/scadRender';
 import { fontFileCache } from '../../src/main/fontStore';
 import { loadMainProcess, type MainProcessHarness } from '../helpers/mainProcess';
 import { FIXTURES_DIR } from '../helpers/paths';
@@ -20,7 +20,7 @@ const size = (bytes: Uint8Array) => {
 
 describe('text() rendering (M15)', () => {
   it('renders with the default font (Liberation Sans) and no font setup in the source', async () => {
-    const bytes = await renderScadToStl('linear_extrude(2) text("Hello", size=10);');
+    const bytes = await renderScadToMesh('linear_extrude(2) text("Hello", size=10);');
     expect(triangleCount(parseStl(bytes))).toBeGreaterThan(100);
     const [w, h, d] = size(bytes);
     expect(w).toBeGreaterThan(20);
@@ -31,26 +31,26 @@ describe('text() rendering (M15)', () => {
   it('bare 2D text renders too (the app wraps it like any 2D primitive)', async () => {
     // Exporting pure 2D as STL fails in OpenSCAD; the renderer's thin-extrude
     // retry handles that for square()/circle() and text() alike.
-    await expect(renderScadToStl('text("Hi");')).rejects.toThrow();
-    await expect(renderScadToStl('linear_extrude(0.01) text("Hi");')).resolves.toBeInstanceOf(Uint8Array);
+    await expect(renderScadToMesh('text("Hi");')).rejects.toThrow();
+    await expect(renderScadToMesh('linear_extrude(0.01) text("Hi");')).resolves.toBeInstanceOf(Uint8Array);
   });
 
   it.each(['Liberation Sans', 'Liberation Serif', 'Liberation Mono', 'Liberation Sans:style=Bold', 'Liberation Serif:style=Bold Italic'])(
     'bundled font %s renders, and differently from the default',
     async (font) => {
-      const plain = size(await renderScadToStl('linear_extrude(1) text("Wide Mg", size=10);'));
-      const styled = size(await renderScadToStl(`linear_extrude(1) text("Wide Mg", size=10, font="${font}");`));
+      const plain = size(await renderScadToMesh('linear_extrude(1) text("Wide Mg", size=10);'));
+      const styled = size(await renderScadToMesh(`linear_extrude(1) text("Wide Mg", size=10, font="${font}");`));
       if (font === 'Liberation Sans') expect(styled).toEqual(plain);
       else expect(styled[0]).not.toBeCloseTo(plain[0], 3);
     },
   );
 
   it('a TrueType font with no hinting program renders (crashed openscad-wasm 0.0.4)', async () => {
-    const bytes = await renderScadToStl('linear_extrude(1) text("iiiii", size=10, font="Source Code Pro");', { fontFiles: [SCP] });
+    const bytes = await renderScadToMesh('linear_extrude(1) text("iiiii", size=10, font="Source Code Pro");', { fontFiles: [SCP] });
     // Monospaced: five narrow i's span nearly five full advances, far wider
     // than in the proportional default font.
     const [w] = size(bytes);
-    const proportional = size(await renderScadToStl('linear_extrude(1) text("iiiii", size=10);'))[0];
+    const proportional = size(await renderScadToMesh('linear_extrude(1) text("iiiii", size=10);'))[0];
     expect(w).toBeGreaterThan(proportional * 1.5);
   });
 
@@ -60,12 +60,12 @@ describe('text() rendering (M15)', () => {
     const docPath = join(dir, 'label.scad');
     const source = 'use <code.ttf>\nlinear_extrude(1) text("iiiii", size=10, font="Source Code Pro");';
     writeFileSync(docPath, source);
-    const withFont = size(await renderScadToStl(source, { documentPath: docPath }));
+    const withFont = size(await renderScadToMesh(source, { documentPath: docPath }));
     // The same geometry as handing the font over as an installed font...
-    const installed = size(await renderScadToStl(source.replace('use <code.ttf>\n', ''), { fontFiles: [SCP] }));
+    const installed = size(await renderScadToMesh(source.replace('use <code.ttf>\n', ''), { fontFiles: [SCP] }));
     expect(withFont[0]).toBeCloseTo(installed[0], 4);
     // ...and not what the name falls back to without the file.
-    const fallback = size(await renderScadToStl(source.replace('use <code.ttf>\n', ''), { documentPath: docPath }));
+    const fallback = size(await renderScadToMesh(source.replace('use <code.ttf>\n', ''), { documentPath: docPath }));
     expect(withFont[0]).not.toBeCloseTo(fallback[0], 1);
   });
 

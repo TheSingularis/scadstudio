@@ -11,9 +11,27 @@ export interface EditorFontSettings {
   editorFontSize: number;
 }
 
+// M18: Settings > Rendering (decided with Jordan 2026-11-27).
+export type PreviewMode = 'auto' | 'always' | 'off';
+export interface AppSettingsState extends EditorFontSettings {
+  previewMode: PreviewMode;
+  previewSegments: number;
+}
+
+const PREVIEW_MODE_LABELS: { mode: PreviewMode; label: string }[] = [
+  { mode: 'auto', label: 'Auto: only slow parts (2 s or more)' },
+  { mode: 'always', label: 'Always' },
+  { mode: 'off', label: 'Off: always full detail' },
+];
+const PREVIEW_SEGMENT_LABELS: { segments: number; label: string }[] = [
+  { segments: 16, label: '16 segments (fastest)' },
+  { segments: 24, label: '24 segments' },
+  { segments: 32, label: '32 segments (closest to the real shape)' },
+];
+
 interface SettingsDialogProps {
-  settings: EditorFontSettings;
-  onChange: (patch: Partial<EditorFontSettings>) => void;
+  settings: AppSettingsState;
+  onChange: (patch: Partial<AppSettingsState>) => void;
   onClose: () => void;
 }
 
@@ -127,6 +145,41 @@ export function SettingsDialog({ settings, onChange, onClose }: SettingsDialogPr
         </div>
         <div style={{ marginTop: 10, opacity: 0.6, fontSize: 12, maxWidth: 380 }}>
           Fonts used in models are set in the code with text(font="..."); pick them from the Text tool's panel.
+        </div>
+        <div style={{ marginTop: 16, opacity: 0.7, textTransform: 'uppercase', fontSize: 11, letterSpacing: 0.5 }}>Rendering</div>
+        <label style={row}>
+          <span style={{ width: 110 }}>Quick preview</span>
+          <select
+            aria-label="Quick preview"
+            value={settings.previewMode}
+            style={{ flex: 1, maxWidth: 240 }}
+            onChange={(e) => onChange({ previewMode: e.target.value as PreviewMode })}
+          >
+            {PREVIEW_MODE_LABELS.map(({ mode, label }) => (
+              <option key={mode} value={mode}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label style={row}>
+          <span style={{ width: 110 }}>Preview detail</span>
+          <select
+            aria-label="Preview detail"
+            value={settings.previewSegments}
+            disabled={settings.previewMode === 'off'}
+            style={{ flex: 1, maxWidth: 240 }}
+            onChange={(e) => onChange({ previewSegments: Number(e.target.value) })}
+          >
+            {PREVIEW_SEGMENT_LABELS.map(({ segments, label }) => (
+              <option key={segments} value={segments}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div style={{ marginTop: 10, opacity: 0.6, fontSize: 12, maxWidth: 380 }}>
+          A preview draws curves with fewer segments while you edit, so slow models update quickly. Render (F6) draws everything at full detail.
         </div>
       </div>
     </div>

@@ -99,7 +99,7 @@ describe('which installed fonts a document names', () => {
 describe('settings (Settings > Fonts sets the code editor font)', () => {
   it('fills in defaults and clamps the size', () => {
     expect(normalizeSettings(null)).toEqual(DEFAULT_SETTINGS);
-    expect(normalizeSettings({ editorFontFamily: 'Fira Code', editorFontSize: 99 })).toEqual({ editorFontFamily: 'Fira Code', editorFontSize: 40 });
+    expect(normalizeSettings({ editorFontFamily: 'Fira Code', editorFontSize: 99 })).toEqual({ ...DEFAULT_SETTINGS, editorFontFamily: 'Fira Code', editorFontSize: 40 });
     expect(normalizeSettings({ editorFontSize: 2.4 }).editorFontSize).toBe(8);
   });
 

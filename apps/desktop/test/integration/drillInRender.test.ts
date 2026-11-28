@@ -77,14 +77,26 @@ describe('drilled-in isolated renders land where OpenSCAD puts the node (M9)', (
     await expectNestedMatches(bracket, [0, 0], 1, 'translate([0, 5, 0]) rotate([0, 0, 90]) translate([3, 3, -1]) cube([24, 9, 5]);');
   });
 
-  it('a non-literal ancestor transform is baked into the render (gizmo off)', async () => {
+  it('an ancestor transform it cannot evaluate is baked into the render (gizmo off)', async () => {
+    // A module parameter: its value depends on the call.
     const r = await expectNestedMatches(
-      'w = 3;\ntranslate([w, 0, 0]) {\n    cube(1);\n    translate([0, 2, 0]) cube([1, 2, 3]);\n}\n',
-      [0],
+      'module m(w = 3) {\n    translate([w, 0, 0]) {\n        cube(1);\n        translate([0, 2, 0]) cube([1, 2, 3]);\n    }\n}\nm(4);\n',
+      [0, 0],
       1,
-      'translate([3, 0, 0]) translate([0, 2, 0]) cube([1, 2, 3]);',
+      'translate([4, 0, 0]) translate([0, 2, 0]) cube([1, 2, 3]);',
     );
     expect(r.transformEditable).toBe(false);
+  });
+
+  it('M11: an ancestor transform written with top-level variables is evaluated (gizmo on)', async () => {
+    const r = await expectNestedMatches(
+      'w = 3;\ngap = 1.5;\ntranslate([w + gap, 0, 0]) rotate([0, 0, w * 10]) {\n    cube(1);\n    translate([0, gap * 2, 0]) cube([1, 2, 3]);\n}\n',
+      [0],
+      1,
+      'translate([4.5, 0, 0]) rotate([0, 0, 30]) translate([0, 3, 0]) cube([1, 2, 3]);',
+    );
+    expect(r.transformEditable).toBe(true);
+    expect(r.transform.exprs?.translate).toEqual([null, 'gap * 2', null]);
   });
 
   it("a block's own assignments stay in scope", async () => {
