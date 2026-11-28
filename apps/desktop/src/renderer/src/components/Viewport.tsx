@@ -2,8 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, Bounds, Center, TransformControls, useBounds, Line, Edges, Html } from '@react-three/drei';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
-import type { ThreeEvent } from '@react-three/fiber';
-import { Box3, Sphere, BufferGeometry, Color, DirectionalLight, SRGBColorSpace, EdgesGeometry, Mesh, MeshStandardMaterial, Vector3, Quaternion, PerspectiveCamera, type Group } from 'three';
+import type { ThreeEvent, ThreeElements } from '@react-three/fiber';
+import { Box3, Sphere, SphereGeometry, BufferGeometry, Color, DirectionalLight, SRGBColorSpace, EdgesGeometry, Mesh, MeshStandardMaterial, Vector3, Quaternion, PerspectiveCamera, type Group } from 'three';
 import { readFaceColors, summarizeFaceColors, vertexColorAttribute } from '../meshColors';
 import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
@@ -79,6 +79,16 @@ import {
 } from '../sketchSnap';
 import type { SketchHandle, SketchState } from '../sketchEditing';
 import { toolPreview, type SketchTool } from '../sketchShapes';
+import {
+  worldUnitsPerPixel,
+  SKETCH_HANDLE_RADIUS_PX,
+  SKETCH_DENSE_HANDLE_RADIUS_PX,
+  SKETCH_ACTIVE_HANDLE_RADIUS_PX,
+  SKETCH_HANDLE_HIT_RADIUS_PX,
+  SNAP_MARKER_RADIUS_PX,
+  SNAP_CLOSE_MARKER_RADIUS_PX,
+  SKETCH_ANCHOR_RADIUS_PX,
+} from '../screenScale';
 import { NavCube, NAMED_VIEWS, NAV_CUBE_MARGIN_PX, type CameraView, type Vec3 } from './NavCube';
 
 // Parsed once per STL buffer and shared between NodeModel (drawing it) and
@@ -1109,7 +1119,7 @@ function SketchDrawingPlane({
   // M7.5 on-plane editing: every pointer move over the plane, already
   // converted to sketch-local (u,v) — Viewport uses it to drive a handle
   // drag. The plane (not the handle itself) is the move target on purpose:
-  // the 0.8-unit handle sphere falls out from under a fast-moving cursor
+  // the few-pixel handle falls out from under a fast-moving cursor
   // immediately, the 1000x1000 plane never does.
   onPointerMoveLocal: (u: number, v: number) => void;
   // True for the one native 'click' that follows the mouseup ending a
@@ -1143,11 +1153,8 @@ function SketchDrawingPlane({
     const raw: Vec2 = [local.x, local.y];
     // Alt is the usual CAD "don't snap this one" modifier.
     if (e.nativeEvent.altKey) return { point: raw, kind: 'none', alignedU: null, alignedV: null };
-    // World units covered by one screen pixel at the hit's depth — the
-    // canvas camera is always perspective (see <Canvas camera> below).
-    const fov = camera instanceof PerspectiveCamera ? camera.fov : 45;
-    const depth = camera.position.distanceTo(e.point);
-    const unitsPerPx = (2 * depth * Math.tan((fov * Math.PI) / 360)) / (camera.zoom * viewportHeightPx);
+    // World units covered by one screen pixel at the hit's depth.
+    const unitsPerPx = worldUnitsPerPixel(camera, e.point, viewportHeightPx);
     const { points, geometry, allowClose } = getSnapContext();
     return snapSketchPoint(raw, points, geometry, snapSettings, SNAP_RADIUS_PX * unitsPerPx, allowClose);
   };
@@ -1229,57 +1236,41 @@ function SketchSnapOverlay({
         />
       )}
       {anchors.map((a, i) => (
-        <mesh key={`anchor-${i}`} position={toWorld(a)} renderOrder={SKETCH_OVERLAY_RENDER_ORDER}>
-          <sphereGeometry args={[0.6, 12, 12]} />
-          <meshBasicMaterial color={SELECTED_MESH_COLOR} depthTest={false} />
-        </mesh>
+        <ScreenDot key={`anchor-${i}`} position={toWorld(a)} radiusPx={SKETCH_ANCHOR_RADIUS_PX} color={SELECTED_MESH_COLOR} />
       ))}
       {preview && preview.points.length > 1 && (
-        <Line
+        <ScreenDashedLine
           points={(preview.closed ? [...preview.points, preview.points[0]] : preview.points).map(toWorld)}
           color={SELECTED_MESH_COLOR}
           lineWidth={1.5}
-          dashed
-          dashSize={1}
-          gapSize={0.6}
-          depthTest={false}
-          renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+          dashPx={8}
+          gapPx={5}
         />
       )}
       {hover && (
         <>
           {drawing && lastPoint && (
-            <Line
-              points={[toWorld(lastPoint), toWorld(hover.point)]}
-              color={SELECTED_MESH_COLOR}
-              lineWidth={1}
-              dashed
-              dashSize={1}
-              gapSize={0.6}
-              depthTest={false}
-              renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
-            />
+            <ScreenDashedLine points={[toWorld(lastPoint), toWorld(hover.point)]} color={SELECTED_MESH_COLOR} lineWidth={1} dashPx={8} gapPx={5} />
           )}
           {[hover.alignedU, hover.alignedV].map(
             (ref, i) =>
               ref && (
-                <Line
+                <ScreenDashedLine
                   key={i}
                   points={[toWorld(ref), toWorld(hover.point)]}
                   color={SNAP_MARKER_COLORS.align}
                   lineWidth={1}
-                  dashed
-                  dashSize={0.5}
-                  gapSize={0.5}
-                  depthTest={false}
-                  renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+                  dashPx={4}
+                  gapPx={4}
                 />
               ),
           )}
-          <mesh position={toWorld(hover.point)} renderOrder={SKETCH_OVERLAY_RENDER_ORDER}>
-            <sphereGeometry args={[hover.kind === 'close' ? 1.2 : 0.6, 12, 12]} />
-            <meshBasicMaterial color={SNAP_MARKER_COLORS[hover.kind]} depthTest={false} />
-          </mesh>
+          <ScreenDot
+            position={toWorld(hover.point)}
+            radiusPx={hover.kind === 'close' ? SNAP_CLOSE_MARKER_RADIUS_PX : SNAP_MARKER_RADIUS_PX}
+            color={SNAP_MARKER_COLORS[hover.kind]}
+            testId="sketch-snap-marker"
+          />
           <Html position={toWorld(hover.point)} style={{ pointerEvents: 'none' }}>
             <div
               data-testid="sketch-snap-label"
@@ -1300,6 +1291,111 @@ function SketchSnapOverlay({
         </>
       )}
     </>
+  );
+}
+
+// A sketch overlay dot (point handle, snap marker, arc anchor) that keeps the
+// same on-screen size at every zoom: it's modeled in pixels and its group is
+// rescaled every frame by the world size of one pixel at its depth
+// (screenScale.ts). Zooming in therefore shrinks it relative to the model,
+// so fine detail stays visible and clickable. The pick target scales the
+// same way, so hit-testing is a constant pixel radius too: the visible
+// sphere never raycasts, an invisible hit sphere of hitRadiusPx (at least
+// radiusPx) takes the pointer events instead.
+type DotHandlers = Pick<
+  ThreeElements['mesh'],
+  'onPointerDown' | 'onPointerOver' | 'onPointerOut' | 'onClick' | 'onDoubleClick'
+>;
+const UNIT_DOT_GEOMETRY = new SphereGeometry(1, 16, 12);
+const noRaycast = () => null;
+function ScreenDot({
+  position,
+  radiusPx,
+  hitRadiusPx,
+  color,
+  testId,
+  ...handlers
+}: {
+  position: Vector3;
+  radiusPx: number;
+  hitRadiusPx?: number;
+  color: string;
+  // Stored in userData.testId so e2e can find the dot and read its scale.
+  testId?: string;
+} & DotHandlers) {
+  const groupRef = useRef<Group>(null);
+  const camera = useThree((state) => state.camera);
+  const heightPx = useThree((state) => state.size.height);
+  const interactive = Object.values(handlers).some(Boolean);
+  // Runs before every render, so the dot is resized in the same frame the
+  // camera moved (and before any raycast that frame's pointer events do).
+  useFrame(() => {
+    const group = groupRef.current;
+    if (!group) return;
+    group.scale.setScalar(worldUnitsPerPixel(camera, group.getWorldPosition(dotScratch), heightPx));
+  });
+  // Also size it on mount, so the very first frame isn't drawn at 1 px = 1 unit.
+  useLayoutEffect(() => {
+    const group = groupRef.current;
+    if (!group) return;
+    group.updateWorldMatrix(true, false);
+    group.scale.setScalar(worldUnitsPerPixel(camera, group.getWorldPosition(dotScratch), heightPx));
+  }, [camera, heightPx, position]);
+  return (
+    <group ref={groupRef} position={position} userData={{ testId, radiusPx }}>
+      <mesh geometry={UNIT_DOT_GEOMETRY} scale={radiusPx} renderOrder={SKETCH_OVERLAY_RENDER_ORDER} raycast={noRaycast}>
+        <meshBasicMaterial color={color} depthTest={false} />
+      </mesh>
+      {interactive && (
+        <mesh geometry={UNIT_DOT_GEOMETRY} scale={Math.max(radiusPx, hitRadiusPx ?? 0)} {...handlers}>
+          {/* material.visible=false: not drawn, but still raycast (see SketchDrawingPlane). */}
+          <meshBasicMaterial visible={false} />
+        </mesh>
+      )}
+    </group>
+  );
+}
+const dotScratch = new Vector3();
+
+// A dashed overlay line whose dash pattern is in screen pixels, for the same
+// reason as ScreenDot: world-unit dashes turn into long solid-looking bars
+// when zoomed far in and into a gray smear when zoomed out. LineMaterial
+// measures dashes in world distance times dashScale, so dashScale is set to
+// pixels-per-unit (at the line's first point) every frame.
+function ScreenDashedLine({
+  points,
+  color,
+  lineWidth,
+  dashPx,
+  gapPx,
+}: {
+  points: Vector3[];
+  color: string;
+  lineWidth: number;
+  dashPx: number;
+  gapPx: number;
+}) {
+  const lineRef = useRef<ComponentRef<typeof Line>>(null);
+  const camera = useThree((state) => state.camera);
+  const heightPx = useThree((state) => state.size.height);
+  const anchor = points[0];
+  useFrame(() => {
+    const material = lineRef.current?.material as LineMaterial | undefined;
+    if (!material || !anchor) return;
+    material.dashScale = 1 / worldUnitsPerPixel(camera, anchor, heightPx);
+  });
+  return (
+    <Line
+      ref={lineRef}
+      points={points}
+      color={color}
+      lineWidth={lineWidth}
+      dashed
+      dashSize={dashPx}
+      gapSize={gapPx}
+      depthTest={false}
+      renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+    />
   );
 }
 
@@ -1354,10 +1450,13 @@ function SketchPointsPreview({
               const handle: SketchHandle = { profile, point: i };
               const active = activeHandle !== null && activeHandle.profile === profile && activeHandle.point === i;
               return (
-                <mesh
+                <ScreenDot
                   key={i}
                   position={p}
-                  renderOrder={SKETCH_OVERLAY_RENDER_ORDER}
+                  radiusPx={active ? SKETCH_ACTIVE_HANDLE_RADIUS_PX : world.length > 12 ? SKETCH_DENSE_HANDLE_RADIUS_PX : SKETCH_HANDLE_RADIUS_PX}
+                  hitRadiusPx={SKETCH_HANDLE_HIT_RADIUS_PX}
+                  color={active ? SKETCH_HANDLE_ACTIVE_COLOR : SELECTED_MESH_COLOR}
+                  testId="sketch-handle"
                   onPointerDown={(e: ThreeEvent<PointerEvent>) => {
                     if (e.button !== 0) return;
                     e.stopPropagation();
@@ -1381,12 +1480,7 @@ function SketchPointsPreview({
                     e.stopPropagation();
                     onHandleDelete(handle, e.nativeEvent.shiftKey);
                   }}
-                >
-                  {/* Circles and arcs put many points close together; their
-                      handles are drawn smaller so the outline stays readable. */}
-                  <sphereGeometry args={[active ? 1.1 : world.length > 12 ? 0.5 : 0.8, 12, 12]} />
-                  <meshBasicMaterial color={active ? SKETCH_HANDLE_ACTIVE_COLOR : SELECTED_MESH_COLOR} depthTest={false} />
-                </mesh>
+                />
               );
             })}
           </group>
