@@ -135,6 +135,7 @@ Two distinct kinds of constraint, handled very differently, both persisting into
 - **M16 — Alternative engine: OpenRSCAD (post-v1 experiment, added 2026-11-25)**: try [OpenRSCAD](https://github.com/matthova/openrscad), a clean-room Rust reimplementation of OpenSCAD on Manifold (Apache-2.0 OR MIT, so compatible with our GPLv3), as a second render engine. Decided with Jordan 2026-11-25 after assessing a from-scratch Rust renderer, estimated at 6 to 12+ months for one developer to reach OpenRSCAD's level, so not worth building ourselves. Rules: (a) post-v1 only, on its own branch, so it never touches v1 work; (b) even if it tests well, it ships as a user choice of engine in a fleshed-out Settings pane, never as a silent swap, with real OpenSCAD staying the default unless Jordan decides otherwise; (c) Settings must list the known drawbacks and differences between the engines, written for whichever one is ahead at the time. Work: put `openrscad-engine` (npm, WASM) or Tau's `@taulabs/openrscad-engine` (N-API addon with WASM fallback) behind `apps/desktop/src/main/engine.ts`; compare it against OpenSCAD on our test fixtures and BOSL2 (`cuboid(rounding=...)`, `include <BOSL2/std.scad>`) by volume, bounds and render time; check whether its `provenance` output (triangles tagged with source byte ranges) can replace our one-render-per-node approach for highlighting and drill-in. Known differences to verify and list (from its COMPAT.md, as of 2026-11-25, its own claims, not yet run by us): targets OpenSCAD 2021.01 core, not bug-for-bug; concave 3D `minkowski()` is a warned convex approximation; `rands()` sequence differs; `textmetrics()` differs by about 0.01 mm; BOSL2 function suite 511/513, BOSL2 modules unproven; young project (started 2026-07, mostly two contributors). Claimed gains: 3 to 5 times faster than OpenSCAD's Manifold backend, incremental re-renders, source provenance.
 - **M17 — Sketch tools, round 2 (post-v1, added 2026-11-26)**: the sketch items from "v1 scope detail" that M7.5 did not build, plus M7.5's own deferred list. Jordan decided on 2026-11-26 that they get their own milestone after v1 rather than going into M10. Scope: slot, ellipse, regular polygon and center-based arc; `projection()` to seed a sketch from a face; mirror and pattern of a sketch; tangent arcs; drawn circles/arcs remembered as curves after commit; dragging an edge as a unit; a live extrude preview while editing a sketch. (The 2D corner fillet/chamfer on a vertex moved to M13, Jordan 2026-11-26.) Added 2026-11-26 (Jordan, see "Sketch mode follow-ups"): extrude each shape or region of a sketch separately, like Onshape, with the extrude staying linked to the sketch (to be fleshed out before building), and extruding a picked face of a solid.
 - **M18 — Fast preview and full render (v1, added 2026-11-27)**: edits render heavy parts at reduced curve detail (a quick preview), and a Render button / F6 renders everything at full detail, like OpenSCAD's F5/F6. Decided by Jordan 2026-11-27; built right after M10a, released as `beta-v0.1.8`. Export is not part of it. See "Fast preview and full render (M18)".
+- **M19 — Design language and base UI (v1, raised 2026-11-28, plan pending Jordan's answers)**: design tokens, light and dark themes, a styled control set (buttons, the value/variable field with ƒx, selects, menus, tooltips, window chrome), an in-window menu bar, and the toolbar regrouped with icons and switching by 2D/3D selection. Proposed as two releases, M19a and M19b, right after M10b. See "Design language and base UI (M19)".
 
 **Build order from here (reordered 2026-10-16 and again 2026-11-26, numbers unchanged to avoid another renumbering):** ~~finish M7.5 (richer sketch tools and several profiles per sketch)~~ done 2026-11-22 → ~~M8 custom-module toolbar~~ done 2026-11-24 → ~~M9 drill-in navigation~~ done 2026-11-25 → ~~M15 text/fonts~~ built 2026-11-25 (see "M15 build notes") → ~~M11 directional constraints~~ built 2026-11-25 (see "M11 build notes") → ~~M10a render feedback and true colors~~ released beta-v0.1.7 2026-11-27 (see "M10a build notes") → ~~M18 fast preview and full render~~ released beta-v0.1.8 2026-11-27 (see "M18 build notes") → M10b floating tool windows → M13 BOSL2 fillets/chamfers → M10c drill-in navigation → M10d Distance face picking → M10e undo, errors and file safety → M10f final sweep (decided by Jordan 2026-11-26; see "M10 breakdown into sub-milestones"). M12 (solver constraints), M16 (OpenRSCAD engine experiment) and M17 (sketch tools, round 2) are post-v1, with M12 before M17 so M17's sketch tools can use real constraints (Jordan, 2026-11-26), and M14 (keybinds) stays a stretch goal. **v1 = M0–M11 + M13 + M15 + M18** (M10 = M10a–M10f).
 
@@ -272,6 +273,8 @@ One pre-release per sub-milestone, patch bump each time, as RELEASING.md says. J
 
 **Shifted 2026-11-27 (Jordan):** M18 (fast preview and full render) goes right after M10a and takes `0.1.8`, so everything after it moves by one: M11 `beta-v0.1.6` → M10a `0.1.7` → M18 `0.1.8` → M10b `0.1.9` → M13 `0.1.10` → M10c `0.1.11` → M10d `0.1.12` → M10e `0.1.13` → M10f `0.1.14`.
 
+**Proposed 2026-11-28 (pending Jordan):** M19a and M19b (design language and base UI) go right after M10b, so M13 and M10c–M10f move by two: M10b `0.1.9` → M19a `0.1.10` → M19b `0.1.11` → M13 `0.1.12` → M10c `0.1.13` → M10d `0.1.14` → M10e `0.1.15` → M10f `0.1.16`. See "Design language and base UI (M19)".
+
 The alternative, keeping M13 before all of M10 (the 2026-10-16 order), was considered and not chosen: M13 would have built its selector UI in the docked M11 panel and M10b would then have had to move it.
 
 ### Sketch items moved to M17
@@ -384,6 +387,128 @@ Estimated size: one PR. The CSG rewrite and two-pass render in the render proces
 3. **Automatic full render**: only on Render/F6 and Export, as asked (recommended), or also on its own after the model has been idle for a while? *Jordan: sounds good → only on Render / F6.*
 4. **When preview kicks in**: Auto, only for slow parts (recommended), or every edit like OpenSCAD's F5? *Jordan asked for the best option → Auto, 2 s threshold.*
 5. **Preview detail**: cap curves at 24 segments (recommended; 16 is faster, 32 closer to the real shape), and should it be in Settings? *Jordan: same as 4 → 24, in Settings.*
+
+## Design language and base UI (M19, raised by Jordan 2026-11-28; plan, decisions pending)
+
+Jordan (2026-11-28): "up next can we tackle reworking much of the base UI; buttons, variable fields, menus, themes, design language as a whole". This section is the plan: what the UI is made of today (checked in the code on `main` at 832b668 and on PR #32's M10b branch), a proposed design language, the control set, how to migrate without a big-bang rewrite, where it slots, and the questions for Jordan with a recommendation for each. It absorbs two M10 backlog entries Jordan raised while hand-testing M10b: "Styled fields, variables and buttons" and "Toolbar follows the selection's kind, 2D or 3D" (both added to the backlog by PR #32).
+
+### What the UI is made of today (audit, 2026-11-28)
+
+- **No styling layer at all.** The renderer has no CSS file. `index.html` holds two rules (`.scad-selected-node`, `.scad-out-of-focus`); everything else is inline `style={{...}}`, 169 of them across the `.tsx` files, against 4 `className`s. There are no design tokens, no theme variables and no shared components for controls.
+- **Native browser controls everywhere.** 45 `<button>` and 16 `<input>` elements (mostly text, plus checkboxes, color and range inputs) and 3 `<select>`s render with Chromium's default look: light grey bevelled buttons on a dark app (see `m10b-tool-windows/1-properties-window.png`). Native `<select>` popups and `<input type="color">` open OS-styled pickers that can't be themed.
+- **About 50 one-off colors.** 49 distinct hex values and 11 distinct `rgba()` values in `.tsx` files. Amber alone appears as `#e8a05a` (12 uses), `#e8a33d` (the brand color), `#e0a82e`, `#c8a96e` and `rgba(201,138,20,…)`; dark surfaces as `#1e1e1e`, `#1b1b1b`, `#222`, `#252526`, `#2d2d2d`, `#2c3036` and three different translucent panels. Several are VS Code's dark theme values (`#252526`, `#9cdcfe`, `#c586c0`).
+- **No type or spacing scale.** Font sizes 10, 11, 12, 13, 14 and 15 px; `fontFamily` is literally `'sans-serif'` or `'monospace'` (so the UI font differs per OS and Linux distro). 20 different `padding` values, radii 2/3/4/6, gaps 0/2/4/6/8/12/16.
+- **Themes: none.** The chrome is dark, Monaco is hard-coded to `vs-dark` (`Editor.tsx`), and the viewport is white with a grey grid, so the window is two-thirds dark and one-third bright. Nothing reads `prefers-color-scheme` or Electron's `nativeTheme`.
+- **Menus: none of our own.** `main/index.ts` never calls `Menu.setApplicationMenu`, so Windows and Linux builds show Electron's default File/Edit/View/Window/Help menu, which has nothing of ours in it (no Open, Save, Insert, Render). Open / Save / Save As / Reset View / Focus / Settings / Variables are a row of buttons instead. No right-click menus anywhere.
+- **Value fields are bare text boxes.** `ParamField` (`App.tsx`) is a text input so a variable name or expression can be typed (M11), with an `ƒx` button beside it for Make variable. There is no visual difference between a literal, a variable and an expression except italic blue monospace in the Position fields; no arrow-key or drag stepping; validation errors only show up as a failed render. `xyz` fields are three loose inputs; `angle` adds a native range slider.
+- **Segmented choices are buttons with `fontWeight: bold`** (Move / Rotate / Scale, Local / World, Union / Difference / Intersection).
+- **The toolbar is text-only buttons** grouped by labels ("Insert:", "Sketch:", "Constrain:"), with an EXPERIMENTAL pill drawn with its own colors.
+- **Good news for migration:** the e2e suite finds controls by role and accessible name (43 `getByRole('button', …)`, plus region/group/checkbox/dialog), so restyled controls that keep their roles and names keep the tests working. The exceptions to fix are the few `locator('select')`, `selectOption` and `input[type=color]` uses, and the pixel tests that sample the viewport (they need a pinned theme).
+- **Brand already exists** (`docs/brand/README.md`): Part amber `#E8A33D` (selection), Ghost blue `#4A90D9` (default mesh), Ink `#18181B`, Graphite `#52525B`, Paper `#FAFAFA`; Archivo ExtraBold for display, Fira Code for code.
+
+### Proposed design language
+
+Principles: the model is the star, so the chrome is quiet (neutral greys, one accent, no gradients on controls); **amber means "active"** everywhere (selected part, active tool, toggled option, primary action, focus), matching the brand and the viewport's selection color; code-ish things look like code (values, expressions and variable names in a monospace face); compact desktop density (Onshape/Fusion, not web-form spacing).
+
+**Tokens** (CSS custom properties in `src/renderer/src/styles/tokens.css`, one set per theme under `:root[data-theme="dark"]` / `[data-theme="light"]`; components use only tokens). Contrast checked against WCAG AA: text ≥ 4.5:1, control borders ≥ 3:1.
+
+| Token | Dark | Light | Use |
+| --- | --- | --- | --- |
+| `--bg-app` | `#17181B` | `#F4F4F5` | Window background, behind panels |
+| `--bg-panel` | `#1F2024` | `#FFFFFF` | Docked panels, toolbar, top bar |
+| `--bg-raised` | `#26282D` | `#FFFFFF` + shadow | Floating windows, menus, popovers, tooltips |
+| `--bg-field` | `#141518` | `#FFFFFF` | Inputs |
+| `--border` | `#33363C` | `#E4E4E7` | Dividers, panel edges |
+| `--border-control` | `#666B73` | `#8E8E96` | Input and button outlines (3.0–3.4:1) |
+| `--text` | `#E6E7EA` | `#18181B` (Ink) | Body text (13:1 / 17:1) |
+| `--text-muted` | `#A1A5AD` | `#52525B` (Graphite) | Labels, secondary (6.0–6.6:1 / 7:1) |
+| `--text-faint` | `#7A7F88` | `#6B6B73` | Placeholders, disabled |
+| `--accent` | `#E8A33D` | `#E8A33D` | Active / primary fills (Part amber) |
+| `--on-accent` | `#1B1405` | `#18181B` | Text on amber (8.5:1 / 8.2:1) |
+| `--accent-text` | `#E8A33D` | `#9A5B00` | Amber used as text (7.5:1 / 5.4:1) |
+| `--info` | `#6CB0F0` | `#1F6FBF` | Links, "variable" chips, info notes |
+| `--danger` | `#F07067` | `#C4312B` | Errors, Delete, Subtract role |
+| `--success` | `#3FB950` | `#1A7F37` | Render OK, Apply-and-done states |
+| `--experimental` | `#A371F7` | `#7C3AED` | The Experimental badge (no longer amber, so it stops looking "active") |
+| `--viewport-bg` | `#2A2D33` → `#1C1E22` | `#FAFAFA` → `#E9E9EC` | Viewport background (subtle vertical gradient) |
+| `--viewport-grid` / `-major` | `#3A3E45` / `#4A4F57` | `#D4D4D8` / `#B4B4BB` | Grid lines |
+
+Model colors are not tokens: the default mesh blue, the selection amber, hover and boolean roles stay as M10a defined them, so a model looks the same in both themes. Monaco gets two themes (`scadstudio-dark`, `scadstudio-light`) built from the same tokens plus a syntax palette.
+
+- **Spacing**: 4 px base: `--space-1..7` = 2, 4, 6, 8, 12, 16, 24.
+- **Radius**: `--radius-sm` 3 (chips, checkboxes), `--radius` 4 (buttons, fields), `--radius-lg` 6 (windows, menus, dialogs), `--radius-pill`.
+- **Type**: UI in **Inter** (SIL OFL, bundled with the app, since the CSP is `default-src 'self'` and the app works offline), 12 px body, 11 px labels and uppercase section heads (letter-spacing 0.04em), 13 px window titles, 15 px dialog titles. Values, expressions and variable names in **Fira Code** 12 px (the brand's code face; the code editor keeps the user's Settings > Fonts choice). Archivo stays for the logo and marketing only.
+- **Sizes**: controls 26 px tall (`md`), 22 px (`sm`, inside dense rows like the Variables list); toolbar icon buttons 30 × 30 with 18 px icons.
+- **Elevation**: two shadows (`--shadow-raised` for windows/menus, `--shadow-overlay` for dialogs); dark theme leans on a 1 px lighter border instead of a big shadow.
+- **Motion**: 120 ms ease-out for hover/press/open, none for anything in the viewport; everything off under `prefers-reduced-motion`.
+- **Focus**: 2 px `--accent` ring with 1 px offset on keyboard focus only (`:focus-visible`).
+- **Icons**: one 18/16 px outline set, 1.5 px stroke, rounded joins. Generic actions (open, save, undo, settings, search, chevrons, close) from **Lucide** (ISC license, tree-shaken SVG); CAD-specific ones (cube, sphere, cylinder, square, circle, text, extrude, revolve, union/difference/intersection, sketch on XY/XZ/YZ, pick face, distance, align, pattern, fillet, chamfer, focus, render) drawn in-house in the same style, living in `src/renderer/src/icons/`.
+
+### Control set
+
+Built on **Base UI** (`@base-ui/react`, MUI's unstyled, accessible primitives; v1 shipped early 2026, 1.9.0 on npm as of 2026-10, React 17–19, has Menu, Menubar, ContextMenu, Select, Combobox, NumberField, Toggle/ToggleGroup, Tabs, Tooltip, Popover, Dialog, Slider, Switch, Checkbox and a `CSPProvider`) with our own CSS. Base UI handles keyboard, focus and ARIA for the hard ones (menus, select, tooltips, popovers); we own every pixel. All in `src/renderer/src/components/ui/`.
+
+- **Button**: variants `primary` (amber fill, one per window: Apply, Save), `secondary` (outlined, the default), `ghost` (no border until hover: window title buttons, inline actions), `danger` (Delete), `toolbar` (icon, optional label, `aria-pressed` for the active tool). Sizes `sm`/`md`. Optional leading icon and trailing shortcut hint.
+- **ToggleGroup (segmented control)**: Move / Rotate / Scale, Local / World, Union / Difference / Intersection, Linear / Rotate, sketch Grid / Snap. Replaces bold-text buttons.
+- **ValueField** (the "variable field"; the heart of the redesign). One field for every numeric parameter, position, size and pattern count. Onshape's numeric fields are the model: they show the evaluated result when not focused and the typed expression when focused, accept math and variables, and step on scroll (0.1, Ctrl 0.01, Shift 1).
+  - *States*, visibly different: **literal** (`10`: plain number), **variable** (`width`: an `--info` chip with the name, its value shown faint beside it, `10`), **expression** (`width/2 + 1`: shows the result `6` with a small ƒ marker; focus to see and edit the expression), **unset** (default shown as a faint placeholder, italic label), **invalid** (red outline and a short message under the field, no commit, last good value kept), **read-only** (library module: no border, muted).
+  - *Input*: type a number, a variable name (autocomplete popover from the Variables list, replacing today's `<datalist>`), or any OpenSCAD expression. Enter or blur commits; Esc reverts.
+  - *Stepping*: ↑/↓ steps by 1 (Shift 10, Alt 0.1); dragging horizontally on the field's label scrubs the value (Blender/Fusion style); the wheel only steps while the field is focused, so scrolling a panel never changes a value by accident. A literal is stepped; a variable-bound field steps the variable (asks once, "Changes `width` everywhere it is used"); an expression field doesn't step. One drag = one undo step; the code updates live while scrubbing and the render follows through M18's quick preview.
+  - *ƒx*: a small button inside the field's right edge, shown on hover/focus: Make variable for a literal (today's behavior), Go to variable for a bound one, Detach (replace with its value) from a menu.
+  - **Vec3Field** groups three ValueFields with X/Y/Z axis-colored labels (red/green/blue, matching the gizmo), one ƒx for the whole vector when the vector is a literal.
+  - **AngleField** = ValueField with a ° suffix and a small dial or slider popover instead of the raw range input.
+- **TextField** (strings, search), **Select** (custom popup, themed, type-ahead; the font picker becomes a searchable **Combobox** with previews), **Checkbox** and **Switch** (Switch for settings, Checkbox for parameter booleans), **ColorField** (swatch button opening a popover with the named OpenSCAD colors, a hex field and a picker; replaces `<input type="color">`, which can't show named colors), **Slider**.
+- **Menus**: **Menu** (dropdown from a button, e.g. Shading, the window ⋯ menu), **ContextMenu** (right-click on a part, a variable, a tree row), **Menubar** (see the next part). Items show icon, label, shortcut, check/radio state, submenus.
+- **Tooltip**: one style, 500 ms delay, name + shortcut + one line of help; disabled controls still show why (as M10b's Extrude does).
+- **Tabs** (Settings sections, later the left panel's Variables / Parts once M10c adds the tree), **Badge** (Experimental, counts), **Kbd** (shortcut hints), **Callout** (info / warning / error notes inside windows), **Spinner/Progress** (restyling M10a's progress overlay and M18's badge).
+- **Window chrome**: M10b's `FloatingWindow` keeps its behavior (drag, remember position, collapse, double-click to reset) and gets the tokens: 32 px title bar with icon, title and ghost buttons (collapse, close), `--bg-raised` body, `--radius-lg`, footer with **Apply** (primary) and **Cancel** right-aligned, Enter = Apply, Esc = Cancel (already). Section headers (Parameters, Placement, Appearance) become collapsible. Settings becomes a proper dialog with a left section list (Appearance, Editor, Rendering, and later Engine for M16).
+
+### Menus and the toolbar
+
+- **In-window menu bar** at the left of the top bar: File (New, Open, Open Recent, Save, Save As, Reload from disk, Quit), Edit (Undo, Redo, Delete, Select All, Find in code), View (Theme, Shading, Reset View, Focus, Show Variables, Show grid), Insert (every Insert tool, Custom modules submenu), Sketch, Render (Render F6, Quick preview options), Help (Keyboard shortcuts, About, Report an issue). Built with Base UI's Menubar so it uses our look in both themes; Electron's default menu is removed (`Menu.setApplicationMenu(null)`), while Ctrl+S / F6 / etc. keep working. The window keeps its normal OS title bar (a custom frameless title bar is a separate, later idea).
+- **Top bar** becomes: menu bar · file name and dirty dot · (center) render state badge · (right) theme toggle, Settings. Open/Save/Save As/Reset View/Focus buttons leave the top bar (menus, shortcuts, and Focus moves next to the nav cube).
+- **Toolbar** becomes icon buttons with tooltips, in groups separated by thin dividers (Insert · Sketch · Operate · Constrain), with a group label shown only when the window is wide enough. Custom modules keep their filter box, as a toolbar dropdown when there are many.
+- **Contextual toolbar (2D/3D)**, as decided with Jordan on 2026-11-27: with a 2D selection (sketch, square, circle, text) the Operate group shows Extrude, Revolve, Offset, Edit Sketch; with a 3D selection it shows Boolean, Pattern, Distance/Align and (M13) Fillet/Chamfer; with nothing selected, Insert and Sketch only. Uses `NodeMesh.flat` as the 2D test, as M10b's Extrude rule does. Tools that don't fit are hidden, not greyed, so the bar stays short; the full list is always in the menus.
+- **Right-click on a part** in the viewport or code: Edit parameters, Focus, Make variable…, Go to definition, Hide/Show only/Highlight (modifiers), Delete.
+
+### Themes
+
+Dark, Light, and **Match system** (the default), in Settings > Appearance and View > Theme. The choice is saved with the other settings and also sets Electron's `nativeTheme.themeSource`, so native file dialogs and scrollbars match. Switching is instant (CSS variables plus a Monaco `setTheme`), no reload. The viewport background and grid follow the theme; model colors don't. E2E tests pin `dark` so pixel samples stay stable, and one spec checks both themes render.
+
+### Migration, step by step
+
+Incremental: every step leaves the app working and the e2e suite green, and old inline styles disappear surface by surface.
+
+1. **Foundation** (no visible change yet): `tokens.css`, `base.css` (box-sizing, body font, scrollbars, `:focus-visible`), bundled Inter and Fira Code, theme state wired through Settings, `nativeTheme` and Monaco themes. Add the `components/ui/` kit and a dev-only **control gallery** (`?gallery` in dev builds) that renders every control in every state in both themes; its screenshots are what Jordan reviews before anything is migrated.
+2. **Floating windows**: `FloatingWindow` chrome, then the Properties window (ValueField, Vec3Field, ToggleGroup, ColorField), then the tool windows in `ToolPanel.tsx` (Boolean, Extrude, Distance, Align, Pattern, Text).
+3. **Variables panel**: rows become name · ValueField · ⋯ menu (Go to line, Used on lines, Delete), replacing the "Line 4 / used on lines 211 212 …" button strips with a compact usage count that expands.
+4. **Top bar, menu bar and toolbar**: menu bar, icons, grouped toolbar, contextual 2D/3D, right-click menus.
+5. **Settings** as a sectioned dialog with Appearance (theme) first.
+6. **Everything else**: sketch toolbar and hint pill, drill-in breadcrumb and banners (restyled only; M10c redesigns the navigation itself), render progress and badge, nav cube buttons, error banners, the Make variable dialog.
+7. **Guard rail**: a unit test fails on any hex or `rgb()` color literal in renderer `.tsx` files outside `tokens.css` and an allowlist (viewport material constants), so new one-off colors can't creep back in.
+
+Tests: unit tests for ValueField parsing/stepping/state (literal vs variable vs expression, invalid input never commits), for the 2D/3D toolbar rule and for theme resolution; e2e updated where native `select`/`color` inputs were driven directly; new e2e for keyboard menus, scrubbing a value (one undo step), the contextual toolbar and switching themes. No golden-image tests (too fragile across CI runners); screenshots go to the project files for review, as usual.
+
+### Size and slot (proposed)
+
+Two releases, named **M19a** and **M19b** (next free number, like M18, so the M10 letters keep following the build order):
+
+- **M19a — Design language and controls** (steps 1–3, 5–7): tokens, themes, the control kit, ValueField, and every existing surface moved onto them. Largest piece; one PR, probably several days of work.
+- **M19b — Menus and the contextual toolbar** (step 4): menu bar, icons, toolbar regrouping, 2D/3D switching, right-click menus.
+
+Proposed slot: **right after M10b**, before M13, because M13 part 2 (the Fillet/Chamfer window) and M10c (parts tree) are both new UI and would otherwise be built in today's raw controls and redone. New order: M10b `0.1.9` → M19a `0.1.10` → M19b `0.1.11` → M13 `0.1.12` → M10c `0.1.13` → M10d `0.1.14` → M10e `0.1.15` → M10f `0.1.16`. M19 counts as part of v1. M10f still does the README hero, docs screenshots and social preview refresh, but they can be taken right after M19b since that is when the app's look changes.
+
+### Questions for Jordan (recommendation first)
+
+1. **Slot**: right after M10b, before M13 (recommended: M13's window and M10c's tree get built once, in the new controls); or after M13; or as part of M10f at the end.
+2. **One release or two**: M19a (look and controls) then M19b (menus and toolbar) (recommended: smaller PRs to hand-test, and the look can be judged before the toolbar changes); or one M19.
+3. **Themes**: Dark + Light + Match system, default Match system (recommended); or dark only for now.
+4. **Accent**: amber as the one accent for everything active (recommended: it is the brand color and already the selection color); or blue for UI controls and amber only for model selection.
+5. **Toolbar**: icons with tooltips, labels only on group headers when there's room (recommended, like Onshape); or icon + label under each; or text only, restyled.
+6. **Menus**: in-window menu bar in our style, replacing Electron's default menu, keeping the OS title bar (recommended); or a native Electron menu (OS-styled, can't follow our theme on Linux); or a custom frameless title bar with the menus in it (more work, window-control quirks on Linux).
+7. **Base UI as the primitive layer** with our own CSS (recommended: accessible menus/select/tooltip/number field we don't have to write, unstyled so the look is ours, actively maintained, imported per component); or hand-roll every control; or a styled kit (shadcn/Tailwind), which brings its own look and a CSS toolchain.
+8. **UI font**: bundled Inter for UI + Fira Code for values (recommended: same look on Windows and every Linux distro); or the OS's system font.
+9. **ValueField stepping**: arrow keys + drag-on-label scrub, wheel only while focused, live code update while scrubbing (recommended); or no scrubbing.
 
 ## M10 UX/polish backlog (ongoing — append here as ideas come up)
 
