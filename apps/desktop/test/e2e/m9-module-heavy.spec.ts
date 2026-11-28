@@ -69,6 +69,11 @@ async function partPixelsOnEdges(scad: ScadApp): Promise<number> {
 
 test.describe('module-heavy files (rack mount fixture)', () => {
   test('Show parts drills through if ($preview) and the module to the body and the keystone', async ({ scad }) => {
+    // The rack mount sits near M18's 2 s quick-preview line (estimate about
+    // 1.6 s on the cloud test machine), so on a slower runner Auto keeps it a
+    // preview. This test is about drill-in and checks the plain "Rendered"
+    // status, so it renders in full.
+    await scad.setQuickPreview('off');
     await scad.stubDialogs({ open: FIXTURE });
     await scad.rendersAfter(() => scad.button('Open .scad file...').click());
     expect(await scad.status()).toBe('Rendered');
